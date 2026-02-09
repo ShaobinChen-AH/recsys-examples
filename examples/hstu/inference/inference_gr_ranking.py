@@ -281,7 +281,7 @@ def run_ranking_gr_simulate(
                                 eval_metric_dict, prefix="Metrics", sep="\n    "
                             )
                         )
-                    model.clear_kv_cache()
+                    #model.clear_kv_cache()
                     cur_date = dates[0]
                 cached_start_pos, cached_len = model.get_user_kvdata_info(
                     uids, dbg_print=True
