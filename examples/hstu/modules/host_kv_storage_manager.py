@@ -79,7 +79,12 @@ class DummyHSTUHostKVStorageImpl(HSTUHostKVStorageImpl):
             storage = self.kv_data_storage[layer_idx]
             if user_id not in storage:
                 storage[user_id] = list()
-            storage[user_id].append(kv_data[layer_idx])
+            data_item = kv_data[layer_idx]
+            if isinstance(data_item, dict):
+                # 量化数据：存储为 dict
+                storage[user_id].append(data_item)
+            else:
+                storage[user_id].append(data_item)
 
     def get_kv_data(
         self, user_id: int, length: int, layer_idx: int, output_buffer: torch.Tensor
@@ -103,6 +108,47 @@ class DummyHSTUHostKVStorageImpl(HSTUHostKVStorageImpl):
         for layer_idx in range(self._num_layers):
             self.kv_data_storage[layer_idx].clear()
 
+    def get_kv_data_quantized(
+            self,
+            user_id: int,
+            length: int,
+            layer_idx: int,
+            indices_buffer: torch.Tensor,
+            scales_buffer: torch.Tensor,
+            zero_points_buffer: torch.Tensor,
+        ):
+        """获取量化格式的 KV 数据"""
+        current_length = 0
+        buffer_idx = 0
+
+        for data_chunk in self.kv_data_storage[layer_idx][user_id]:
+            # 量化数据是 dict 格式
+            if isinstance(data_chunk, dict):
+                indices_chunk = data_chunk['indices']
+                scales_chunk = data_chunk['scales']
+                zero_points_chunk = data_chunk['zero_points']
+            else:
+                # 非量化数据不应该调用这个函数
+                raise ValueError("Calling get_kv_data_quantized on non-quantized data")
+
+            chunk_length = indices_chunk.shape[0] * self._page_size
+
+            if current_length + chunk_length > length:
+                # 只取需要的部分
+                pages_needed = (length - current_length) // self._page_size
+                indices_buffer[buffer_idx:buffer_idx + pages_needed, ...].copy_(indices_chunk[:pages_needed, ...])
+                scales_buffer[buffer_idx:buffer_idx + pages_needed, ...].copy_(scales_chunk[:pages_needed, ...])
+                zero_points_buffer[buffer_idx:buffer_idx + pages_needed, ...].copy_(zero_points_chunk[:pages_needed, ...])
+                break
+            else:
+                indices_buffer[buffer_idx:buffer_idx + indices_chunk.shape[0], ...].copy_(indices_chunk)
+                scales_buffer[buffer_idx:buffer_idx + scales_chunk.shape[0], ...].copy_(scales_chunk)
+                zero_points_buffer[buffer_idx:buffer_idx + zero_points_chunk.shape[0], ...].copy_(zero_points_chunk)
+                buffer_idx += indices_chunk.shape[0]
+
+            current_length += chunk_length
+
+
 
 class HSTUHostKVStorageManager:
     def __init__(
@@ -123,6 +169,11 @@ class HSTUHostKVStorageManager:
         self.offload_chunksize = kv_cache_config.offload_chunksize
         self.max_batch_size = hstu_config.max_batch_size
 
+        self.enable_quantization = getattr(kv_cache_config, 'enable_kv_quantization', False)
+        if self.enable_quantization:
+            self.quantization_bits = getattr(kv_cache_config, 'kv_quantization_bits', 4)
+            self.compression_ratio = 16 // self.quantization_bits
+
         self.impl: HSTUHostKVStorageImpl = DummyHSTUHostKVStorageImpl(
             self.num_layers, self.page_size, self.offload_chunksize
         )
@@ -134,6 +185,15 @@ class HSTUHostKVStorageManager:
             if hstu_config.fp16
             else torch.float32
         )
+
+        if self.enable_quantization:
+            # 量化模式：存储 uint8 (4-bit packed)
+            buffer_dtype = torch.uint8
+            buffer_head_dim = (self.head_dim + 1) // 2  # 4-bit packed
+        else:
+            buffer_dtype = self.kv_cache_dtype
+            buffer_head_dim = self.head_dim
+
         self.static_kvdata_buffer_ = torch.empty(
             (
                 self.num_layers,
@@ -148,10 +208,43 @@ class HSTUHostKVStorageManager:
             pin_memory=True,
         ).uniform_(-0.05, 0.05)
 
+        if self.enable_quantization:
+            self.static_kvdata_scales_ = torch.empty(
+                (
+                    self.num_layers,
+                    (self.max_batch_size * self.max_seq_len) // self.page_size,
+                    2,
+                    self.num_heads,
+                ),
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+                pin_memory=True,
+            )
+            self.static_kvdata_zero_points_ = torch.empty(
+                (
+                    self.num_layers,
+                    (self.max_batch_size * self.max_seq_len) // self.page_size,
+                    2,
+                    self.num_heads,
+                ),
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+                pin_memory=True,
+            )
+        else:
+            self.static_kvdata_scales_ = None
+            self.static_kvdata_zero_points_ = None
+
     def fetch_kv_data(
         self, user_id: int, length: int, layer_idx: int, output_buffer: torch.Tensor
     ):
-        self.impl.get_kv_data(user_id, length, layer_idx, output_buffer)
+        if self.enable_quantization and scales_buffer is not None and zero_points_buffer is not None:
+            # 量化模式下需要提取三个 buffer
+            self.impl.get_kv_data_quantized(
+                user_id, length, layer_idx, output_buffer, scales_buffer, zero_points_buffer
+            )
+        else:
+            self.impl.get_kv_data(user_id, length, layer_idx, output_buffer)
 
     def get_user_kvdata_info(self, user_id: int) -> Tuple[int, int]:
         return self.impl.get_user_kvdata_info(user_id)
@@ -200,6 +293,8 @@ class HSTUHostKVStorageManager:
                     self.static_kvdata_buffer_[
                         layer_idx, start_page_idx:end_page_idx, ...
                     ],
+                    self.static_kvdata_scales_[layer_idx, start_page_idx:end_page_idx, ...] if self.enable_quantization else None,
+                    self.static_kvdata_zero_points_[layer_idx, start_page_idx:end_page_idx, ...] if self.enable_quantization else None,
                 )
 
         onload_kv_page_ids = torch.arange(
@@ -220,6 +315,8 @@ class HSTUHostKVStorageManager:
         user_ids: torch.Tensor,
         offload_start_pos: torch.Tensor,
         offload_page_indptr: torch.Tensor,
+        offloaded_scales: List[torch.Tensor] = None,  # === 新增 ===
+        offloaded_zero_points: List[torch.Tensor] = None,
     ):
         for idx in range(len(user_ids)):
             uid = user_ids[idx].item()
@@ -230,23 +327,45 @@ class HSTUHostKVStorageManager:
             if length == 0:
                 continue
 
+            kv_data_per_layer = []
+            for layer_idx in range(self.num_layers):
+                layer_data = {
+                    'indices': offloaded_kv_data[layer_idx][page_start:page_end, ...]
+                    .detach()
+                    .clone()
+                }
+                # === 新增：如果有量化参数，也存储 ===
+                if offloaded_scales is not None and offloaded_zero_points is not None:
+                    layer_data['scales'] = offloaded_scales[layer_idx][page_start:page_end, ...].detach().clone()
+                    layer_data['zero_points'] = offloaded_zero_points[layer_idx][page_start:page_end, ...].detach().clone()
+
+                kv_data_per_layer.append(layer_data)
+
             self.impl.append_kvdata(
                 uid,
                 start_pos,
                 length,
-                [
-                    offloaded_kv_data[layer_idx][page_start:page_end, ...]
-                    .detach()
-                    .clone()
-                    for layer_idx in range(self.num_layers)
-                ],
+                kv_data_per_layer,
             )
 
     def evict_all_kvdata(self):
         self.impl.evict_all_kvdata()
 
     def get_lookup_buffer(self) -> torch.Tensor:
-        return self.static_kvdata_buffer_
+        if self.enable_quantization:
+            return {
+                'indices': self.static_kvdata_buffer_,
+                'scales': self.static_kvdata_scales_,
+                'zero_points': self.static_kvdata_zero_points_,
+            }
+        else:
+            return self.static_kvdata_buffer_
+
+    def get_lookup_scales(self):
+        return self.static_kvdata_scales_ if self.enable_quantization else None
+
+    def get_lookup_zero_points(self):
+        return self.static_kvdata_zero_points_ if self.enable_quantization else None
 
     def get_onload_history_seqlen(self, user_id: int, cached_start_pos: int) -> int:
         (offloaded_start_pos, offloaded_length) = self.get_user_kvdata_info(user_id)

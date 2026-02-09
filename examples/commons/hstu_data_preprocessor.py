@@ -453,7 +453,8 @@ class DLRMKuaiRandProcessor(DataProcessor):
             "friend_user_num_range",
             "register_days_range",
         ]
-        base_path = os.path.join(data_path, prefix, "data")
+        #base_path = os.path.join(data_path, prefix, "data")
+        base_path = "/workspace/data/KuaiRand-1K/data/"
         if prefix == "KuaiRand-Pure":
             self._log_files = [
                 os.path.join(base_path, "log_standard_4_08_to_4_21_pure.csv"),

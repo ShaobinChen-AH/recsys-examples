@@ -99,6 +99,10 @@ class KVCacheConfig:
     page_size: int
     offload_chunksize: int
     max_attention_window: Optional[int] = None
+    enable_kv_quantization: bool = False
+    kv_quantization_bits: int = 4
+    use_random_rotation: bool = True
+    rotation_group_size: int = 128
 
 
 def get_kvcache_config(
@@ -106,6 +110,10 @@ def get_kvcache_config(
     page_size: int,
     offload_chunksize: int,
     max_attention_window: Optional[int] = None,
+    enable_kv_quantization: bool = False,
+    kv_quantization_bits: int = 4,
+    use_random_rotation: bool = True,
+    rotation_group_size: int = 128,
 ) -> KVCacheConfig:
     """
     Create the HSTU KV cache configuration.
@@ -125,6 +133,10 @@ def get_kvcache_config(
         page_size=page_size,
         offload_chunksize=offload_chunksize,
         max_attention_window=max_attention_window,
+        enable_kv_quantization=enable_kv_quantization,
+        kv_quantization_bits=kv_quantization_bits,
+        use_random_rotation=use_random_rotation,
+        rotation_group_size=rotation_group_size,
     )
 
 

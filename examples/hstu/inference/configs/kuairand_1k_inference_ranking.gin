@@ -5,11 +5,11 @@ DatasetArgs.shuffle = False
 
 NetworkArgs.num_layers = 3
 NetworkArgs.num_attention_heads = 4
-NetworkArgs.hidden_size = 512
+NetworkArgs.hidden_size = 1024
 NetworkArgs.kv_channels = 128
 
 RankingArgs.prediction_head_arch = [
-    512, 8
+    2048, 8
 ]
 RankingArgs.prediction_head_bias = True
 RankingArgs.num_tasks = 8

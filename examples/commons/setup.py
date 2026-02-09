@@ -50,6 +50,17 @@ setup(
                 "nvcc": nvcc_threads_args() + nvcc_flags,
             },
         ),
+        CUDAExtension(
+            name="kv_quantization_ops",
+            sources=[
+                "ops/cuda_ops/csrc/kv_quantization_cuda.cpp",
+                "ops/cuda_ops/csrc/kv_quantization_kernels.cu",
+            ],
+            extra_compile_args={
+                "cxx": ["-O3", "-std=c++17"],
+                "nvcc": nvcc_threads_args() + nvcc_flags,
+            },
+        ),
     ],
     cmdclass={"build_ext": BuildExtension},
 )

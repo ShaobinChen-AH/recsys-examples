@@ -165,6 +165,13 @@ def get_inference_hstu_model(
         "page_size": 32,
         "offload_chunksize": 1024,
     }
+    if args.enable_kv_quantization:
+        kvcache_args.update({
+            "enable_kv_quantization": True,
+            "kv_quantization_bits": args.kv_quantization_bits,
+            "use_random_rotation": True,
+            "rotation_group_size": 128,
+        })
     kv_cache_config = get_kvcache_config(**kvcache_args)
 
     ranking_args = RankingArgs()
@@ -446,6 +453,14 @@ if __name__ == "__main__":
     parser.add_argument("--disable_auc", action="store_true")
     parser.add_argument("--disable_context", action="store_true")
     parser.add_argument("--disable_kvcache", action="store_true")
+
+    parser.add_argument("--enable_kv_quantization", action="store_true",
+                       help="Enable KV cache quantization")
+    parser.add_argument("--kv_quantization_bits", type=int, default=4,
+                       help="Quantization bits (default: 4)")
+    parser.add_argument("--use_random_rotation", action="store_true", default=True,
+                       help="Use random rotation before quantization")
+
 
     args = parser.parse_args()
     gin.parse_config_file(args.gin_config_file)

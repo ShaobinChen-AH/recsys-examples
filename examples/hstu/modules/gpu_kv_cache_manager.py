@@ -20,6 +20,7 @@ import paged_kvcache_ops
 import tensorrt_llm
 import torch
 from configs import InferenceHSTUConfig, KVCacheConfig, KVCacheMetadata
+from .kv_cache_quantization import create_kv_quantizer, KVCacheQuantizer
 
 KVCacheManagerImpl = tensorrt_llm.bindings.internal.batch_manager.KVCacheManager
 KvCacheConfigCpp = tensorrt_llm.bindings.KvCacheConfig
@@ -118,20 +119,69 @@ class HSTUGpuKVCacheManager:
             else DataType.FLOAT
         )
         self.impl.allocate_pools(kv_cache_dtype, False)
-        self._offload_kvdata_host_buffers = [
-            torch.empty(
-                (
-                    self.num_reserved_cache_pages,
-                    2,
-                    self.page_size,
-                    self.num_heads_per_layer[i],
-                    self.head_dim,
-                ),
-                dtype=self.dtype,
-                pin_memory=True,
-            )
-            for i in range(self.num_layers)
-        ]
+        
+        self.quantizer = create_kv_quantizer(hstu_config, kv_cache_config)
+        self.enable_quantization = self.quantizer is not None
+
+        if self.enable_quantization:
+            # 4-bit量化：每个元素4bit，所以每个uint8存储2个值
+            # 还需要额外存储scales和zero_points
+            host_dtype = torch.uint8
+            # 计算压缩后的尺寸
+            self.quantization_bits = kv_cache_config.kv_quantization_bits
+            self.compression_ratio = 16 // self.quantization_bits  # 例如4bit是4倍压缩
+        else:
+            host_dtype = self.dtype
+        
+        if self.enable_quantization:
+            self._offload_kvdata_host_buffers = [
+                torch.empty(
+                    (
+                        self.num_reserved_cache_pages,
+                        2,
+                        self.page_size,
+                        self.num_heads_per_layer[i],
+                        (self.head_dim + 1) // 2,  # 4-bit packed, 减半
+                    ),
+                    dtype=torch.uint8,
+                    pin_memory=True,
+                )
+                for i in range(self.num_layers)
+            ]
+            self._offload_kvdata_scales = [
+                torch.empty(
+                    (self.num_reserved_cache_pages, 2, self.num_heads_per_layer[i]),
+                    dtype=torch.float32,
+                    pin_memory=True,
+                )
+                for i in range(self.num_layers)
+            ]
+            self._offload_kvdata_zero_points = [
+                torch.empty(
+                    (self.num_reserved_cache_pages, 2, self.num_heads_per_layer[i]),
+                    dtype=torch.float32,
+                    pin_memory=True,
+                )
+                for i in range(self.num_layers)
+            ]
+        else:
+            self._offload_kvdata_host_buffers = [
+                torch.empty(
+                    (
+                        self.num_reserved_cache_pages,
+                        2,
+                        self.page_size,
+                        self.num_heads_per_layer[i],
+                        self.head_dim,
+                    ),
+                    dtype=self.dtype,
+                    pin_memory=True,
+                )
+                for i in range(self.num_layers)
+            ]
+            self._offload_kvdata_scales = None
+            self._offload_kvdata_zero_points = None
+
 
     def allocate(
         self,
@@ -285,16 +335,44 @@ class HSTUGpuKVCacheManager:
                     num_pages,
                     0,  # NHD layout
                 )
-                self._offload_kvdata_host_buffers[layer_idx][:num_pages, ...].copy_(
-                    gather_kv_gpu_buffers[layer_idx][:num_pages], non_blocking=True
-                )
+                if self.enable_quantization:
+                    gathered_data = gather_kv_gpu_buffers[layer_idx][:num_pages]
+                    quantized_indices, scales, zero_points = self.quantizer.quantize(
+                        gathered_data, layer_idx
+                    )
+
+                    # 复制量化后的数据到host buffer
+                    self._offload_kvdata_host_buffers[layer_idx][:num_pages, ...].copy_(
+                        quantized_indices, non_blocking=True
+                    )
+                    self._offload_kvdata_scales[layer_idx][:num_pages, ...].copy_(
+                        scales, non_blocking=True
+                    )
+                    self._offload_kvdata_zero_points[layer_idx][:num_pages, ...].copy_(
+                        zero_points, non_blocking=True
+                    )
+                else:
+                    self._offload_kvdata_host_buffers[layer_idx][:num_pages, ...].copy_(
+                        gather_kv_gpu_buffers[layer_idx][:num_pages], non_blocking=True
+                    )
             self._offload_end_event.record(self._offload_stream)
-        return (
-            self._offload_kvdata_host_buffers,
-            offload_user_ids,
-            offload_start_pos,
-            offload_page_indptr,
-        )
+        
+        if self.enable_quantization:
+            return (
+                self._offload_kvdata_host_buffers,
+                offload_user_ids,
+                offload_start_pos,
+                offload_page_indptr,
+                self._offload_kvdata_scales,
+                self._offload_kvdata_zero_points,
+            )
+        else:
+            return (
+                self._offload_kvdata_host_buffers,
+                offload_user_ids,
+                offload_start_pos,
+                offload_page_indptr,
+            )
 
     def onload(self, host_kv_data: torch.Tensor, onload_length: int, kv_cache_metadata):
         if onload_length == 0:
@@ -302,11 +380,44 @@ class HSTUGpuKVCacheManager:
         onload_num_pages = onload_length // self.page_size
         with torch.cuda.stream(self._onload_stream):
             for layer_idx in range(self.num_layers):
-                kv_cache_metadata.onload_history_kv_buffer[layer_idx][
-                    :onload_num_pages, ...
-                ].copy_(
-                    host_kv_data[layer_idx, :onload_num_pages, ...], non_blocking=True
-                )
+                if self.enable_quantization:
+                    gpu_quantized = torch.empty(
+                        (onload_num_pages, *kv_cache_metadata.onload_history_kv_buffer[layer_idx].shape[1:]),
+                        dtype=torch.uint8,
+                        device=torch.cuda.current_device(),
+                    )
+                    gpu_quantized.copy_(
+                        host_kv_data[layer_idx, :onload_num_pages, ...],
+                        non_blocking=True
+                    )
+                    gpu_scales = torch.empty(
+                        (onload_num_pages, 2, self.num_heads_per_layer[layer_idx]),
+                        dtype=torch.float32,
+                        device=torch.cuda.current_device(),
+                    )
+                    gpu_zero_points = torch.empty(
+                        (onload_num_pages, 2, self.num_heads_per_layer[layer_idx]),
+                        dtype=torch.float32,
+                        device=torch.cuda.current_device(),
+                    )
+                    gpu_scales.copy_(host_scales[layer_idx, :onload_num_pages], non_blocking=True)
+                    gpu_zero_points.copy_(host_zero_points[layer_idx, :onload_num_pages], non_blocking=True)
+
+                    # 反量化
+                    dequantized = self.quantizer.dequantize(
+                        gpu_quantized, gpu_scales, gpu_zero_points, layer_idx
+                    )
+
+                    # 存储到KV cache buffer
+                    kv_cache_metadata.onload_history_kv_buffer[layer_idx][
+                        :onload_num_pages, ...
+                    ].copy_(dequantized, non_blocking=True)
+                else:    
+                    kv_cache_metadata.onload_history_kv_buffer[layer_idx][
+                        :onload_num_pages, ...
+                    ].copy_(
+                        host_kv_data[layer_idx, :onload_num_pages, ...], non_blocking=True
+                    )
                 kv_cache_metadata.onload_history_kv_events[layer_idx].record(
                     self._onload_stream
                 )
