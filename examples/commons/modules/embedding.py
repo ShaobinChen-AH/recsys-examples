@@ -23,6 +23,7 @@ import numpy as np
 import torch
 import torch.fx
 import torch.nn as nn
+from commons.utils.jagged_tensor_utils import embeddings_to_jt_dict
 from commons.utils.nvtx_op import output_nvtx_hook, register_setter_and_getter_for_nvtx
 from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
@@ -295,13 +296,7 @@ class DataParallelEmbeddingCollection(torch.nn.Module):
                 )
             features = features.split(self._feature_splits)[0]
         embeddings = self._dp_lookups[0](features).view(-1, self._embedding_dim)
-        kjt = KeyedJaggedTensor(
-            values=embeddings,
-            keys=features.keys(),
-            lengths=features.lengths(),
-            offsets=features.offsets(),
-        )
-        return kjt.to_dict()
+        return embeddings_to_jt_dict(embeddings=embeddings, features=features)
 
 
 class ShardedEmbedding(torch.nn.Module):
@@ -395,12 +390,15 @@ class ShardedEmbedding(torch.nn.Module):
         ), "either model_parallel_embedding_collection or data_parallel_embedding_collection must be not None"
         embeddings: Dict[str, JaggedTensor] = {}
         if self._model_parallel_embedding_collection is not None:
-            mp_embeddings_awaitables = self._model_parallel_embedding_collection(kjt)
-            embeddings = {**embeddings, **(mp_embeddings_awaitables.wait())}
+            with torch.cuda.nvtx.range("mp_embedding_wait"):
+                mp_embeddings_awaitables = self._model_parallel_embedding_collection(kjt)
+                embeddings = {**embeddings, **(mp_embeddings_awaitables.wait())}
         if self._data_parallel_embedding_collection is not None:
             with torch.cuda.stream(self._side_stream):
-                dp_embeddings = self._data_parallel_embedding_collection(kjt)
-            torch.cuda.current_stream().wait_stream(self._side_stream)
+                with torch.cuda.nvtx.range("dp_embedding_side_stream"):
+                    dp_embeddings = self._data_parallel_embedding_collection(kjt)
+            with torch.cuda.nvtx.range("dp_embedding_wait_stream"):
+                torch.cuda.current_stream().wait_stream(self._side_stream)
             embeddings = {**embeddings, **dp_embeddings}
         return embeddings
 

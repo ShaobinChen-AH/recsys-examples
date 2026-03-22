@@ -1,0 +1,78 @@
+TrainerArgs.train_batch_size = 32
+TrainerArgs.eval_batch_size = 32
+TrainerArgs.log_interval = 1
+TrainerArgs.eval_interval = 1000000
+TrainerArgs.profile = True
+TrainerArgs.profile_step_start = 50
+TrainerArgs.profile_step_end = 55
+TrainerArgs.max_train_iters = 64
+TrainerArgs.max_eval_iters = 16
+TrainerArgs.pipeline_type = "none"
+
+# === Random distributions (optional, for BenchmarkDataset) ===
+# Sequence length distribution: Zipf, values in [1, max_sequence_length)
+# high is auto-filled from FeatureArgs.max_sequence_length when omitted
+item_seqlen_dist/RandomDistribution.dist_type = 'zipf'
+item_seqlen_dist/RandomDistribution.alpha = 1.5
+item_seqlen_dist/RandomDistribution.low = 1
+
+# Item-ID value distribution: Zipf (long-tail), values in [0, +inf)
+item_value_dist/RandomDistribution.dist_type = 'zipf'
+item_value_dist/RandomDistribution.alpha = 1.2
+
+item_and_action_feature/FeatureArgs.feature_names = ['item', 'action']
+item_and_action_feature/FeatureArgs.max_sequence_length = 4096
+# if False, the generated sequence length per user is fixed to max_sequence_length
+item_and_action_feature/FeatureArgs.is_jagged = False
+item_and_action_feature/FeatureArgs.seqlen_dist = @item_seqlen_dist/RandomDistribution()
+item_and_action_feature/FeatureArgs.value_dists = {
+    'item': @item_value_dist/RandomDistribution(),
+}
+
+BenchmarkDatasetArgs.feature_args = [
+    @item_and_action_feature/FeatureArgs(),
+]
+
+item_embedding/DynamicEmbeddingArgs.feature_names = ['item']
+item_embedding/DynamicEmbeddingArgs.table_name = 'item'
+item_embedding/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 50000000 # gross 50M embedding rows
+item_embedding/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = 0.1
+item_embedding/DynamicEmbeddingArgs.evict_strategy = 'lru'
+
+action_embedding/EmbeddingArgs.feature_names = ['action']
+action_embedding/EmbeddingArgs.table_name = 'action'
+action_embedding/EmbeddingArgs.item_vocab_size_or_capacity = 100
+action_embedding/EmbeddingArgs.sharding_type = 'data_parallel'
+
+BenchmarkDatasetArgs.embedding_args = [
+    @item_embedding/DynamicEmbeddingArgs(),
+    @action_embedding/EmbeddingArgs(),
+]
+
+BenchmarkDatasetArgs.item_feature_name='item'
+BenchmarkDatasetArgs.contextual_feature_names=[]
+BenchmarkDatasetArgs.action_feature_name='action'
+BenchmarkDatasetArgs.max_num_candidates=0
+
+NetworkArgs.item_embedding_dim = 128
+NetworkArgs.contextual_embedding_dim = 256
+NetworkArgs.num_layers = 8
+NetworkArgs.num_attention_heads = 4
+NetworkArgs.hidden_size = 1024
+# per head dim
+NetworkArgs.kv_channels = 256
+NetworkArgs.kernel_backend = 'cutlass'
+
+# recompute can incurs perf regression, but save memory
+NetworkArgs.recompute_input_layernorm = True
+NetworkArgs.recompute_input_silu = False
+
+RankingArgs.prediction_head_arch = [
+    512, 8,
+]
+RankingArgs.prediction_head_bias = True
+RankingArgs.num_tasks = 8
+
+OptimizerArgs.optimizer_str = 'adam'
+OptimizerArgs.learning_rate = 1e-3
+

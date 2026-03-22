@@ -20,6 +20,7 @@ import warnings
 from typing import Dict, List, Optional
 
 import torch
+from commons.utils.jagged_tensor_utils import embeddings_to_jt_dict
 from configs import EmbeddingBackend, InferenceEmbeddingConfig
 from dynamicemb import (
     DynamicEmbInitializerArgs,
@@ -152,13 +153,7 @@ class InferenceDynamicEmbeddingCollection(torch.nn.Module):
                 [features_split[idx] for idx in self._features_split_indices]
             )
             embeddings = self._embedding_tables(features.values(), features.offsets())
-        embeddings_kjt = KeyedJaggedTensor(
-            values=embeddings,
-            keys=features.keys(),
-            lengths=features.lengths(),
-            offsets=features.offsets(),
-        )
-        return embeddings_kjt.to_dict()
+        return embeddings_to_jt_dict(embeddings=embeddings, features=features)
 
 
 def create_embedding_collection(configs, backend, use_static: bool = False, **kwargs):
