@@ -1,5 +1,5 @@
-TrainerArgs.train_batch_size = 32
-TrainerArgs.eval_batch_size = 32
+TrainerArgs.train_batch_size = 8
+TrainerArgs.eval_batch_size = 8
 TrainerArgs.log_interval = 1
 TrainerArgs.eval_interval = 1000000
 TrainerArgs.profile = True
@@ -21,7 +21,7 @@ item_value_dist/RandomDistribution.dist_type = 'zipf'
 item_value_dist/RandomDistribution.alpha = 1.2
 
 item_and_action_feature/FeatureArgs.feature_names = ['item', 'action']
-item_and_action_feature/FeatureArgs.max_sequence_length = 4096
+item_and_action_feature/FeatureArgs.max_sequence_length = 1024
 # if False, the generated sequence length per user is fixed to max_sequence_length
 item_and_action_feature/FeatureArgs.is_jagged = False
 item_and_action_feature/FeatureArgs.seqlen_dist = @item_seqlen_dist/RandomDistribution()
@@ -35,8 +35,9 @@ BenchmarkDatasetArgs.feature_args = [
 
 item_embedding/DynamicEmbeddingArgs.feature_names = ['item']
 item_embedding/DynamicEmbeddingArgs.table_name = 'item'
-item_embedding/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 50000000 # gross 50M embedding rows
-item_embedding/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = 0.1
+item_embedding/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 5000000 
+item_embedding/DynamicEmbeddingArgs.global_hbm_for_values = 4294967296
+item_embedding/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = 0.05
 item_embedding/DynamicEmbeddingArgs.evict_strategy = 'lru'
 
 action_embedding/EmbeddingArgs.feature_names = ['action']
@@ -62,6 +63,7 @@ NetworkArgs.hidden_size = 1024
 # per head dim
 NetworkArgs.kv_channels = 256
 NetworkArgs.kernel_backend = 'cutlass'
+NetworkArgs.scaling_seqlen = 1024
 
 # recompute can incurs perf regression, but save memory
 NetworkArgs.recompute_input_layernorm = True
