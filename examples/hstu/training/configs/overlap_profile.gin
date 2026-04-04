@@ -1,5 +1,5 @@
-TrainerArgs.train_batch_size = 8
-TrainerArgs.eval_batch_size = 8
+TrainerArgs.train_batch_size = 16
+TrainerArgs.eval_batch_size = 16
 TrainerArgs.log_interval = 1
 TrainerArgs.eval_interval = 1000000
 TrainerArgs.profile = True
@@ -62,7 +62,7 @@ NetworkArgs.num_attention_heads = 4
 NetworkArgs.hidden_size = 1024
 # per head dim
 NetworkArgs.kv_channels = 256
-NetworkArgs.kernel_backend = 'cutlass'
+NetworkArgs.kernel_backend = 'triton'
 NetworkArgs.scaling_seqlen = 1024
 
 # recompute can incurs perf regression, but save memory

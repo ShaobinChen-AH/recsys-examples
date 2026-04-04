@@ -246,6 +246,8 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             ctx.has_multiple_targets = num_targets is not None
             ctx.N = N
             ctx.contextual_seq_len = contextual_seq_len
+            assert causal, "Triton backend does not support causal=False"
+            enable_tma = torch.cuda.get_device_properties(q.device).major >= 9
 
             jagged_attn_output = triton_hstu_attention_fwd(
                 N=N,
@@ -255,11 +257,11 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 k=k,
                 v=v,
                 seq_offsets=seq_offsets,
-                causal=causal,
                 num_targets=num_targets,
                 max_attn_len=0,
                 contextual_seq_len=contextual_seq_len,
                 sort_by_length_indices=None,
+                enable_tma=enable_tma,
             ).reshape(-1, num_heads * attention_dim_per_head)
             return jagged_attn_output
 
@@ -719,13 +721,15 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             N: int,
             scaling_seqlen: int,
             alpha: float,
-            causal: float,
+            causal: bool,
             contextual_seq_len: int,
             dqkv: Optional[torch.Tensor] = None,
         ):
             dq = torch.empty_like(q)
             dk = torch.empty_like(k)
             dv = torch.empty_like(v)
+            assert causal, "Triton backend does not support causal=False"
+            enable_tma = torch.cuda.get_device_properties(q.device).major >= 9
             dq, dk, dv = triton_hstu_attention_bwd(
                 dout=dout,
                 q=q,
@@ -740,9 +744,9 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 scaling_seqlen=scaling_seqlen,
                 alpha=alpha,
                 max_attn_len=0,
-                causal=causal,
                 contextual_seq_len=contextual_seq_len,
                 sort_by_length_indices=None,
+                enable_tma=enable_tma,
             )
             return dq, dk, dv
 

@@ -14,6 +14,7 @@
 # limitations under the License.
 import copy
 import os
+import time
 from dataclasses import dataclass
 
 # pyre-strict
@@ -23,6 +24,7 @@ import numpy as np
 import torch
 import torch.fx
 import torch.nn as nn
+from torch.autograd.profiler import record_function
 from commons.utils.jagged_tensor_utils import embeddings_to_jt_dict
 from commons.utils.nvtx_op import output_nvtx_hook, register_setter_and_getter_for_nvtx
 from dynamicemb.planner import (
@@ -51,6 +53,27 @@ from torchrec.modules.embedding_modules import (
     EmbeddingCollectionInterface,
 )
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
+
+
+def _host_trace_enabled() -> bool:
+    return os.environ.get("ASYNC_OVERLAP_HOST_TRACE", "0") == "1"
+
+
+def _host_trace_should_print() -> bool:
+    if not _host_trace_enabled():
+        return False
+    target = os.environ.get("ASYNC_OVERLAP_TRACE_STEP", "50")
+    return os.environ.get("ASYNC_OVERLAP_CURRENT_STEP") == target
+
+
+def _host_trace(msg: str, start_ns: Optional[int] = None) -> int:
+    now = time.perf_counter_ns()
+    if _host_trace_should_print():
+        if start_ns is None:
+            print(f"[host-trace] {msg}", flush=True)
+        else:
+            print(f"[host-trace] {msg}: {(now - start_ns) / 1e6:.3f} ms", flush=True)
+    return now
 
 
 @dataclass
@@ -389,16 +412,35 @@ class ShardedEmbedding(torch.nn.Module):
             and self._data_parallel_embedding_collection is None
         ), "either model_parallel_embedding_collection or data_parallel_embedding_collection must be not None"
         embeddings: Dict[str, JaggedTensor] = {}
+        mp_embeddings_awaitables = None
+        dp_embeddings = None
         if self._model_parallel_embedding_collection is not None:
-            with torch.cuda.nvtx.range("mp_embedding_wait"):
-                mp_embeddings_awaitables = self._model_parallel_embedding_collection(kjt)
-                embeddings = {**embeddings, **(mp_embeddings_awaitables.wait())}
+            t_mp_launch = _host_trace("mp.launch.enter")
+            with record_function("## mp_embedding_launch ##"):
+                with torch.cuda.nvtx.range("mp_embedding_launch"):
+                    mp_embeddings_awaitables = self._model_parallel_embedding_collection(
+                        kjt
+                    )
+            _host_trace("mp.launch.return", t_mp_launch)
         if self._data_parallel_embedding_collection is not None:
+            t_dp_launch = _host_trace("dp.launch.enter")
             with torch.cuda.stream(self._side_stream):
-                with torch.cuda.nvtx.range("dp_embedding_side_stream"):
-                    dp_embeddings = self._data_parallel_embedding_collection(kjt)
-            with torch.cuda.nvtx.range("dp_embedding_wait_stream"):
-                torch.cuda.current_stream().wait_stream(self._side_stream)
+                with record_function("## dp_embedding_side_stream ##"):
+                    with torch.cuda.nvtx.range("dp_embedding_side_stream"):
+                        dp_embeddings = self._data_parallel_embedding_collection(kjt)
+            _host_trace("dp.launch.return", t_dp_launch)
+        if mp_embeddings_awaitables is not None:
+            t_mp_wait = _host_trace("mp.wait.enter")
+            with record_function("## mp_embedding_wait ##"):
+                with torch.cuda.nvtx.range("mp_embedding_wait"):
+                    embeddings = {**embeddings, **(mp_embeddings_awaitables.wait())}
+            _host_trace("mp.wait.return", t_mp_wait)
+        if dp_embeddings is not None:
+            t_dp_wait = _host_trace("dp.wait_stream.enter")
+            with record_function("## dp_embedding_wait_stream ##"):
+                with torch.cuda.nvtx.range("dp_embedding_wait_stream"):
+                    torch.cuda.current_stream().wait_stream(self._side_stream)
+            _host_trace("dp.wait_stream.return", t_dp_wait)
             embeddings = {**embeddings, **dp_embeddings}
         return embeddings
 

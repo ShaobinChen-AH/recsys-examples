@@ -13,11 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import time
 from typing import Dict, List, Optional, Tuple
 
 import torch
 from dynamicemb_extensions import block_bucketize_sparse_features  # pyre-ignore
 from torch import distributed as dist
+from torch.autograd.profiler import record_function
 from torchrec.distributed.dist_data import KJTAllToAll
 from torchrec.distributed.embedding_sharding import BaseSparseFeaturesDist
 from torchrec.distributed.types import Awaitable
@@ -27,6 +30,27 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 torch.fx.wrap("len")
 
 CACHE_LOAD_FACTOR_STR: str = "cache_load_factor"
+
+
+def _host_trace_enabled() -> bool:
+    return os.environ.get("ASYNC_OVERLAP_HOST_TRACE", "0") == "1"
+
+
+def _host_trace_should_print() -> bool:
+    if not _host_trace_enabled():
+        return False
+    target = os.environ.get("ASYNC_OVERLAP_TRACE_STEP", "50")
+    return os.environ.get("ASYNC_OVERLAP_CURRENT_STEP") == target
+
+
+def _host_trace(msg: str, start_ns: Optional[int] = None) -> int:
+    now = time.perf_counter_ns()
+    if _host_trace_should_print():
+        if start_ns is None:
+            print(f"[host-trace] {msg}", flush=True)
+        else:
+            print(f"[host-trace] {msg}: {(now - start_ns) / 1e6:.3f} ms", flush=True)
+    return now
 
 
 # torch.Tensor.to can not be fx symbolic traced as it does not go through __torch_dispatch__ => fx.wrap it
@@ -129,25 +153,27 @@ def bucketize_kjt_before_all2all(
         dist_type_list, dtype=torch.int32, device=kjt.values().device
     )
 
-    (
-        bucketized_lengths,
-        bucketized_indices,
-        bucketized_weights,
-        pos,
-        unbucketize_permute,
-    ) = block_bucketize_sparse_features(
-        kjt.lengths().view(-1),
-        kjt.values(),
-        bucketize_pos=bucketize_pos,
-        sequence=output_permute,
-        block_sizes=block_sizes_new_type,
-        my_size=num_buckets,
-        weights=kjt.weights_or_none(),
-        batch_size_per_feature=_fx_wrap_batch_size_per_feature(kjt),
-        max_B=_fx_wrap_max_B(kjt),
-        block_bucketize_pos=block_bucketize_row_pos,  # each tensor should have the same dtype as kjt.lengths()
-        dist_type_per_feature=dist_type_t,
-    )
+    with record_function("## dynemb_bucketize_sparse_features ##"):
+        with torch.cuda.nvtx.range("dynemb_bucketize_sparse_features"):
+            (
+                bucketized_lengths,
+                bucketized_indices,
+                bucketized_weights,
+                pos,
+                unbucketize_permute,
+            ) = block_bucketize_sparse_features(
+                kjt.lengths().view(-1),
+                kjt.values(),
+                bucketize_pos=bucketize_pos,
+                sequence=output_permute,
+                block_sizes=block_sizes_new_type,
+                my_size=num_buckets,
+                weights=kjt.weights_or_none(),
+                batch_size_per_feature=_fx_wrap_batch_size_per_feature(kjt),
+                max_B=_fx_wrap_max_B(kjt),
+                block_bucketize_pos=block_bucketize_row_pos,  # each tensor should have the same dtype as kjt.lengths()
+                dist_type_per_feature=dist_type_t,
+            )
 
     return (
         KeyedJaggedTensor(
@@ -264,20 +290,33 @@ class RwSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
             Awaitable[Awaitable[KeyedJaggedTensor]]: awaitable of awaitable of KeyedJaggedTensor.
         """
 
-        (
-            bucketized_features,
-            self.unbucketize_permute_tensor,
-        ) = bucketize_kjt_before_all2all(
-            sparse_features,
-            num_buckets=self._world_size,
-            block_sizes=self._feature_block_sizes_tensor,
-            output_permute=self._is_sequence,
-            bucketize_pos=(
-                self._has_feature_processor
-                if sparse_features.weights_or_none() is None
-                else self._need_pos
-            ),
-            dist_type_per_feature=self._dist_type_per_feature,
+        t_forward = _host_trace(
+            f"rw_dist.forward.enter(world_size={self._world_size})"
         )
+        t_bucketize = _host_trace("rw_dist.bucketize.enter")
+        with record_function("## dynemb_rw_dist_bucketize ##"):
+            with torch.cuda.nvtx.range("dynemb_rw_dist_bucketize"):
+                (
+                    bucketized_features,
+                    self.unbucketize_permute_tensor,
+                ) = bucketize_kjt_before_all2all(
+                    sparse_features,
+                    num_buckets=self._world_size,
+                    block_sizes=self._feature_block_sizes_tensor,
+                    output_permute=self._is_sequence,
+                    bucketize_pos=(
+                        self._has_feature_processor
+                        if sparse_features.weights_or_none() is None
+                        else self._need_pos
+                    ),
+                    dist_type_per_feature=self._dist_type_per_feature,
+                )
+        _host_trace("rw_dist.bucketize.return", t_bucketize)
 
-        return self._dist(bucketized_features)
+        t_alltoall = _host_trace("rw_dist.alltoall.enter")
+        with record_function("## dynemb_rw_dist_alltoall ##"):
+            with torch.cuda.nvtx.range("dynemb_rw_dist_alltoall"):
+                out = self._dist(bucketized_features)
+        _host_trace("rw_dist.alltoall.return", t_alltoall)
+        _host_trace("rw_dist.forward.return", t_forward)
+        return out

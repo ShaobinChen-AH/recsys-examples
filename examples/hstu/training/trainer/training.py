@@ -13,12 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+from datetime import datetime
 from itertools import chain, count, cycle, islice
 from typing import Iterator, Optional, Union
 
 import commons.checkpoint as checkpoint
 import torch  # pylint: disable-unused-import
 import torch.distributed as dist
+from torch.autograd.profiler import record_function
 from commons.checkpoint import get_unwrapped_module
 from commons.pipeline.train_pipeline import (
     JaggedMegatronPrefetchTrainPipelineSparseDist,
@@ -161,15 +163,38 @@ def train_with_pipeline(
     iter_slices = batched(train_loader_iter, n)
     start_iter = 0
     pipeline._model.train()
+    torch_profiler = None
+    trace_file = None
+    if trainer_args.profile:
+        torch_profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            with_stack=True,
+            with_flops=True,
+        )
+        trace_dir = os.path.join(os.getcwd(), "profile")
+        os.makedirs(trace_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        trace_file = os.path.join(trace_dir, f"hstu_trace_rank{rank}_{timestamp}.json")
     for batched_iterator in iter_slices:
         # for one slice(every eval interval)
         for train_iter in count(start_iter):
             if trainer_args.profile and train_iter == trainer_args.profile_step_start:
                 dist.barrier(device_ids=[torch.cuda.current_device()])
                 torch.cuda.profiler.start()
+                assert torch_profiler is not None
+                torch_profiler.start()
             if trainer_args.profile and train_iter == trainer_args.profile_step_end:
                 torch.cuda.profiler.stop()
                 dist.barrier(device_ids=[torch.cuda.current_device()])
+                assert torch_profiler is not None
+                assert trace_file is not None
+                torch_profiler.stop()
+                torch_profiler.export_chrome_trace(trace_file)
+                print_rank_0(f"[profile] Exported Chrome trace to {trace_file}")
             if (
                 train_iter * trainer_args.ckpt_save_interval > 0
                 and train_iter % trainer_args.ckpt_save_interval == 0
@@ -179,21 +204,25 @@ def train_with_pipeline(
                 )
                 save_ckpts(save_path, pipeline._model, dense_optimizer)
             try:
-                torch.cuda.nvtx.range_push(f"step {train_iter}")
-                reporting_loss, (
-                    local_loss,
-                    logits,
-                    labels,
-                    (ddp_seqlen, ddp_num_contextual, ddp_num_candidate),
-                ) = pipeline.progress(batched_iterator)
-                ddp_seqlens.append(ddp_seqlen.view(-1))
-                ddp_num_contextuals.append(ddp_num_contextual.view(-1))
-                ddp_num_candidates.append(ddp_num_candidate.view(-1))
-                tokens_logged += reporting_loss[1]
-                torch.cuda.nvtx.range_pop()
+                with record_function(f"## step {train_iter} ##"):
+                    torch.cuda.nvtx.range_push(f"step {train_iter}")
+                    os.environ["ASYNC_OVERLAP_CURRENT_STEP"] = str(train_iter)
+                    try:
+                        reporting_loss, (
+                            local_loss,
+                            logits,
+                            labels,
+                            (ddp_seqlen, ddp_num_contextual, ddp_num_candidate),
+                        ) = pipeline.progress(batched_iterator)
+                        ddp_seqlens.append(ddp_seqlen.view(-1))
+                        ddp_num_contextuals.append(ddp_num_contextual.view(-1))
+                        ddp_num_candidates.append(ddp_num_candidate.view(-1))
+                        tokens_logged += reporting_loss[1]
+                    finally:
+                        os.environ.pop("ASYNC_OVERLAP_CURRENT_STEP", None)
+                        torch.cuda.nvtx.range_pop()
             except StopIteration:
                 start_iter = train_iter
-                torch.cuda.nvtx.range_pop()
                 break
             # log
             if train_iter > 0 and (train_iter + 1) % trainer_args.log_interval == 0:
