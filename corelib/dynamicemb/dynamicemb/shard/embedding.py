@@ -171,6 +171,32 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                 persistent=False,
             )
 
+    @staticmethod
+    def _rebuild_kjt_with_preserved_batch_metadata(
+        source_kjt: KeyedJaggedTensor,
+        values: torch.Tensor,
+        lengths: torch.Tensor,
+        offsets: torch.Tensor,
+        weights: Optional[torch.Tensor] = None,
+    ) -> KeyedJaggedTensor:
+        # Preserve the original distributed batch metadata so downstream
+        # all-to-all logic keeps the same batch semantics for empty inputs.
+        variable_stride = source_kjt.variable_stride_per_key()
+        return KeyedJaggedTensor(
+            keys=source_kjt.keys(),
+            values=values,
+            weights=weights,
+            lengths=lengths,
+            offsets=offsets,
+            stride=None if variable_stride else source_kjt.stride(),
+            stride_per_key_per_rank=(
+                source_kjt.stride_per_key_per_rank() if variable_stride else None
+            ),
+            length_per_key=None,
+            offset_per_key=None,
+            index_per_key=None,
+        )
+
     def _dedup_indices(
         self,
         ctx: DynamicEmbeddingCollectionContext,
@@ -197,15 +223,15 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
 
                 # Handle empty input
                 if num_elements == 0:
-                    dedup_features = KeyedJaggedTensor(
-                        keys=input_feature.keys(),
+                    dedup_features = self._rebuild_kjt_with_preserved_batch_metadata(
+                        source_kjt=input_feature,
                         lengths=input_feature.lengths(),
                         offsets=input_feature.offsets(),
                         values=indices,
                     )
                     ctx.input_features.append(input_feature)
                     ctx.reverse_indices.append(
-                        torch.empty(0, dtype=torch.uint64, device=self._device)
+                        torch.empty(0, dtype=torch.int64, device=self._device)
                     )
                     features_by_shards.append(dedup_features)
                     continue
@@ -255,8 +281,8 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                 total_unique = num_uniques.item()
                 unique_keys = unique_keys[:total_unique]
 
-                dedup_features = KeyedJaggedTensor(
-                    keys=input_feature.keys(),
+                self._rebuild_kjt_with_preserved_batch_metadata(
+                    source_kjt=input_feature,
                     lengths=new_lengths,
                     offsets=new_offsets,
                     values=unique_keys,

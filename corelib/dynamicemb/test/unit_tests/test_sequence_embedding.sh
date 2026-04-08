@@ -21,6 +21,11 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun \
 CUDA_VISIBLE_DEVICES=0,1 torchrun \
   --nnodes 1 \
   --nproc_per_node 2 \
+  ./test/unit_tests/test_sequence_embedding_fw.py --print_sharding_plan --optimizer_type "adam" --use_index_dedup True --empty_nonzero_ranks True
+
+CUDA_VISIBLE_DEVICES=0,1 torchrun \
+  --nnodes 1 \
+  --nproc_per_node 2 \
   ./test/unit_tests/test_sequence_embedding_fw.py --print_sharding_plan --optimizer_type "adam" --use_index_dedup True --embedding_dim 129
 
 CUDA_VISIBLE_DEVICES=0,1 torchrun \

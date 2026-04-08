@@ -157,9 +157,25 @@ def init_fn(x: torch.Tensor):
 
 
 def generate_sparse_feature(
-    feature_num, num_embeddings_list, multi_hot_sizes, local_batch_size=50
+    feature_num,
+    num_embeddings_list,
+    multi_hot_sizes,
+    local_batch_size=50,
+    force_empty=False,
 ):
     feature_batch = feature_num * local_batch_size
+    feature_names = [
+        feature_idx_to_name(feature_idx) for feature_idx in range(feature_num)
+    ]
+    
+    if force_empty:
+        return torchrec.KeyedJaggedTensor.from_lengths_sync(
+            keys=feature_names,
+            values=torch.empty(0, dtype=torch.int64, device=torch.device("cuda")),
+            lengths=torch.zeros(
+                feature_batch, dtype=torch.int64, device=torch.device("cuda")
+            ),
+        )
 
     indices = []
     lengths = []
@@ -175,7 +191,7 @@ def generate_sparse_feature(
         lengths.append(cur_bag_size)
 
     return torchrec.KeyedJaggedTensor(
-        keys=[feature_idx_to_name(feature_idx) for feature_idx in range(feature_num)],
+        keys=feature_names,
         values=torch.tensor(
             indices, dtype=torch.int64
         ).cuda(),  # key [0,1] on rank0, [2] on rank 1
@@ -301,6 +317,7 @@ def run(args):
             num_embeddings_list=args.num_embeddings_per_feature,
             multi_hot_sizes=args.multi_hot_sizes,
             local_batch_size=args.batch_size // world_size,
+            force_empty=args.empty_nonzero_ranks and local_rank != 0,
         )
         ret = model(sparse_feature)  # => this is awaitable
 
@@ -314,7 +331,9 @@ def run(args):
         feature_num = len(ret.keys())
         dims = [args.embedding_dim for _ in range(feature_num)]
 
-        dyn_emb_features = [feature_idx_to_name(i) for i in range(args.dynamicemb_num)]
+        dyn_emb_features = [
+            feature_idx_to_name(i) for i in range(args.dynamicemb_num)
+        ]
 
         debugger.feature_before_all2all(sparse_feature)
         debugger.sequence_embds_after_all2all(
@@ -531,6 +550,12 @@ def main(argv: List[str]) -> None:
         type=str2bool,
         default=True,
         help="Use index deduplication (default: True).",
+    )
+    parser.add_argument(
+        "--empty_nonzero_ranks",
+        type=str2bool,
+        default=False,
+        help="Feed empty sparse batches to all nonzero ranks for regression testing.",
     )
     args = parser.parse_args()
 
