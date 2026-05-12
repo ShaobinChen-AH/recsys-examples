@@ -250,7 +250,7 @@ class HSTUBatch(BaseBatch):
             self.action_feature_name, str
         ), "action_feature_name must be None or a string"
         assert isinstance(
-            self.max_num_candidates, (int, torch.export.dynamic_shapes._IntWrapper)
+            self.max_num_candidates, int
         ), "max_num_candidates must be an int"
 
     def num_loss_tokens(self) -> torch.Tensor:

@@ -37,8 +37,6 @@ class BaseBatch(Pipelineable):
         assert (
             isinstance(self.batch_size, int)
             and self.batch_size > 0
-            or isinstance(self.batch_size, torch.export.dynamic_shapes._IntWrapper)
-            and self.batch_size.val > 0
         )
         self.actual_batch_size = (
             self.batch_size
