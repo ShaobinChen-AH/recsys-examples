@@ -246,7 +246,7 @@ def run_static_sweep(
 
         for r in trace_records:
             with open(out_jsonl, "a") as f:
-                f.write(json.dumps(r) + "")
+                f.write(json.dumps(r) + "\n")
 
         valid = [r for r in trace_records if "latency_ms" in r]
         mean_lat = sum(r["latency_ms"] for r in valid) / max(1, len(valid)) if valid else float("nan")
