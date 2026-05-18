@@ -185,6 +185,16 @@ class InferenceDenseModule(torch.nn.Module):
             self.setup_for_cudagraph(
                 hstu_config, kvcache_config, use_cudagraph, cudagraph_configs
             )
+        self._max_kv_pages = kvcache_config.blocks_in_primary_pool
+        self.hotstate = None
+
+    def enable_hotstate(self, total_hbm_bytes: int,
+                    embedding_module, kv_module):
+        self.hotstate = HotStateController(
+            total_hbm_bytes=total_hbm_bytes,
+            embedding_module=embedding_module,
+            kv_module=kv_module,
+        )
 
     def setup_for_kvcache(self, hstu_config, kvcache_config):
         max_batch_size = hstu_config.max_batch_size

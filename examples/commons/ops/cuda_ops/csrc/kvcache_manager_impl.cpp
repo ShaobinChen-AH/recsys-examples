@@ -590,6 +590,8 @@ GPUKVCacheMangerImpl::GPUKVCacheMangerImpl(
     this->queued_offload_limits = max_queued_offload_tokens;
     this->offload_busy_.store(false);
     this->offload_worker = std::thread(&GPUKVCacheMangerImpl::offload_loop, this);
+
+    _active_page_limit = num_primary_cache_pages;
 };
 
 GPUKVCacheMangerImpl::~GPUKVCacheMangerImpl() {
@@ -603,6 +605,38 @@ GPUKVCacheMangerImpl::~GPUKVCacheMangerImpl() {
 
     cudaFree(offload_device_buffers);
     cudaFree(onload_device_buffers);
+}
+
+int GPUKVCacheMangerImpl::get_user_page_count(int64_t uid) {
+    auto it = _uid_to_page_id.find(uid);
+    return (it != _uid_to_page_id.end()) ? (int)it->second.size() : 0;
+}
+
+void GPUKVCacheMangerImpl::set_active_page_limit(int new_limit) {
+    int current_active = num_primary_cache_pages - (int)_withheld_pages.size();
+    if (new_limit > num_primary_cache_pages)
+        new_limit = num_primary_cache_pages;
+    if (new_limit < 1)
+        new_limit = 1;
+    if (new_limit == current_active)
+        return;
+
+    if (new_limit > current_active) {
+        int to_release = new_limit - current_active;
+        for (int i = 0; i < to_release && !_withheld_pages.empty(); i++) {
+            _empty_pages.push(_withheld_pages.front());
+            _withheld_pages.pop();
+        }
+    } else {
+        int to_withhold = current_active - new_limit;
+        for (int i = 0; i < to_withhold; i++) {
+            if (!_empty_pages.empty()) {
+                _withheld_pages.push(_empty_pages.front());
+                _empty_pages.pop();
+            }
+        }
+    }
+    _active_page_limit = new_limit;
 }
 
 int64_t GPUKVCacheMangerImpl::getUIdToEvict(std::unordered_set<int64_t> extra_freezed_uids) {

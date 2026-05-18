@@ -405,6 +405,106 @@ def epsilon_schedule(measured_idx: int, max_explore: int = 300) -> float:
         return 0.0
     return 0.5 * (1.0 - measured_idx / max_explore)
 
+def run_hotstate_arbiter(dataset, total_available, warmup_batches,
+                         measure_batches, num_users, out_jsonl,
+                         hidden_dim, num_layers, num_heads, head_dim,
+                         dtype, max_seqlen, total_hbm_bytes):
+    """Run with full HotState controller — zero rebuilds, self-discovering."""
+
+    # Build ONE model with max KV pages
+    max_pages = compute_split_params(total_hbm_bytes, 20, 80,
+        num_layers, num_heads, head_dim, DEFAULT_KV_PAGE_SIZE, dtype)[2]
+
+    model = build_inference_model(hidden_dim, num_layers, num_heads,
+                                  head_dim, dtype, max_seqlen, max_pages)
+
+    # Get embedding module reference (from the inference ranking model)
+    # This is set up by get_inference_ranking_gr
+    emb_module = model.sparse_module
+
+    # Enable HotState
+    model.dense_module.enable_hotstate(
+        total_hbm_bytes=total_hbm_bytes,
+        embedding_module=emb_module,
+        kv_module=model.dense_module.async_kvcache,
+    )
+    controller = model.dense_module.hotstate
+
+    print(f"=== HotState: Unified HBM Control Plane ===")
+    print(f"Total HBM: {total_hbm_bytes / 1024**3:.2f} GiB")
+    print(f"KV pages: {max_pages} (max), dynamically managed")
+    print(f"Embedding: hot/cold row-group granularity")
+    print(f"")
+
+    dataset._iloc = 0
+    dataloader = get_data_loader(dataset)
+    it = iter(dataloader)
+
+    # Warmup
+    print(f"Warming up ({warmup_batches} batches)...")
+    for _ in range(warmup_batches):
+        batch, uids, thl = next(it)
+        controller.before_batch(batch, uids, thl)
+        with torch.inference_mode():
+            model.forward_with_kvcache(batch, uids, thl)
+        controller.after_batch(batch, 0.0)
+
+    # Measure
+    trace_records = []
+    kv_budget_history = []
+    print(f"\nMeasuring ({measure_batches} batches)...")
+    for i in range(measure_batches):
+        batch, uids, thl = next(it)
+        control = controller.before_batch(batch, uids, thl)
+
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        with torch.inference_mode():
+            model.forward_with_kvcache(batch, uids, thl)
+        torch.cuda.synchronize()
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+
+        controller.after_batch(batch, latency_ms)
+
+        hist_len = thl[0].item() // 2
+        user_id = int(uids[0].item())
+        kv_budget_history.append(control["kv_page_budget"])
+
+        trace_records.append({
+            "split": f"hotstate",
+            "split_lhs": 0, "split_rhs": 0,
+            "kv_page_budget": control["kv_page_budget"],
+            "hbm_bytes_used": control["hbm_bytes_used"],
+            "evicted": control["evicted"],
+            "admitted": control["admitted"],
+            "batch_idx": i,
+            "latency_ms": latency_ms,
+            "seq_history_len": hist_len,
+            "user_id": user_id,
+            "epoch": control["epoch"],
+        })
+        if i % 20 == 0:
+            print(f"  [{i+1}/{measure_batches}] latency={latency_ms:.2f}ms "
+                  f"hist={hist_len} kv_pages={control['kv_page_budget']}")
+
+    teardown_model(model)
+
+    lats = sorted(r["latency_ms"] for r in trace_records)
+    n = len(lats)
+    def pct(v, r):
+        return v[min(len(v)-1, int(len(v)*r))] if v else float("nan")
+
+    results = {
+        "mean": sum(lats)/n, "p50": pct(lats,0.5), "p95": pct(lats,0.95),
+        "p99": pct(lats,0.99), "p99_9": pct(lats,0.999),
+        "max": max(lats), "num_records": n,
+        "kv_budget_range": f"{min(kv_budget_history)}-{max(kv_budget_history)}",
+    }
+    with open(out_jsonl, "w") as f:
+        for r in trace_records:
+            f.write(json.dumps(r) + "\n")
+    return results
+
 
 def run_discover_arbiter(dataset, total_available, warmup_batches,
                          initial_measure_batches, num_users, out_jsonl,
@@ -595,7 +695,7 @@ def main():
     parser.add_argument("--num-users", type=int, default=8)
     # Arbiter config
     parser.add_argument("--mode", type=str, default="discover",
-                        choices=["discover", "exploit"],
+                        choices=["discover", "exploit", "hotstate"],
                         help="discover = Phase 3 (ε-greedy), exploit = Phase 2")
     parser.add_argument("--thresholds", type=str, default=None,
                         help="For exploit mode: e.g. '3072:50:50'")
@@ -639,6 +739,15 @@ def main():
         )
         results = run_exploit_arbiter(
             measure_batches=measure_batches, policy=policy, **common)
+    elif args.mode == "hotstate":
+        results = run_hotstate_arbiter(
+            dataset=dataset, total_available=total_available,
+            warmup_batches=warmup_batches, measure_batches=measure_batches,
+            num_users=args.num_users, out_jsonl=args.out_jsonl,
+            hidden_dim=args.hidden_dim, num_layers=args.num_layers,
+            num_heads=args.num_heads, head_dim=args.head_dim,
+            dtype=dtype, max_seqlen=max_seqlen,
+            total_hbm_bytes=total_hbm_bytes)
 
     else:  # discover
         results = run_discover_arbiter(
