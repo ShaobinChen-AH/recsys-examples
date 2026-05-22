@@ -39,6 +39,9 @@ from dynamicemb_extensions import (
     table_update_counter_with_layout,
 )
 
+# Must match kMaxNumScores in score.cuh.
+kMaxNumScores: int = 8
+
 
 @dataclass(frozen=True)
 class ScoreSpec:
@@ -316,8 +319,8 @@ class LinearBucketTable(ScoredHashTable):
 
         # score type
         assert (
-            len(score_specs) >= 1 and len(score_specs) <= 1
-        ), "Only support at least one and at most one ScoreSpec in this version."
+            len(score_specs) >= 1 and len(score_specs) <= kMaxNumScores
+        ), f"ScoreSpec count must be between 1 and {kMaxNumScores}"
         self.score_specs_ = sorted(
             score_specs, key=lambda x: (not x.is_reduction, x.priority)
         )
@@ -331,6 +334,10 @@ class LinearBucketTable(ScoredHashTable):
             ), "Only accept 64 bits unsigned integer as score's type."
             self.score_types_.append(score_spec.dtype)
             self.score_names_.append(score_spec.name)
+        self.num_scores_ = len(self.score_specs_)
+        self._extra_policies_list = [
+            spec.policy for spec in self.score_specs_[1:]
+        ]
 
         # digest type
         self.digest_type_ = torch.uint8
@@ -511,6 +518,34 @@ class LinearBucketTable(ScoredHashTable):
             ), "Global timer can only work for torch.uint64"
         return score.value, policy
 
+    def _parse_scores(
+        self,
+        scores: List[ScoreArg],
+    ) -> Tuple[int, List[Optional[torch.Tensor]], ScorePolicy]:
+        num = self.num_scores_
+        score_values: List[Optional[torch.Tensor]] = [None] * num
+        primary_policy = self.score_specs_[0].policy
+        for s in range(num):
+            if s < len(scores):
+                sv = scores[s]
+                name = self.score_names_[s]
+                if sv.name != name:
+                    raise ValueError(
+                        f"Score name mismatch at index {s}: "
+                        f"expected {name}, got {sv.name}"
+                    )
+                policy = (
+                    sv.policy
+                    if sv.policy is not None
+                    else self.score_specs_[s].policy
+                )
+                if s == 0:
+                    primary_policy = policy
+                if policy == ScorePolicy.GLOBAL_TIMER:
+                    assert self.score_specs_[s].dtype == torch.uint64
+                score_values[s] = sv.value
+        return num, score_values, primary_policy
+
     def lookup(
         self,
         keys: torch.Tensor,
@@ -525,6 +560,10 @@ class LinearBucketTable(ScoredHashTable):
             (score_out, founds, indices): score tensor (int64), found mask, indices.
         """
         score_value, policy = self._parse_score(score)
+        extra_inputs: List[Optional[torch.Tensor]] = []
+        # For multi-score, additional scores are passed as a list of none/values.
+        # The C++ side uses the primary score_value/policy for the first score
+        # and Assign policy for extra scores by default.
 
         score_out, founds, indices = table_lookup(
             self.table_storage_,
@@ -534,6 +573,9 @@ class LinearBucketTable(ScoredHashTable):
             table_ids,
             score_value,
             policy,
+            num_scores=self.num_scores_,
+            score_inputs=extra_inputs,
+            extra_policies=self._extra_policies_list,
         )
         return score_out, founds, indices
 
@@ -544,6 +586,7 @@ class LinearBucketTable(ScoredHashTable):
         score: ScoreArg,
         insert_results: Optional[torch.Tensor] = None,
         score_out: Optional[torch.Tensor] = None,
+        extra_scores: Optional[List[ScoreArg]] = None,
     ) -> torch.Tensor:
         """
         Keys have to be unique.
@@ -554,6 +597,13 @@ class LinearBucketTable(ScoredHashTable):
         If score_out is provided (caller-allocated int64 tensor), it is filled with output scores.
         """
         score_value, policy = self._parse_score(score)
+        extra_inputs: List[Optional[torch.Tensor]] = []
+        if extra_scores and self.num_scores_ > 1:
+            extra_inputs = [None] * (self.num_scores_ - 1)
+            for extra in extra_scores:
+                idx = self.score_names_.index(extra.name)
+                if idx > 0:
+                    extra_inputs[idx - 1] = extra.value
 
         if os.environ.get("DEMB_DETERMINISM_MODE") is not None:
             return self._deterministic_insert(keys, table_ids, score_value, policy)
@@ -570,6 +620,9 @@ class LinearBucketTable(ScoredHashTable):
             self._ref_counter,
             insert_results,
             score_out,
+            num_scores=self.num_scores_,
+            score_inputs=extra_inputs,
+            extra_policies=self._extra_policies_list,
         )
         return indices
 
@@ -598,6 +651,39 @@ class LinearBucketTable(ScoredHashTable):
             return self._deterministic_insert_and_evict(
                 keys, table_ids, score_value, policy
             )
+
+        (
+            indices,
+            num_evicted,
+            evicted_keys,
+            evicted_indices,
+            evicted_scores,
+            evicted_table_ids,
+        ) = table_insert_and_evict(
+            self.table_storage_,
+            self.table_bucket_offsets_,
+            self.bucket_capacity_,
+            self.bucket_sizes,
+            keys,
+            table_ids,
+            score_value,
+            policy,
+            self._ref_counter,
+            insert_results=insert_results,
+            score_output=score_out,
+            num_scores=self.num_scores_,
+            extra_policies=self._extra_policies_list,
+        )
+
+        h_num_evicted = num_evicted.cpu().item()
+        return (
+            indices,
+            h_num_evicted,
+            evicted_keys[:h_num_evicted],
+            evicted_indices[:h_num_evicted],
+            evicted_scores[:h_num_evicted],
+            evicted_table_ids[:h_num_evicted],
+        )
 
         (
             indices,
@@ -722,6 +808,8 @@ class LinearBucketTable(ScoredHashTable):
             ovf_storage=self.overflow_table_storage_,
             ovf_bucket_capacity=self.overflow_bucket_capacity_,
             ovf_output_offsets=self.overflow_output_offsets_,
+            num_scores=self.num_scores_,
+            extra_policies=self._extra_policies_list,
         )
         return score_out, founds, indices
 
@@ -771,6 +859,8 @@ class LinearBucketTable(ScoredHashTable):
             ovf_bucket_sizes=self.overflow_bucket_sizes,
             ovf_counter=self._ovf_counter,
             ovf_output_offsets=self.overflow_output_offsets_,
+            num_scores=self.num_scores_,
+            extra_policies=self._extra_policies_list,
         )
 
         h_num_evicted = num_evicted.cpu().item()
@@ -800,6 +890,7 @@ class LinearBucketTable(ScoredHashTable):
             self.bucket_sizes,
             keys,
             table_ids,
+            num_scores=self.num_scores_,
         )
 
     def load(
@@ -892,15 +983,33 @@ class LinearBucketTable(ScoredHashTable):
                 for score_name in scores_dict:
                     scores_dict[score_name] = scores_dict[score_name][masks]
 
-            assert len(scores_dict) == 1, "Only single score is supported."
-            score_name, scores = next(iter(scores_dict.items()))
+            # Insert with the primary score (index 0). Extra scores are stored
+            # as metadata on the table slots.
+            primary_name = self.score_names_[0]
+            if primary_name not in scores_dict:
+                scores_dict[primary_name] = torch.zeros(
+                    keys.numel(), dtype=SCORE_TYPE, device=device
+                )
             score_arg = ScoreArg(
-                name=score_name, value=scores, policy=ScorePolicy.ASSIGN
+                name=primary_name,
+                value=scores_dict[primary_name],
+                policy=ScorePolicy.ASSIGN,
             )
+            extra_score_args = []
+            for s in range(1, self.num_scores_):
+                name = self.score_names_[s]
+                if name in scores_dict:
+                    extra_score_args.append(
+                        ScoreArg(
+                            name=name,
+                            value=scores_dict[name],
+                            policy=ScorePolicy.ASSIGN,
+                        )
+                    )
             tid = torch.full(
                 (keys.numel(),), load_table_id, dtype=torch.int64, device=device
             )
-            self.insert(keys, tid, score_arg)
+            self.insert(keys, tid, score_arg, extra_scores=extra_score_args)
 
         fkey.close()
         for name in fscores.keys():
@@ -947,13 +1056,12 @@ class LinearBucketTable(ScoredHashTable):
 
         key_dtype = self.key_type_
 
-        # With single score, resolve the threshold to a single optional value.
+        # Resolve threshold for the primary (eviction) score.
         threshold_: Optional[int] = None
         if thresholds is not None:
             assert len(score_names) == len(
                 thresholds
             ), "Thresholds' length have to consistent with score names."
-            assert len(self.score_names_) == 1, "Only single score is supported."
             if self.score_names_[0] in score_names:
                 idx = score_names.index(self.score_names_[0])
                 threshold_ = thresholds[idx]
@@ -969,6 +1077,7 @@ class LinearBucketTable(ScoredHashTable):
                 key_dtype,
                 threshold_,
                 begin_slot,
+                num_scores=self.num_scores_,
             )
 
             actual_length = d_counter.item()
@@ -976,9 +1085,25 @@ class LinearBucketTable(ScoredHashTable):
                 named_scores: Dict[str, torch.Tensor] = {}
                 for score_name in score_names:
                     if score_name in self.score_names_:
-                        named_scores[score_name] = (
-                            score[:actual_length].to(SCORE_TYPE).to(target_device)
-                        )
+                        sidx = self.score_names_.index(score_name)
+                        if sidx == 0:
+                            named_scores[score_name] = (
+                                score[:actual_length].to(SCORE_TYPE).to(target_device)
+                            )
+                        else:
+                            # Extract extra scores from the scores arrays
+                            idx_tensor = indices[:actual_length].long()
+                            bucket_ids = (
+                                idx_tensor // self.bucket_capacity_
+                                - int(self.table_bucket_offsets_cpu_[table_id].item())
+                            )
+                            slot_offsets = idx_tensor % self.bucket_capacity_
+                            extra_score_vals = self.scores_list[sidx][
+                                bucket_ids, slot_offsets
+                            ]
+                            named_scores[score_name] = (
+                                extra_score_vals.to(SCORE_TYPE).to(target_device)
+                            )
 
                 yield (
                     keys[:actual_length].to(KEY_TYPE).to(target_device),
@@ -1001,15 +1126,37 @@ class LinearBucketTable(ScoredHashTable):
                     key_dtype,
                     threshold_,
                     ovf_begin,
+                    num_scores=self.num_scores_,
                 )
                 actual_length = d_counter.item()
                 if actual_length > 0:
                     named_scores: Dict[str, torch.Tensor] = {}
                     for score_name in score_names:
                         if score_name in self.score_names_:
-                            named_scores[score_name] = (
-                                score[:actual_length].to(SCORE_TYPE).to(target_device)
-                            )
+                            sidx = self.score_names_.index(score_name)
+                            if sidx == 0:
+                                named_scores[score_name] = (
+                                    score[:actual_length].to(SCORE_TYPE).to(target_device)
+                                )
+                            else:
+                                idx_tensor = indices[:actual_length].long()
+                                ovf_local_idx = (
+                                    idx_tensor
+                                    - int(self.overflow_output_offsets_[table_id].item())
+                                )
+                                bucket_ids = (
+                                    ovf_local_idx // self.overflow_bucket_capacity_
+                                )
+                                slot_offsets = (
+                                    ovf_local_idx % self.overflow_bucket_capacity_
+                                )
+                                # scores_list[sidx] is [num_buckets, bucket_capacity] for overflow
+                                extra_score_vals = self.scores_list[sidx][
+                                    bucket_ids, slot_offsets
+                                ]
+                                named_scores[score_name] = (
+                                    extra_score_vals.to(SCORE_TYPE).to(target_device)
+                                )
                     ovf_out_offset = (
                         int(self.overflow_output_offsets_[table_id].item())
                         if return_index
@@ -1126,6 +1273,7 @@ class LinearBucketTable(ScoredHashTable):
             threshold_val,
             count_begin,
             count_end,
+            num_scores=self.num_scores_,
         )
 
         # if not dist.is_initialized() or dist.get_world_size(group=pg) == 1:
@@ -1141,6 +1289,7 @@ class LinearBucketTable(ScoredHashTable):
                 threshold_val,
                 ovf_begin,
                 ovf_end,
+                num_scores=self.num_scores_,
             )
             total_matched += d_ovf_matched.cpu().item()
 

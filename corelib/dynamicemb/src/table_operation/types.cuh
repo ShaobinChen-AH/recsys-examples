@@ -85,10 +85,12 @@ __forceinline__ __device__ void async_copy_bulk(T *dst, T const *src) {
   }
 }
 
-template <typename KeyType_,
+template <typename KeyType_, int NumScores_ = 1,
           typename = std::enable_if_t<std::is_integral_v<KeyType_> &&
                                       sizeof(KeyType_) == 8>>
 struct LinearBucket {
+
+  static constexpr int NumScores = NumScores_;
 
   __forceinline__ __device__ LinearBucket(uint8_t *storage, int64_t capacity)
       : storage_(storage), capacity_(capacity) {}
@@ -241,7 +243,8 @@ struct LinearBucket {
   static constexpr int KeyOffset = 0;
   static constexpr int DigestOffset = KeyOffset + sizeof(KeyType);
   static constexpr int ScoreOffset = DigestOffset + sizeof(DigestType);
-  static constexpr int BucketBytes = ScoreOffset + sizeof(ScoreType);
+  static constexpr int ScoreStride = sizeof(ScoreType);
+  static constexpr int BucketBytes = ScoreOffset + sizeof(ScoreType) * NumScores;
 
   static __device__ __forceinline__ uint64_t memory_usage(int64_t size) {
     return BucketBytes * size;
@@ -258,8 +261,10 @@ struct LinearBucket {
            iter;
   }
 
-  __forceinline__ __device__ ScoreType *scores(const Iterator &iter) const {
-    return reinterpret_cast<ScoreType *>(storage_ + ScoreOffset * capacity_) +
+  // Access the s-th score (0-indexed) for the given slot.
+  // Score 0 is the primary (eviction) score.
+  __forceinline__ __device__ ScoreType *scores(const Iterator &iter, int s = 0) const {
+    return reinterpret_cast<ScoreType *>(storage_ + (ScoreOffset + s * ScoreStride) * capacity_) +
            iter;
   }
 

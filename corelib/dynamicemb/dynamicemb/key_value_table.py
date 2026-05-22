@@ -237,6 +237,15 @@ def create_table_state(
     device_idx = torch.cuda.current_device()
     device = torch.device(f"cuda:{device_idx}")
     score_policy = get_score_policy(base_opt.score_strategy)
+    extra_score_specs = []
+    for n in range(base_opt.num_extra_scores):
+        extra_score_specs.append(
+            ScoreSpec(
+                name=f"extra_{n}",
+                policy=ScorePolicy.ASSIGN,
+                is_reduction=False,
+            )
+        )
     evict_strategy = base_opt.evict_strategy.value
 
     # NO_EVICTION: key_index_map uses max_load_factor=0.5 to avoid eviction; table uses init_capacity.
@@ -260,7 +269,7 @@ def create_table_state(
         capacity=capacities,
         bucket_capacity=base_opt.bucket_capacity,
         key_type=base_opt.index_type,
-        score_specs=[score_policy],
+        score_specs=[score_policy] + extra_score_specs,
         device=device,
         enable_overflow=enable_overflow,
     )

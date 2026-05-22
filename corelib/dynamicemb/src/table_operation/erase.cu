@@ -23,7 +23,7 @@ namespace dyn_emb {
 void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
                  int64_t bucket_capacity, at::Tensor bucket_sizes,
                  at::Tensor keys, at::Tensor table_ids,
-                 std::optional<at::Tensor> indices) {
+                 std::optional<at::Tensor> indices, int num_scores) {
 
   int64_t num_total = keys.size(0);
   if (num_total == 0)
@@ -42,22 +42,24 @@ void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
   DISPATCH_KEY_TYPE(key_type, KeyType, [&] {
     auto keys_ = get_pointer<KeyType>(keys);
 
-    constexpr int64_t total_size =
-        sizeof(KeyType) + sizeof(DigestType) + sizeof(ScoreType);
+    int64_t total_size =
+        sizeof(KeyType) + sizeof(DigestType) + num_scores * sizeof(ScoreType);
     int64_t bucket_bytes = bucket_capacity * total_size;
     int64_t num_buckets =
         table_storage.numel() * table_storage.element_size() / bucket_bytes;
 
-    using Bucket = LinearBucket<KeyType>;
-    using Table = LinearBucketTable<Bucket>;
+    DISPATCH_NUM_SCORES(num_scores, NumScoresV, [&] {
+      using Bucket = LinearBucket<KeyType, NumScoresV>;
+      using Table = LinearBucketTable<Bucket>;
 
-    auto table = Table(reinterpret_cast<uint8_t *>(table_storage.data_ptr()),
-                       num_buckets, bucket_capacity);
+      auto table = Table(reinterpret_cast<uint8_t *>(table_storage.data_ptr()),
+                         num_buckets, bucket_capacity);
 
-    table_erase_kernel<Table, 1>
-        <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
-            table, table_bucket_offsets_ptr, bucket_sizes_, num_total, keys_,
-            table_ids_ptr, indices_);
+      table_erase_kernel<Table, 1>
+          <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
+             stream>>>(table, table_bucket_offsets_ptr, bucket_sizes_, num_total,
+                       keys_, table_ids_ptr, indices_);
+    });
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }

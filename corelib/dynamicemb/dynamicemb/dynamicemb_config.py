@@ -301,6 +301,7 @@ class DynamicEmbTableOptions:
     dist_type: str = "roundrobin"
     admit_strategy: Optional[AdmissionStrategy] = None
     admission_counter: Optional[Any] = None
+    num_extra_scores: int = 0  # Additional score slots per key (0 = single-score mode)
 
     def __post_init__(self):
         assert (

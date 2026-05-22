@@ -62,6 +62,53 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
     throw std::runtime_error("Not supported score policy.");                   \
   }
 
+#define DISPATCH_NUM_SCORES(NUM_SCORES, HINT, ...)                             \
+  switch (NUM_SCORES) {                                                        \
+    case 1: {                                                                  \
+      constexpr int HINT = 1;                                                  \
+      __VA_ARGS__();                                                           \
+      break;                                                                   \
+    }                                                                          \
+    case 2: {                                                                  \
+      constexpr int HINT = 2;                                                  \
+      __VA_ARGS__();                                                           \
+      break;                                                                   \
+    }                                                                          \
+    case 3: {                                                                  \
+      constexpr int HINT = 3;                                                  \
+      __VA_ARGS__();                                                           \
+      break;                                                                   \
+    }                                                                          \
+    case 4: {                                                                  \
+      constexpr int HINT = 4;                                                  \
+      __VA_ARGS__();                                                           \
+      break;                                                                   \
+    }                                                                          \
+    case 5: {                                                                  \
+      constexpr int HINT = 5;                                                  \
+      __VA_ARGS__();                                                           \
+      break;                                                                   \
+    }                                                                          \
+    case 6: {                                                                  \
+      constexpr int HINT = 6;                                                  \
+      __VA_ARGS__();                                                           \
+      break;                                                                   \
+    }                                                                          \
+    case 7: {                                                                  \
+      constexpr int HINT = 7;                                                  \
+      __VA_ARGS__();                                                           \
+      break;                                                                   \
+    }                                                                          \
+    case 8: {                                                                  \
+      constexpr int HINT = 8;                                                  \
+      __VA_ARGS__();                                                           \
+      break;                                                                   \
+    }                                                                          \
+  default:                                                                     \
+    throw std::runtime_error("Unsupported num_scores (1-8): " +                \
+                             std::to_string(NUM_SCORES));                      \
+  }
+
 namespace dyn_emb {
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
@@ -70,7 +117,10 @@ table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
              std::optional<at::Tensor> score_input, ScorePolicyType policy_type,
              std::optional<at::Tensor> ovf_storage = std::nullopt,
              int64_t ovf_bucket_capacity = 0,
-             std::optional<at::Tensor> ovf_output_offsets = std::nullopt);
+             std::optional<at::Tensor> ovf_output_offsets = std::nullopt,
+             int num_scores = 1,
+             std::vector<std::optional<at::Tensor>> score_inputs = {},
+             std::vector<ScorePolicyType> extra_policies = {});
 
 at::Tensor table_insert(at::Tensor table_storage,
                         at::Tensor table_bucket_offsets,
@@ -79,7 +129,12 @@ at::Tensor table_insert(at::Tensor table_storage,
                         std::optional<at::Tensor> score_input,
                         ScorePolicyType policy_type, at::Tensor counter,
                         std::optional<at::Tensor> insert_results = std::nullopt,
-                        std::optional<at::Tensor> score_output = std::nullopt);
+                        std::optional<at::Tensor> score_output = std::nullopt,
+                        int num_scores = 1,
+                        std::vector<std::optional<at::Tensor>> score_inputs = {},
+                         std::vector<std::optional<at::Tensor>> score_outputs =
+                             {},
+                         std::vector<ScorePolicyType> extra_policies = {});
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
            at::Tensor>
@@ -94,22 +149,27 @@ table_insert_and_evict(
     int64_t ovf_bucket_capacity = 0,
     std::optional<at::Tensor> ovf_bucket_sizes = std::nullopt,
     std::optional<at::Tensor> ovf_counter = std::nullopt,
-    std::optional<at::Tensor> ovf_output_offsets = std::nullopt);
+    std::optional<at::Tensor> ovf_output_offsets = std::nullopt,
+    int num_scores = 1,
+     std::vector<std::optional<at::Tensor>> score_inputs = {},
+     std::vector<std::optional<at::Tensor>> score_outputs = {},
+     std::vector<ScorePolicyType> extra_policies = {});
 
 void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
                  int64_t bucket_capacity, at::Tensor bucket_sizes,
                  at::Tensor keys, at::Tensor table_ids,
-                 std::optional<at::Tensor> indices);
+                 std::optional<at::Tensor> indices, int num_scores = 1);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 table_export_batch(at::Tensor table_storage, int64_t bucket_capacity,
                    int64_t batch, int64_t offset, torch::Dtype key_dtype,
                    std::optional<ScoreType> threshold = std::nullopt,
-                   int64_t table_begin = 0);
+                   int64_t table_begin = 0, int num_scores = 1);
 
 at::Tensor table_count_matched(at::Tensor table_storage, torch::Dtype key_dtype,
                                int64_t bucket_capacity, ScoreType threshold,
-                               int64_t begin = -1, int64_t end = -1);
+                               int64_t begin = -1, int64_t end = -1,
+                               int num_scores = 1);
 
 std::vector<at::Tensor> table_partition(at::Tensor storage,
                                         std::vector<torch::Dtype> dtypes,

@@ -25,7 +25,9 @@ void table_export_single_score(at::Tensor table_storage,
                                int64_t offset, at::Tensor counter,
                                at::Tensor keys, at::Tensor score,
                                std::optional<ScoreType> threshold,
-                               at::Tensor indices, int64_t table_begin) {
+                               at::Tensor indices, int64_t table_begin,
+                               int num_scores,
+                               const std::vector<at::Tensor> &extra_scores) {
   auto key_type = get_data_type(keys);
   auto scores_ = reinterpret_cast<ScoreType *>(score.data_ptr<int64_t>());
   auto indices_ = indices.data_ptr<IndexType>();
@@ -42,44 +44,55 @@ void table_export_single_score(at::Tensor table_storage,
   DISPATCH_KEY_TYPE(key_type, KeyType, [&] {
     auto keys_ = get_pointer<KeyType>(keys);
 
-    constexpr int64_t total_size =
-        sizeof(KeyType) + sizeof(DigestType) + sizeof(ScoreType);
+    int64_t total_size =
+        sizeof(KeyType) + sizeof(DigestType) + num_scores * sizeof(ScoreType);
     int64_t bucket_bytes = bucket_capacity * total_size;
     int64_t num_buckets =
         table_storage.numel() * table_storage.element_size() / bucket_bytes;
-
-    using Bucket = LinearBucket<KeyType>;
-    using Table = LinearBucketTable<Bucket>;
-
-    auto table = Table(reinterpret_cast<uint8_t *>(table_storage.data_ptr()),
-                       num_buckets, bucket_capacity);
 
     if (offset + num_total > num_buckets * bucket_capacity) {
       throw std::invalid_argument("Offset and batch size overflow.");
     }
 
-    if (num_total % 32 == 0) {
-      DISPATCH_BOOLEAN(score_pred, PredFlag, [&] {
-        using PredFunc = ExportPredFunctor<PredFlag>;
-        PredFunc pred(threshold_val);
-        table_export_batch_kernel<Table, PredFunc, 32>
-            <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
-               stream>>>(table, offset, offset + num_total,
-                         static_cast<IndexType>(table_begin), counter_, keys_,
-                         scores_, pred, indices_);
-      });
-
-    } else {
-      DISPATCH_BOOLEAN(score_pred, PredFlag, [&] {
-        using PredFunc = ExportPredFunctor<PredFlag>;
-        PredFunc pred(threshold_val);
-        table_export_batch_kernel<Table, PredFunc, 1>
-            <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
-               stream>>>(table, offset, offset + num_total,
-                         static_cast<IndexType>(table_begin), counter_, keys_,
-                         scores_, pred, indices_);
-      });
+    // Build score pointer array for kernel
+    ScoreType *score_ptrs[kMaxNumScores] = {};
+    score_ptrs[0] = scores_;
+    for (int s = 1; s < num_scores; ++s) {
+      if (s - 1 < (int)extra_scores.size() && extra_scores[s - 1].defined()) {
+        score_ptrs[s] =
+            reinterpret_cast<ScoreType *>(extra_scores[s - 1].data_ptr<int64_t>());
+      }
     }
+
+    DISPATCH_NUM_SCORES(num_scores, NumScoresV, [&] {
+      using Bucket = LinearBucket<KeyType, NumScoresV>;
+      using Table = LinearBucketTable<Bucket>;
+
+      auto table = Table(reinterpret_cast<uint8_t *>(table_storage.data_ptr()),
+                         num_buckets, bucket_capacity);
+
+      if (num_total % 32 == 0) {
+        DISPATCH_BOOLEAN(score_pred, PredFlag, [&] {
+          using PredFunc = ExportPredFunctor<PredFlag>;
+          PredFunc pred(threshold_val);
+          table_export_batch_kernel<Table, PredFunc, 32>
+              <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
+                 stream>>>(table, offset, offset + num_total,
+                           static_cast<IndexType>(table_begin), counter_, keys_,
+                           score_ptrs, pred, indices_);
+        });
+      } else {
+        DISPATCH_BOOLEAN(score_pred, PredFlag, [&] {
+          using PredFunc = ExportPredFunctor<PredFlag>;
+          PredFunc pred(threshold_val);
+          table_export_batch_kernel<Table, PredFunc, 1>
+              <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
+                 stream>>>(table, offset, offset + num_total,
+                           static_cast<IndexType>(table_begin), counter_, keys_,
+                           score_ptrs, pred, indices_);
+        });
+      }
+    });
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -87,7 +100,8 @@ void table_export_single_score(at::Tensor table_storage,
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 table_export_batch(at::Tensor table_storage, int64_t bucket_capacity,
                    int64_t batch, int64_t offset, torch::Dtype key_dtype,
-                   std::optional<ScoreType> threshold, int64_t table_begin) {
+                   std::optional<ScoreType> threshold, int64_t table_begin,
+                   int num_scores) {
   auto device = table_storage.device();
   auto key_scalar_type = static_cast<torch::ScalarType>(key_dtype);
 
@@ -103,10 +117,19 @@ table_export_batch(at::Tensor table_storage, int64_t bucket_capacity,
   if (batch == 0)
     return std::make_tuple(counter, keys, score, indices);
 
+  // Allocate extra score tensors
+  std::vector<at::Tensor> extra_scores;
+  for (int s = 1; s < num_scores; ++s) {
+    extra_scores.push_back(torch::empty(
+        {batch}, torch::TensorOptions().dtype(torch::kInt64).device(device)));
+  }
+
   table_export_single_score(table_storage, bucket_capacity, batch, offset,
                             counter, keys, score, threshold, indices,
-                            table_begin);
+                            table_begin, num_scores, extra_scores);
 
+  // TODO: return extra scores as part of the tuple when needed.
   return std::make_tuple(counter, keys, score, indices);
 }
+
 } // namespace dyn_emb

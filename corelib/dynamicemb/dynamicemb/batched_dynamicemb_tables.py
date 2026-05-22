@@ -1031,6 +1031,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
     def _create_score(self):
         self._scores: Dict[str, int] = {}
+        self._extra_scores: Dict[str, Dict[str, int]] = {}
         for table_name, option in zip(self._table_names, self._dynamicemb_options):
             if option.score_strategy == DynamicEmbScoreStrategy.TIMESTAMP:
                 option.evict_strategy = DynamicEmbEvictStrategy.LRU
@@ -1047,6 +1048,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             elif option.score_strategy == DynamicEmbScoreStrategy.NO_EVICTION:
                 option.evict_strategy = DynamicEmbEvictStrategy.CUSTOMIZED
                 self._scores[table_name] = 0
+            # Initialize extra score entries
+            if option.num_extra_scores > 0:
+                extra = {}
+                for n in range(option.num_extra_scores):
+                    extra[f"extra_{n}"] = 0
+                self._extra_scores[table_name] = extra
 
     def _update_score(self):
         """Only STEP mode updates score; TIMESTAMP/LFU are not used by the underlying table or are constant."""

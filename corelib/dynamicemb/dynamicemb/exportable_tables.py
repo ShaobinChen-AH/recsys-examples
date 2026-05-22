@@ -114,6 +114,7 @@ class InferenceLinearBucketTable(torch.nn.Module):
         key_type: torch.dtype = torch.int64,
         bucket_capacity: int = 128,
         device: Optional[torch.device] = None,
+        num_scores: int = 1,
     ):
         """Initialize demo hash table.
 
@@ -133,6 +134,8 @@ class InferenceLinearBucketTable(torch.nn.Module):
         self.bucket_capacity_ = bucket_capacity
         self.num_tables_ = len(capacity)
 
+        self.num_scores_ = num_scores
+
         per_table_num_buckets = []
         bucket_offset_list = [0]
         for cap in capacity:
@@ -143,7 +146,7 @@ class InferenceLinearBucketTable(torch.nn.Module):
         total_buckets = bucket_offset_list[-1]
         self.capacity_ = total_buckets * self.bucket_capacity_
 
-        bytes_per_slot = 8 + 1 + 8
+        bytes_per_slot = 8 + 1 + 8 * num_scores
         total_storage_bytes = bytes_per_slot * bucket_capacity * total_buckets
 
         self.register_buffer(
@@ -184,6 +187,7 @@ class InferenceLinearBucketTable(torch.nn.Module):
             None,
             0,
             None,
+            num_scores=self.num_scores_,
         )
 
         return score_out, founds, indices
