@@ -24,6 +24,8 @@ class EmbeddingAdapter:
 
     def calibrate(self):
         """Read actual table dimensions from the embedding module."""
+        if self._module is None:
+            return
         try:
             storage = self._module._storage
             if hasattr(storage, 'tables'):
@@ -70,3 +72,6 @@ class EmbeddingAdapter:
             ),
         ]
         return handles
+    def trigger_flush(self):
+        if self._module is not None and hasattr(self._module, 'flush'):
+            self._module.flush()

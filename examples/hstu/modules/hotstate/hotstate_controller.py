@@ -11,8 +11,7 @@ from modules.hotstate.hot_set_manager import HotSetManager
 class HotStateController:
     """Unified HBM control plane for generative recommendation inference."""
 
-    def __init__(self, total_hbm_bytes: int,
-                 embedding_module, kv_module):
+    def __init__(self, total_hbm_bytes: int, kv_module, embedding_module = None):
         self.emb_adapter = EmbeddingAdapter(embedding_module)
         self.kv_adapter = KVAdapter(kv_module)
         self.registry = StateRegistry()
@@ -39,6 +38,16 @@ class HotStateController:
                 h.logical_key, Placement.HBM, authoritative=False)
 
     # Public API
+    def set_embedding_module(self, embedding_module):
+        """Connect the embedding adapter after both dense and sparse modules exist."""
+        self.emb_adapter.embedding_module = embedding_module
+        self.emb_adapter.calibrate()
+        # Re-initialize directory with embedding handles
+        for h in self.emb_adapter.export_handles():
+            self.registry.register(h)
+            if Placement.HBM in h.placement:
+                self.directory.register(
+                    h.logical_key, Placement.HBM, authoritative=False)
 
     def before_batch(self, batch, user_ids, total_history_lengths) -> dict:
         """Called before each inference batch.

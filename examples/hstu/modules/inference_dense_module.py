@@ -33,6 +33,8 @@ from configs import (
 )
 from modules.hstu_block_inference import HSTUBlockInference
 
+from modules.hotstate.hotstate_controller import HotStateController
+
 if int(os.getenv("HSTU_INFERENCE_ONLY", 0)) != 1:
     from modules.hstu_block import HSTUBlock
 else:
@@ -282,6 +284,31 @@ class InferenceDenseModule(torch.nn.Module):
         self._mlp.bfloat16()
         return self
 
+    def enable_hotstate(self, total_hbm_bytes: int):
+        """Enable the HotState unified HBM control plane.
+
+        Must be called after model construction and after the sparse
+        (embedding) module has been created by InferenceRankingGR.
+
+        Args:
+            total_hbm_bytes: Total GPU HBM budget in bytes.
+        """
+        from modules.hotstate.hotstate_controller import HotStateController
+        self.hotstate = HotStateController(
+            total_hbm_bytes=total_hbm_bytes,
+            kv_module=self.async_kvcache,
+        )
+
+
+    def set_hotstate_embedding_module(self, embedding_module):
+        """Connect the embedding module to HotState after construction.
+
+        Called by InferenceRankingGR after both sparse and dense modules
+        are created, since HotState needs references to both.
+        """
+        if self.hotstate is not None:
+            self.hotstate.set_embedding_module(embedding_module)
+
     def half(self):
         """
         Convert the model to use half precision. Only affects the dense module.
@@ -358,6 +385,10 @@ class InferenceDenseModule(torch.nn.Module):
         prepare_kvcache_result: List,
     ):
         with torch.inference_mode():
+            control = None
+            if self.hotstate is not None:
+                control = self.hotstate.before_batch(
+                    batch, user_ids, total_history_lengths)
             (
                 old_cached_lengths,
                 num_history_tokens,

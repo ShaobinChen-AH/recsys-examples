@@ -132,8 +132,8 @@ private:
     nvcompStatus_t *decomp_status_;
     nvcompStatus_t *decomp_status_cpu_;
 
-    const nvcompBatchedANSCompressOpts_t k_comp_opts_ = {nvcomp_rANS, NVCOMP_TYPE_FLOAT16, {0}};
-    const nvcompBatchedANSDecompressOpts_t k_decomp_opts_ = nvcompBatchedANSDecompressDefaultOpts;
+    const nvcompBatchedANSOpts_t k_comp_opts_ = {nvcomp_rANS, uint8};
+    const nvcompBatchedANSOpts_t k_decomp_opts_ = nvcompBatchedANSDefaultOpts;
 };
 
 class GPUKVCacheMangerImpl;

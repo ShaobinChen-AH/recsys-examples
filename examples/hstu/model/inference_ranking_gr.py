@@ -171,4 +171,7 @@ def get_inference_ranking_gr(
         cudagraph_configs,
     )
 
+    if inference_dense.hotstate is not None:
+        inference_dense.hotstate.set_embedding_module(inference_sparse)
+
     return InferenceRankingGR(inference_sparse, inference_dense)

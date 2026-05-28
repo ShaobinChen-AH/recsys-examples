@@ -425,9 +425,8 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
     # Enable HotState
     model.dense_module.enable_hotstate(
         total_hbm_bytes=total_hbm_bytes,
-        embedding_module=emb_module,
-        kv_module=model.dense_module.async_kvcache,
     )
+    model.dense_module.set_hotstate_embedding_module(emb_module)
     controller = model.dense_module.hotstate
 
     print(f"=== HotState: Unified HBM Control Plane ===")
@@ -447,7 +446,6 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
         controller.before_batch(batch, uids, thl)
         with torch.inference_mode():
             model.forward_with_kvcache(batch, uids, thl)
-        controller.after_batch(batch, 0.0)
 
     # Measure
     trace_records = []
@@ -460,7 +458,7 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         with torch.inference_mode():
-            model.forward_with_kvcache(batch, uids, thl)
+            logits = model.forward_with_kvcache(batch, uids, thl)
         torch.cuda.synchronize()
         latency_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -498,6 +496,7 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
         "mean": sum(lats)/n, "p50": pct(lats,0.5), "p95": pct(lats,0.95),
         "p99": pct(lats,0.99), "p99_9": pct(lats,0.999),
         "max": max(lats), "num_records": n,
+        "switch_count": 0,
         "kv_budget_range": f"{min(kv_budget_history)}-{max(kv_budget_history)}",
     }
     with open(out_jsonl, "w") as f:

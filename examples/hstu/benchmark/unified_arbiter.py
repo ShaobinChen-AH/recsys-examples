@@ -28,7 +28,7 @@ from typing import Dict, List, Tuple
 
 import torch
 
-# ── Path setup (same as unified_plane_profiling.py) ──────────────────────────
+# Path setup (same as unified_plane_profiling.py)
 _HSTU_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _REPO_ROOT = os.path.abspath(os.path.join(_HSTU_DIR, ".."))
 
@@ -286,7 +286,7 @@ def run_arbiter(dataset, total_available, warmup_batches, measure_batches,
             measure_batches -= num_users
             continue       # back to while loop — these batches consumed
 
-        # ── Normal measurement ───────────────────────────────────────────
+        # Normal measurement
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         with torch.inference_mode():
