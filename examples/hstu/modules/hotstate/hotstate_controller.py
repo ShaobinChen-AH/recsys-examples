@@ -21,6 +21,7 @@ class HotStateController:
             total_hbm_bytes, self.value_engine,
             self.registry, self.directory,
             self.emb_adapter, self.kv_adapter)
+        self.scheduler = TransferScheduler(self.kv_adapter, self.directory, self.value_engine)
         self.epoch = 0
 
         # Calibrate adapter (read actual table sizes)
@@ -49,46 +50,48 @@ class HotStateController:
                 self.directory.register(
                     h.logical_key, Placement.HBM, authoritative=False)
 
-    def before_batch(self, batch, user_ids, total_history_lengths) -> dict:
-        """Called before each inference batch.
-
-        Returns control decisions for logging/monitoring.
-        """
+    def before_batch(self, batch, user_ids, total_history_lengths, batch_idx=0) -> dict:
+        """Called before each inference batch. Runs control epoch + transfer planning."""
         uid = int(user_ids[0].item())
         hist_len = int(total_history_lengths[0].item()) // 2
 
-        # Extract item indices for hot-key tracking
         try:
             item_values = batch.features["item_feat"].values()
             item_indices = item_values.unique().tolist()
         except Exception:
             item_indices = []
 
-        # Track hot keys for embedding adapter
         self.emb_adapter.record_batch_keys(item_indices)
 
-        # Build demand signal
         demand = DemandSignal(
-            current_user_id=uid,
-            history_length=hist_len,
+            current_user_id=uid, history_length=hist_len,
             num_candidates=batch.max_num_candidates or 100,
-            epoch=self.epoch,
-            item_indices=item_indices,
-        )
+            epoch=self.epoch, item_indices=item_indices)
 
-        # Check completed transfers
-        self._check_completions()
+        # 1. Check completed offloads from previous epochs
+        completed = self.scheduler.poll_completions(self.epoch)
 
-        # Run control epoch
+        # 2. Score and decide: what to keep, what to evict
         result = self.hot_set.run_epoch(self.epoch, demand)
 
-        # Update access statistics in ValueEngine
+        # 3. Plan and submit transfers with priority ordering
+        # Build a quick scoring lookup for reuse_imminence
+        scoring_map = {}
+        for s in self.value_engine.compute_scores(
+            self.registry.snapshot(), demand):
+            scoring_map[s.handle.logical_key] = s
+
+        self.scheduler.plan_and_submit(
+            current_batch=batch_idx,
+            evicted_keys=result.evicted_keys,
+            scoring_map=scoring_map,
+            epoch=self.epoch)
+
+        # 4. Track access
         for key in result.evicted_keys + result.admitted_keys:
             self.value_engine.record_access(key, self.epoch)
-        self.value_engine.record_access(
-            f"kv:uid:{uid}", self.epoch)
+        self.value_engine.record_access(f"kv:uid:{uid}", self.epoch)
 
-        # Decay old access logs
         if self.epoch % 50 == 0:
             self.value_engine.decay_logs(self.epoch)
 
@@ -101,6 +104,7 @@ class HotStateController:
             "admitted": len(result.admitted_keys),
             "epoch": self.epoch - 1,
         }
+
 
     def after_batch(self, batch, latency_ms: float):
         """Called after inference. Updates access statistics."""

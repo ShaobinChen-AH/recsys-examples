@@ -311,6 +311,8 @@ PYBIND11_MODULE(paged_kvcache_ops, m) {
     .def("offload_kvcache", &kvcache::GPUKVCacheMangerImpl::offload_kvcache, py::call_guard<py::gil_scoped_release>())
     .def("is_busy_offloading", &kvcache::GPUKVCacheMangerImpl::is_busy_offloading)
     .def("init_random_offload_status", &kvcache::GPUKVCacheMangerImpl::init_random_offload_status)
+    .def("submit_transfer", &kvcache::GPUKVCacheMangerImpl::submit_transfer, py::arg("uid"), py::arg("direction"), py::arg("stream_group"), py::arg("priority"), py::arg("num_pages"), "Submit a prioritized KV page transfer. Returns transfer_id.")
+    .def("is_transfer_complete", &kvcache::GPUKVCacheMangerImpl::is_transfer_complete, py::arg("transfer_id"), "True if the transfer with the given ID has completed.")
   ;
 
   py::class_<kvcache::KVOnloadHandle>(m, "KVOnloadHandle")

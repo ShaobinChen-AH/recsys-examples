@@ -573,9 +573,10 @@ GPUKVCacheMangerImpl::GPUKVCacheMangerImpl(
 
     per_token_kv_stride = 2 * num_kv_heads * kv_headdim;
 
+    _stream_groups.emplace_back(0, 2);  // Group 0: Critical (2 streams)
+    _stream_groups.emplace_back(1, 4);  // Group 1: Prefetch (4 streams)
+    _stream_groups.emplace_back(2, 1);  // Group 2: Background (1 stream)
     cudaCheck(cudaStreamCreateWithFlags(&worker_stream, cudaStreamNonBlocking));
-    cudaCheck(cudaStreamCreateWithFlags(&onload_stream, cudaStreamNonBlocking));
-    cudaCheck(cudaStreamCreateWithFlags(&offload_stream, cudaStreamNonBlocking));
 
     this->host_kv_mgr = &host_kv_mgr;
 
@@ -594,6 +595,14 @@ GPUKVCacheMangerImpl::GPUKVCacheMangerImpl(
     _active_page_limit = num_primary_cache_pages;
 };
 
+int StreamGroup::release_stream(int idx) {
+    int tid = in_flight[idx].transfer_id;
+    cudaStreamSynchronize(streams[idx]);
+    in_flight.erase(idx);
+    idle_streams.push(idx);
+    return tid;
+}
+
 GPUKVCacheMangerImpl::~GPUKVCacheMangerImpl() {
     {
         std::unique_lock<std::mutex> lock(offload_task_mutex_);
@@ -605,6 +614,44 @@ GPUKVCacheMangerImpl::~GPUKVCacheMangerImpl() {
 
     cudaFree(offload_device_buffers);
     cudaFree(onload_device_buffers);
+}
+
+bool GPUKVCacheMangerImpl::is_transfer_complete(int transfer_id)
+{
+    std::lock_guard<std::mutex> lock(_completed_mutex);
+    auto it = _completed_transfers.find(transfer_id);
+    if (it != _completed_transfers.end()) {
+        _completed_transfers.erase(it);
+        return true;
+    }
+    return false;
+}
+
+int GPUKVCacheMangerImpl::submit_transfer(
+    int64_t uid, int direction, int stream_group, float priority, int num_pages)
+{
+    if (stream_group < 0 || stream_group >= (int)_stream_groups.size())
+        return -1;
+    if (num_pages <= 0)
+        return -1;
+
+    TransferCommand cmd;
+    cmd.uid = uid;
+    cmd.direction = (direction == 0) ? TransferDirection::ONLOAD
+                                     : TransferDirection::OFFLOAD;
+    cmd.stream_group = stream_group;
+    cmd.priority = std::max(0.0f, std::min(1.0f, priority));
+    cmd.num_pages = num_pages;
+    cmd.transfer_id = _next_transfer_id++;
+    cmd.submit_epoch = _current_epoch;
+
+    {
+        std::lock_guard<std::mutex> lock(_transfer_mutex);
+        _stream_groups[stream_group].cmd_queue.push(cmd);
+    }
+    _transfer_cv.notify_one();
+
+    return cmd.transfer_id;
 }
 
 int GPUKVCacheMangerImpl::get_user_page_count(int64_t uid) {
