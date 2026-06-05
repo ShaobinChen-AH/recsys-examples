@@ -339,6 +339,12 @@ public:
     int submit_transfer(int64_t uid, int direction, int stream_group, float priority, int num_pages);
     bool is_transfer_complete(int transfer_id);
 
+    void cancel_transfers_for_user(int64_t uid);
+
+    int pending_in_group(int stream_group);
+
+    void set_current_epoch(int epoch);
+
 private:
     std::atomic<int> _next_transfer_id{1};
     int _current_epoch{0};
@@ -347,6 +353,9 @@ private:
 
     std::unordered_set<int> _completed_transfers;
     std::mutex _completed_mutex;
+
+    void execute_transfer(const TransferCommand& cmd, int page_offset,
+                      int num_pages, cudaStream_t stream);
 
 public:
     void onload_kvcache(
