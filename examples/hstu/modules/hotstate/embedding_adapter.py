@@ -13,7 +13,7 @@ class EmbeddingAdapter:
     the current hot-working-set footprint.
     """
 
-    DEFAULT_ROW_BYTES = 1024   # dim(512) × bf16(2 bytes) = 1024
+    DEFAULT_ROW_BYTES = 1024   # dim(512) bf16(2 bytes) = 1024
     SLIDING_WINDOW_SIZE = 10000  # max recent keys to track
 
     def __init__(self, embedding_module):
@@ -58,7 +58,7 @@ class EmbeddingAdapter:
                 state_type=StateType.EMBEDDING_HOT_ROWS,
                 logical_key="emb:item:hot_rows",
                 footprint_bytes=self.hot_footprint_bytes(),
-                placement={Placement.HBM},
+                placement={Placement.HOST_DRAM},
                 reconstructability=Reconstructability.REFETCHABLE,
                 consistency_class="mutable_writeback",
             ),

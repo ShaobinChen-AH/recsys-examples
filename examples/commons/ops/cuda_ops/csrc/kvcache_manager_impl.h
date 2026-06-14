@@ -38,7 +38,9 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef USE_NVCOMP
 #include "nvcomp/ans.h"
+#endif
 
 namespace kvcache {
 
@@ -146,7 +148,7 @@ public:
     std::vector<char *> ptr_;
     std::vector<cudaEvent_t> cuda_event_;
 };
-
+#ifdef USE_NVCOMP
 class KVCompressor {
 public:
     KVCompressor(int max_num_chunks, size_t chunk_numel, size_t chunk_bytes);
@@ -207,6 +209,22 @@ private:
     const nvcompBatchedANSOpts_t k_comp_opts_ = {nvcomp_rANS, uint8};
     const nvcompBatchedANSOpts_t k_decomp_opts_ = nvcompBatchedANSDefaultOpts;
 };
+#else
+class KVCompressor {
+public:
+    KVCompressor(int, size_t, size_t) {}
+    ~KVCompressor() {}
+    void set_compress_input_buffer_ptrs(char*, size_t) {}
+    void set_decompress_output_buffer_ptrs(char*, size_t, cudaStream_t) {}
+    void compress(size_t*, size_t, const char* const*, size_t, const size_t*, char*, size_t, cudaStream_t) {}
+    void decompress(char* const*, size_t, const size_t*, const char*, size_t, char*, size_t, cudaStream_t) {}
+    char* comp_out_buffer() { return nullptr; }
+    char* comp_out_buffer(int) { return nullptr; }
+    char* decomp_in_buffer() { return nullptr; }
+    char* decomp_in_buffer(int) { return nullptr; }
+}
+#endif
+
 
 class GPUKVCacheMangerImpl;
 class HostKVStorageImpl;
@@ -356,6 +374,12 @@ private:
 
     void execute_transfer(const TransferCommand& cmd, int page_offset,
                       int num_pages, cudaStream_t stream);
+
+    std::thread _transfer_worker;
+    void transfer_loop();
+
+    cudaStream_t onload_stream;
+    cudaStream_t offload_stream;
 
 public:
     void onload_kvcache(

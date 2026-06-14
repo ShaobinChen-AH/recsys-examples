@@ -20,7 +20,9 @@
 
 #include "kvcache_manager_impl.h"
 #include <nvtx3/nvtx3.hpp>
+#ifdef USE_NVCOMP
 #include "nvcomp/ans.h"
+#endif
 
 #define cudaCheck(ans) { cudaSuccesAssert((ans), __FILE__, __LINE__); }
 inline void cudaSuccesAssert(cudaError_t code, const char *file, int line, bool abort=true)
@@ -133,7 +135,7 @@ PinnedDoubleBuffer::~PinnedDoubleBuffer() {
     }
 }
 
-
+#ifdef USE_NVCOMP
 KVCompressor::KVCompressor(int max_num_chunks, size_t chunk_numel, size_t chunk_bytes)
 : max_num_chunks_(max_num_chunks), chunk_numel_(chunk_numel), chunk_bytes_(chunk_bytes) {
     if (max_num_chunks == 0) return;
@@ -181,7 +183,7 @@ KVCompressor::KVCompressor(int max_num_chunks, size_t chunk_numel, size_t chunk_
         max_num_chunks, chunk_bytes, k_decomp_opts_, &decomp_tmp_bytes_, max_num_chunks * chunk_bytes);
     cudaCheck(cudaMalloc(&decomp_tmp_buffer_, decomp_tmp_bytes_));
 }
-
+#endif
 KVCompressor::~KVCompressor() {
     if (max_num_chunks_ == 0) return;
 
@@ -554,7 +556,11 @@ GPUKVCacheMangerImpl::GPUKVCacheMangerImpl(
     , num_onload_device_chunks(onload_buffer_chunks)
     , num_offload_device_chunks(offload_buffer_chunks)
     , enable_nvcomp(enable_nvcomp)
+#ifdef USE_NVCOMP
     , compressor(enable_nvcomp ? 8 : 0, host_kv_mgr.chunk_numel, host_kv_mgr.chunk_numel * sizeof(uint16_t))
+#else
+    , compressor(0, 0, 0)
+#endif
     , onload_pin_buffer(host_kv_mgr.chunk_numel * sizeof(uint16_t))
     , offload_pin_buffer(host_kv_mgr.chunk_numel * sizeof(uint16_t))
     , onload_memcpy_workers(num_memcpy_workers)
@@ -576,6 +582,10 @@ GPUKVCacheMangerImpl::GPUKVCacheMangerImpl(
     _stream_groups.emplace_back(0, 2);  // Group 0: Critical (2 streams)
     _stream_groups.emplace_back(1, 4);  // Group 1: Prefetch (4 streams)
     _stream_groups.emplace_back(2, 1);  // Group 2: Background (1 stream)
+    
+    onload_stream  = _stream_groups[0].streams[0];
+    offload_stream = _stream_groups[2].streams[0];
+
     cudaCheck(cudaStreamCreateWithFlags(&worker_stream, cudaStreamNonBlocking));
 
     this->host_kv_mgr = &host_kv_mgr;
@@ -591,6 +601,7 @@ GPUKVCacheMangerImpl::GPUKVCacheMangerImpl(
     this->queued_offload_limits = max_queued_offload_tokens;
     this->offload_busy_.store(false);
     this->offload_worker = std::thread(&GPUKVCacheMangerImpl::offload_loop, this);
+    this->_transfer_worker = std::thread(&GPUKVCacheMangerImpl::transfer_loop, this);
 
     _active_page_limit = num_primary_cache_pages;
 };
@@ -658,7 +669,7 @@ void GPUKVCacheMangerImpl::execute_transfer(
             uint16_t* layer_base = static_cast<uint16_t*>(this->cache_table)
                                    + layer * layer_stride_u16;
             uint16_t* page_src = layer_base + page_offset * page_u16;
-            uint16_t* dst = static_cast<uint16_t*>(this->offload_pin_buffer.data())
+            uint16_t* dst = static_cast<uint16_t*>(this->offload_pin_buffer.ptr_[0])
                             + layer * num_pages * page_u16;
             cudaMemcpyAsync(dst, page_src, bytes,
                             cudaMemcpyDeviceToHost, stream);
@@ -671,7 +682,7 @@ void GPUKVCacheMangerImpl::execute_transfer(
             uint16_t* layer_base = static_cast<uint16_t*>(this->cache_table)
                                    + layer * layer_stride_u16;
             uint16_t* page_dst = layer_base + page_offset * page_u16;
-            uint16_t* src = static_cast<uint16_t*>(this->onload_pin_buffer.data())
+            uint16_t* src = static_cast<uint16_t*>(this->onload_pin_buffer.ptr_[0])
                             + layer * num_pages * page_u16;
             cudaMemcpyAsync(page_dst, src, bytes,
                             cudaMemcpyHostToDevice, stream);
@@ -691,7 +702,7 @@ void GPUKVCacheMangerImpl::transfer_loop()
         {
             std::unique_lock<std::mutex> lock(_transfer_mutex);
             _transfer_cv.wait(lock, [this]() {
-                if (this->_terminate_)
+                if (this->terminate_)
                     return true;
                 for (auto& g : _stream_groups) {
                     if (!g.cmd_queue.empty() && g.has_idle_stream())
@@ -700,7 +711,7 @@ void GPUKVCacheMangerImpl::transfer_loop()
                 return false;
             });
 
-            if (this->_terminate_)
+            if (this->terminate_)
                 return;
 
             // Scan groups 0 → 1 → 2, grab the first with work + idle stream
