@@ -478,7 +478,10 @@ public:
     c10::Device device;
 public:
     int get_empty_page_count() const { return (int)_empty_pages.size(); }
-    int get_user_page_count(int64_t uid);
+    int64_t get_user_page_count(int64_t uid);
+    int64_t get_empty_page_count();
+    bool has_user(int64_t uid);
+    bool evict_if_present(int64_t uid);
     void set_active_page_limit(int new_limit);
 private:
     std::queue<int64_t> _withheld_pages;   // pages temporarily removed from circulation

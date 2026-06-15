@@ -853,9 +853,24 @@ int GPUKVCacheMangerImpl::submit_transfer(
     return cmd.transfer_id;
 }
 
-int GPUKVCacheMangerImpl::get_user_page_count(int64_t uid) {
+int64_t GPUKVCacheMangerImpl::get_user_page_count(int64_t uid) {
     auto it = _uid_to_page_id.find(uid);
-    return (it != _uid_to_page_id.end()) ? (int)it->second.size() : 0;
+    if (it == _uid_to_page_id.end()) return 0;
+    return static_cast<int64_t>(it->second.size());
+}
+
+int64_t GPUKVCacheMangerImpl::get_empty_page_count() {
+    return static_cast<int64_t>(_empty_pages.size());
+}
+
+bool GPUKVCacheMangerImpl::has_user(int64_t uid) {
+    return _lru_lookup_table.find(uid) != _lru_lookup_table.end();
+}
+
+bool GPUKVCacheMangerImpl::evict_if_present(int64_t uid) {
+    if (!has_user(uid)) return false;
+    evict(uid);
+    return true;
 }
 
 void GPUKVCacheMangerImpl::set_active_page_limit(int new_limit) {

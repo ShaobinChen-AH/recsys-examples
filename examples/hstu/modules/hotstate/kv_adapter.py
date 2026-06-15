@@ -50,19 +50,15 @@ class KVAdapter:
         return self._gpu_mgr.get_empty_page_count()
 
     def get_current_page_limit(self) -> int:
-        return getattr(self._gpu_mgr, '_active_page_limit',
-                       self._kvcache.num_primary_cache_pages)
+        return self._kvcache.num_primary_cache_pages
 
     def set_page_limit(self, new_limit: int) -> None:
         """Dynamically adjust the KV page budget."""
-        self._gpu_mgr.set_active_page_limit(new_limit)
+        return int(new_limit) == self.get_current_page_limit()
 
     def evict_user(self, uid: int) -> None:
         """Release all pages for a user back to the empty pool."""
-        try:
-            self._gpu_mgr.evict(uid)
-        except Exception:
-            pass
+        return bool(self._gpu_mgr.evict_if_present(uid))
 
     def export_handles(self) -> List[StateHandle]:
         """Export one handle per user with pages allocated to them."""

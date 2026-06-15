@@ -6,6 +6,7 @@ from modules.hotstate.value_engine import ValueEngine
 from modules.hotstate.embedding_adapter import EmbeddingAdapter
 from modules.hotstate.kv_adapter import KVAdapter
 from modules.hotstate.hot_set_manager import HotSetManager
+from modules.hotstate.transfer_scheduler import TransferScheduler
 
 
 class HotStateController:
@@ -24,6 +25,8 @@ class HotStateController:
         self.scheduler = TransferScheduler(self.kv_adapter, self.directory, self.value_engine)
         self.epoch = 0
 
+        self.enable_transfer_scheduler = False
+
         # Calibrate adapter (read actual table sizes)
         self.emb_adapter.calibrate()
 
@@ -41,14 +44,7 @@ class HotStateController:
     # Public API
     def set_embedding_module(self, embedding_module):
         """Connect the embedding adapter after both dense and sparse modules exist."""
-        self.emb_adapter.embedding_module = embedding_module
-        self.emb_adapter.calibrate()
-        # Re-initialize directory with embedding handles
-        for h in self.emb_adapter.export_handles():
-            self.registry.register(h)
-            if Placement.HBM in h.placement:
-                self.directory.register(
-                    h.logical_key, Placement.HBM, authoritative=False)
+        self.emb_adapter.set_module(embedding_module)
 
     def before_batch(self, batch, user_ids, total_history_lengths, batch_idx=0) -> dict:
         """Called before each inference batch. Runs control epoch + transfer planning."""
@@ -80,12 +76,13 @@ class HotStateController:
         for s in self.value_engine.compute_scores(
             self.registry.snapshot(), demand):
             scoring_map[s.handle.logical_key] = s
-
-        self.scheduler.plan_and_submit(
-            current_batch=batch_idx,
-            evicted_keys=result.evicted_keys,
-            scoring_map=scoring_map,
-            epoch=self.epoch)
+        
+        if self.enable_transfer_scheduler:
+            self.scheduler.plan_and_submit(
+                current_batch=batch_idx,
+                evicted_keys=result.evicted_keys,
+                scoring_map=scoring_map,
+                epoch=self.epoch)
 
         # 4. Track access
         for key in result.evicted_keys + result.admitted_keys:

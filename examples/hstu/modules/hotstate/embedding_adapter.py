@@ -40,6 +40,11 @@ class EmbeddingAdapter:
         """Feed this batch's item_feat values into the sliding window."""
         for idx in item_indices:
             self._recent_keys.append(idx)
+    
+    def set_module(self, embedding_module):
+        self._module = embedding_module
+        self._total_size_bytes = 0
+        self.calibrate()    
 
     def hot_key_count(self) -> int:
         """Number of unique keys seen in the recent window."""

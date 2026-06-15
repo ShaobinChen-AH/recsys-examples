@@ -122,8 +122,7 @@ class HotSetManager:
             self.kv.evict_user(uid)
         elif h.state_type in (StateType.EMBEDDING_HOT_ROWS,
                                StateType.EMBEDDING_COLD_ROWS):
-            # Suggest embedding subsystem to flush cache
-            self.emb.trigger_flush()
+            return
 
     def _execute_admission(self, h):
         key = h.logical_key
