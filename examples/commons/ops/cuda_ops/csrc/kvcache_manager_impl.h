@@ -222,7 +222,7 @@ public:
     char* comp_out_buffer(int) { return nullptr; }
     char* decomp_in_buffer() { return nullptr; }
     char* decomp_in_buffer(int) { return nullptr; }
-}
+};
 #endif
 
 
