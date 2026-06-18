@@ -618,7 +618,7 @@ GPUKVCacheMangerImpl::~GPUKVCacheMangerImpl()
 {
     {
         std::unique_lock<std::mutex> lock(offload_task_mutex_);
-        this->_terminate_ = true;
+        this->terminate_ = true;
     }
     offload_task_cv_.notify_all();
     _transfer_cv.notify_all();
@@ -773,7 +773,7 @@ void GPUKVCacheMangerImpl::transfer_loop()
 
                 if (cmd.direction == TransferDirection::OFFLOAD) {
                     // D2H: copy from GPU cache to pinned buffer, then to host
-                    cudaMemcpyAsync(this->offload_pin_buffer.data(), page_ptr,
+                    cudaMemcpyAsync(this->offload_pin_buffer.ptr_[0], page_ptr,
                                     bytes, cudaMemcpyDeviceToHost, stream);
                 } else {
                     // H2D stub: in practice, onloads are handled via
