@@ -216,8 +216,8 @@ public:
     ~KVCompressor() {}
     void set_compress_input_buffer_ptrs(char*, size_t) {}
     void set_decompress_output_buffer_ptrs(char*, size_t, cudaStream_t) {}
-    void compress(size_t*, size_t, const char* const*, size_t, const size_t*, char*, size_t, cudaStream_t) {}
-    void decompress(char* const*, size_t, const size_t*, const char*, size_t, char*, size_t, cudaStream_t) {}
+    void compress(size_t*, size_t, cudaStream_t) {}
+    void decompress(size_t*, size_t, cudaStream_t) {}
     char* comp_out_buffer() { return nullptr; }
     char* comp_out_buffer(int) { return nullptr; }
     char* decomp_in_buffer() { return nullptr; }
