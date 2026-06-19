@@ -391,7 +391,7 @@ public:
     uint16_t *cache_table;
     c10::Device device;
 public:
-    int get_empty_page_count() const { return (int)_empty_pages.size(); }
+    int64_t get_empty_page_count();
     int64_t get_user_page_count(int64_t uid);
     bool has_user(int64_t uid);
     bool evict_if_present(int64_t uid);
