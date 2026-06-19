@@ -46,10 +46,6 @@ namespace kvcache {
 
 // File: kvcache_manager_impl.h add in public section, before the class's private section
 
-
-};
-
-
 class MultithreadMemcpyProcessor
 {
 public:

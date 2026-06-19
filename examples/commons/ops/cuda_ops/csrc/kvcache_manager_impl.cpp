@@ -183,7 +183,7 @@ KVCompressor::KVCompressor(int max_num_chunks, size_t chunk_numel, size_t chunk_
         max_num_chunks, chunk_bytes, k_decomp_opts_, &decomp_tmp_bytes_, max_num_chunks * chunk_bytes);
     cudaCheck(cudaMalloc(&decomp_tmp_buffer_, decomp_tmp_bytes_));
 }
-#endif
+
 KVCompressor::~KVCompressor() {
     if (max_num_chunks_ == 0) return;
 
@@ -254,6 +254,7 @@ char *KVCompressor::comp_out_buffer(int index) { return comp_out_buffer_ + index
 
 char *KVCompressor::decomp_in_buffer() { return decomp_in_buffer_; }
 char *KVCompressor::decomp_in_buffer(int index) { return decomp_in_buffer_ + index * max_comp_chunk_bytes_; }
+#endif
 
 KVOnloadHandle::KVOnloadHandle() : no_onload(true) {}
 
@@ -600,16 +601,22 @@ cudaCheck(cudaStreamCreateWithFlags(&worker_stream, cudaStreamNonBlocking)); cud
     _active_page_limit = num_primary_cache_pages;
 };
 
-
+GPUKVCacheMangerImpl::~GPUKVCacheMangerImpl()
+{
+    {
+        std::unique_lock<std::mutex> lock(offload_task_mutex_);
+        this->terminate_ = true;
     }
+    offload_task_cv_.notify_all();
+
     if (this->offload_worker.joinable()) {
         this->offload_worker.join();
     }
 
-
     cudaStreamDestroy(worker_stream);
     cudaFree(offload_device_buffers);
     cudaFree(onload_device_buffers);
+}
 }
 
 
