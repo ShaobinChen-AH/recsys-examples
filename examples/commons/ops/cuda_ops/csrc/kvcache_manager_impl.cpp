@@ -617,14 +617,6 @@ GPUKVCacheMangerImpl::~GPUKVCacheMangerImpl()
     cudaFree(offload_device_buffers);
     cudaFree(onload_device_buffers);
 }
-}
-
-
-
-
-
-
-
 
 int64_t GPUKVCacheMangerImpl::get_empty_page_count() {
     return static_cast<int64_t>(_empty_pages.size());
