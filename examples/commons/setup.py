@@ -48,21 +48,16 @@ setup(
                 "ops/cuda_ops/csrc/paged_kvcache_ops_kernel.cu",
             ],
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++20", "-fvisibility=hidden"]
-                + [
-                    "-I/workspace/deps/nvcomp/include",
-                    "-L/workspace/deps/nvcomp/lib",
-                    "-lnvcomp_static",
-                ],
+                "cxx": ["-O3", "-std=c++20", "-fvisibility=hidden"],
                 "nvcc": nvcc_threads_args() + nvcc_flags,
             },
             include_dirs=[
-                "/workspace/deps/nvcomp/include",
+                "",
             ],
             library_dirs=[
-                "/workspace/deps/nvcomp/lib",
+                "",
             ],
-            libraries=["nvcomp_static"],
+            libraries=[""],
         ),
     ],
     cmdclass={"build_ext": BuildExtension},
