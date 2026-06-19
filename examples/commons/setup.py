@@ -51,13 +51,9 @@ setup(
                 "cxx": ["-O3", "-std=c++20", "-fvisibility=hidden"],
                 "nvcc": nvcc_threads_args() + nvcc_flags,
             },
-            include_dirs=[
-                "",
-            ],
-            library_dirs=[
-                "",
-            ],
-            libraries=[""],
+            include_dirs=[],
+            library_dirs=[],
+            libraries=[],
         ),
     ],
     cmdclass={"build_ext": BuildExtension},
