@@ -314,11 +314,6 @@ PYBIND11_MODULE(paged_kvcache_ops, m) {
     .def("offload_kvcache", &kvcache::GPUKVCacheMangerImpl::offload_kvcache, py::call_guard<py::gil_scoped_release>())
     .def("is_busy_offloading", &kvcache::GPUKVCacheMangerImpl::is_busy_offloading)
     .def("init_random_offload_status", &kvcache::GPUKVCacheMangerImpl::init_random_offload_status)
-    .def("submit_transfer", &kvcache::GPUKVCacheMangerImpl::submit_transfer, py::arg("uid"), py::arg("direction"), py::arg("stream_group"), py::arg("priority"), py::arg("num_pages"), "Submit a prioritized KV page transfer. Returns transfer_id.")
-    .def("is_transfer_complete", &kvcache::GPUKVCacheMangerImpl::is_transfer_complete, py::arg("transfer_id"), "True if the transfer with the given ID has completed.")
-    .def("cancel_transfers_for_user", &kvcache::GPUKVCacheMangerImpl::cancel_transfers_for_user, py::arg("uid"), "Cancel all pending transfers for the given user.")
-    .def("pending_in_group", &kvcache::GPUKVCacheMangerImpl::pending_in_group, py::arg("stream_group"), "Number of pending transfers in the given stream group.")
-    .def("set_current_epoch", &kvcache::GPUKVCacheMangerImpl::set_current_epoch, py::arg("epoch"), "Set the current control epoch (used for transfer staleness tracking).")
   ;
 
   py::class_<kvcache::KVOnloadHandle>(m, "KVOnloadHandle")

@@ -46,73 +46,7 @@ namespace kvcache {
 
 // File: kvcache_manager_impl.h add in public section, before the class's private section
 
-enum class TransferDirection { ONLOAD = 0, OFFLOAD = 1 };
 
-struct TransferCommand {
-    int64_t uid;
-    TransferDirection direction;
-    int stream_group;       // 0=critical, 1=prefetch, 2=background
-    float priority;         // 0.0 to 1.0, higher = more urgent
-    int num_pages;
-    int transfer_id;        // assigned by submit_transfer, returned to Python
-    int submit_epoch;       // epoch when submitted (for aging/staleness)
-
-    // Priority comparator: higher priority pops first in max-heap.
-    // std::priority_queue uses operator< for ordering (largest comes out first
-    // when using default std::less), so we invert: lower numeric value = higher
-    // priority pops first.
-    bool operator<(const TransferCommand& other) const {
-        if (stream_group != other.stream_group) {
-            return stream_group > other.stream_group;  // group 0 pops before group 1
-        }
-        if (priority != other.priority) {
-            return priority < other.priority;          // higher priority pops first
-        }
-        return submit_epoch > other.submit_epoch;      // older (stale) pops last
-    }
-};
-
-// File: kvcache_manager_impl.h add in private section
-
-struct StreamGroup {
-    int group_id;                                    // 0=critical, 1=prefetch, 2=background
-    std::vector<cudaStream_t> streams;               // pool of CUDA streams
-    std::priority_queue<TransferCommand> cmd_queue;  // ordered by TransferCommand::operator<
-    std::unordered_map<int, TransferCommand> in_flight;  // stream_index active command
-    std::queue<int> idle_streams;                    // indices of free streams
-    int num_streams;
-
-    StreamGroup(int gid, int count) : group_id(gid), num_streams(count) {
-        streams.reserve(count);
-        for (int i = 0; i < count; i++) {
-            cudaStream_t s;
-            cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
-            streams.push_back(s);
-            idle_streams.push(i);
-        }
-    }
-
-    ~StreamGroup() {
-        for (int i = 0; i < num_streams; i++) {
-            if (in_flight.count(i)) {
-                cudaStreamSynchronize(streams[i]);
-            }
-            cudaStreamDestroy(streams[i]);
-        }
-    }
-
-    bool has_idle_stream() const { return !idle_streams.empty(); }
-
-    int acquire_stream(const TransferCommand& cmd) {
-        int idx = idle_streams.front();
-        idle_streams.pop();
-        in_flight[idx] = cmd;
-        return idx;
-    }
-
-    int release_stream(int idx);
-
-    cudaStream_t stream(int idx) { return streams[idx]; }
 };
 
 
@@ -354,29 +288,14 @@ public:
     uint16_t *get_cache_table_by_layer(int layer_idx);
 
 public:
-    int submit_transfer(int64_t uid, int direction, int stream_group, float priority, int num_pages);
-    bool is_transfer_complete(int transfer_id);
 
-    void cancel_transfers_for_user(int64_t uid);
 
-    int pending_in_group(int stream_group);
 
-    void set_current_epoch(int epoch);
 
 private:
-    std::atomic<int> _next_transfer_id{1};
-    int _current_epoch{0};
-    std::mutex _transfer_mutex;
-    std::condition_variable _transfer_cv;
 
-    std::unordered_set<int> _completed_transfers;
-    std::mutex _completed_mutex;
 
-    void execute_transfer(const TransferCommand& cmd, int page_offset,
-                      int num_pages, cudaStream_t stream);
 
-    std::thread _transfer_worker;
-    void transfer_loop();
 
     cudaStream_t onload_stream;
     cudaStream_t offload_stream;
@@ -463,7 +382,6 @@ public:
     KVCompressor compressor;
 
     cudaStream_t worker_stream;
-    std::vector<StreamGroup> _stream_groups;
 
     PinnedDoubleBuffer onload_pin_buffer;
     PinnedDoubleBuffer offload_pin_buffer;

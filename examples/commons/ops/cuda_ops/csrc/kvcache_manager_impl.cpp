@@ -579,12 +579,7 @@ GPUKVCacheMangerImpl::GPUKVCacheMangerImpl(
 
     per_token_kv_stride = 2 * num_kv_heads * kv_headdim;
 
-    _stream_groups.emplace_back(0, 2);  // Group 0: Critical (2 streams)
-    _stream_groups.emplace_back(1, 4);  // Group 1: Prefetch (4 streams)
-    _stream_groups.emplace_back(2, 1);  // Group 2: Background (1 stream)
-    
-    onload_stream  = _stream_groups[0].streams[0];
-    offload_stream = _stream_groups[2].streams[0];
+cudaCheck(cudaStreamCreateWithFlags(&worker_stream, cudaStreamNonBlocking)); cudaCheck(cudaStreamCreateWithFlags(&onload_stream, cudaStreamNonBlocking)); cudaCheck(cudaStreamCreateWithFlags(&offload_stream, cudaStreamNonBlocking));
 
     cudaCheck(cudaStreamCreateWithFlags(&worker_stream, cudaStreamNonBlocking));
 
@@ -601,263 +596,28 @@ GPUKVCacheMangerImpl::GPUKVCacheMangerImpl(
     this->queued_offload_limits = max_queued_offload_tokens;
     this->offload_busy_.store(false);
     this->offload_worker = std::thread(&GPUKVCacheMangerImpl::offload_loop, this);
-    this->_transfer_worker = std::thread(&GPUKVCacheMangerImpl::transfer_loop, this);
 
     _active_page_limit = num_primary_cache_pages;
 };
 
-int StreamGroup::release_stream(int idx) {
-    int tid = in_flight[idx].transfer_id;
-    cudaStreamSynchronize(streams[idx]);
-    in_flight.erase(idx);
-    idle_streams.push(idx);
-    return tid;
-}
 
-GPUKVCacheMangerImpl::~GPUKVCacheMangerImpl()
-{
-    {
-        std::unique_lock<std::mutex> lock(offload_task_mutex_);
-        this->terminate_ = true;
-    }
-    offload_task_cv_.notify_all();
-    _transfer_cv.notify_all();
-
-    if (this->_transfer_worker.joinable()) {
-        this->_transfer_worker.join();
     }
     if (this->offload_worker.joinable()) {
         this->offload_worker.join();
     }
 
-    // StreamGroups are automatically destroyed (their destructors
-    // synchronize + destroy individual streams via ~StreamGroup())
-    _stream_groups.clear();
 
     cudaStreamDestroy(worker_stream);
     cudaFree(offload_device_buffers);
     cudaFree(onload_device_buffers);
 }
 
-bool GPUKVCacheMangerImpl::is_transfer_complete(int transfer_id)
-{
-    std::lock_guard<std::mutex> lock(_completed_mutex);
-    auto it = _completed_transfers.find(transfer_id);
-    if (it != _completed_transfers.end()) {
-        _completed_transfers.erase(it);
-        return true;
-    }
-    return false;
-}
 
-void GPUKVCacheMangerImpl::set_current_epoch(int epoch) {
-    _current_epoch = epoch;
-}
 
-void GPUKVCacheMangerImpl::execute_transfer(
-    const TransferCommand& cmd, int page_offset, int num_pages,
-    cudaStream_t stream)
-{
-    size_t layer_stride_u16 = (size_t)this->num_primary_cache_pages * this->page_stride
-                              / sizeof(uint16_t);
-    size_t page_u16 = this->page_stride / sizeof(uint16_t);
-    size_t bytes = num_pages * this->page_stride;
 
-    if (cmd.direction == TransferDirection::OFFLOAD) {
-        // D2H offload: gather KV pages from GPU cache pinned buffer
-        for (int layer = 0; layer < this->num_layers; layer++) {
-            uint16_t* layer_base = static_cast<uint16_t*>(this->cache_table)
-                                   + layer * layer_stride_u16;
-            uint16_t* page_src = layer_base + page_offset * page_u16;
-            uint16_t* dst = static_cast<uint16_t*>(this->offload_pin_buffer.ptr_[0])
-                            + layer * num_pages * page_u16;
-            cudaMemcpyAsync(dst, page_src, bytes,
-                            cudaMemcpyDeviceToHost, stream);
-        }
-        // Signal host-side kv_mgr to pick up from pinned buffer
-        // (handled by caller after synchronize)
-    } else {
-        // H2D onload: copy from host GPU cache pages
-        for (int layer = 0; layer < this->num_layers; layer++) {
-            uint16_t* layer_base = static_cast<uint16_t*>(this->cache_table)
-                                   + layer * layer_stride_u16;
-            uint16_t* page_dst = layer_base + page_offset * page_u16;
-            uint16_t* src = static_cast<uint16_t*>(this->onload_pin_buffer.ptr_[0])
-                            + layer * num_pages * page_u16;
-            cudaMemcpyAsync(page_dst, src, bytes,
-                            cudaMemcpyHostToDevice, stream);
-        }
-    }
-}
 
-void GPUKVCacheMangerImpl::transfer_loop()
-{
-    const int PAGE_CHUNK = 1;  // preemption granularity: one page at a time
 
-    while (true) {
-        TransferCommand cmd;
-        int group_idx = -1;
 
-        // Step 1: Pop highest-priority transfer across all groups
-        {
-            std::unique_lock<std::mutex> lock(_transfer_mutex);
-            _transfer_cv.wait(lock, [this]() {
-                if (this->terminate_)
-                    return true;
-                for (auto& g : _stream_groups) {
-                    if (!g.cmd_queue.empty() && g.has_idle_stream())
-                        return true;
-                }
-                return false;
-            });
-
-            if (this->terminate_)
-                return;
-
-            // Scan groups 0 → 1 → 2, grab the first with work + idle stream
-            for (int gid = 0; gid < (int)_stream_groups.size(); gid++) {
-                auto& g = _stream_groups[gid];
-                if (!g.cmd_queue.empty() && g.has_idle_stream()) {
-                    cmd = g.cmd_queue.top();
-                    g.cmd_queue.pop();
-                    group_idx = gid;
-                    break;
-                }
-            }
-            if (group_idx < 0)
-                continue;  // spurious wakeup
-        }
-
-        auto& group = _stream_groups[group_idx];
-
-        // Step 2: Acquire a stream and start the transfer
-        int stream_idx = group.acquire_stream(cmd);
-        cudaStream_t stream = group.stream(stream_idx);
-        size_t layer_stride_bytes = this->num_primary_cache_pages * this->page_stride;
-
-        size_t total_pages = cmd.num_pages;
-        size_t pages_done = 0;
-
-        while (pages_done < total_pages) {
-            // Preemption check after each page-sized chunk
-            {
-                std::lock_guard<std::mutex> lock(_transfer_mutex);
-                for (int gid = 0; gid < group_idx; gid++) {
-                    auto& higher_group = _stream_groups[gid];
-                    if (!higher_group.cmd_queue.empty()) {
-                        // Higher-priority transfer arrived: yield this stream
-                        // by finishing the current chunk, releasing the stream,
-                        // and re-queuing the remaining pages
-                        if (pages_done > 0) {
-                            TransferCommand remainder = cmd;
-                            remainder.num_pages = total_pages - pages_done;
-                            group.cmd_queue.push(remainder);
-                        }
-                        cudaStreamSynchronize(stream);
-                        std::lock_guard<std::mutex> cl(_completed_mutex);
-                        _completed_transfers.insert(cmd.transfer_id);
-                        group.release_stream(stream_idx);
-                        goto next_transfer;
-                    }
-                }
-            }
-
-            // Execute one page transfer
-            for (int layer = 0; layer < this->num_layers; layer++) {
-                uint16_t* base = static_cast<uint16_t*>(this->cache_table) +
-                                 layer * layer_stride_bytes / sizeof(uint16_t);
-                // Find the page for this user at the correct offset
-                uint16_t* page_ptr = base + cmd.uid * PAGE_CHUNK * this->page_stride / sizeof(uint16_t)
-                                     + pages_done * this->page_stride / sizeof(uint16_t);
-                size_t bytes = PAGE_CHUNK * this->page_stride;
-
-                if (cmd.direction == TransferDirection::OFFLOAD) {
-                    // D2H: copy from GPU cache to pinned buffer, then to host
-                    cudaMemcpyAsync(this->offload_pin_buffer.ptr_[0], page_ptr,
-                                    bytes, cudaMemcpyDeviceToHost, stream);
-                } else {
-                    // H2D stub: in practice, onloads are handled via
-                    // existing prepare_kvcache path. This path is reserved
-                    // for future direct page-level onload.
-                }
-            }
-            pages_done += PAGE_CHUNK;
-        }
-
-        // Step 3: Transfer complete
-        cudaStreamSynchronize(stream);
-        {
-            std::lock_guard<std::mutex> cl(_completed_mutex);
-            _completed_transfers.insert(cmd.transfer_id);
-        }
-        group.release_stream(stream_idx);
-
-        next_transfer: continue;
-    }
-}
-
-int GPUKVCacheMangerImpl::pending_in_group(int stream_group)
-{
-    if (stream_group < 0 || stream_group >= (int)_stream_groups.size())
-        return 0;
-    std::lock_guard<std::mutex> lock(_transfer_mutex);
-    return (int)_stream_groups[stream_group].cmd_queue.size();
-}
-
-void GPUKVCacheMangerImpl::cancel_transfers_for_user(int64_t uid)
-{
-    std::lock_guard<std::mutex> lock(_transfer_mutex);
-    for (auto& group : _stream_groups) {
-        std::vector<TransferCommand> kept;
-        while (!group.cmd_queue.empty()) {
-            TransferCommand cmd = group.cmd_queue.top();
-            group.cmd_queue.pop();
-            if (cmd.uid != uid) {
-                kept.push_back(cmd);
-            } else {
-                // Mark cancelled transfers as completed with status -1
-                std::lock_guard<std::mutex> cl(_completed_mutex);
-                _completed_transfers.insert(cmd.transfer_id);
-            }
-        }
-        for (const auto& cmd : kept) {
-            group.cmd_queue.push(cmd);
-        }
-    }
-}
-
-int GPUKVCacheMangerImpl::submit_transfer(
-    int64_t uid, int direction, int stream_group, float priority, int num_pages)
-{
-    if (stream_group < 0 || stream_group >= (int)_stream_groups.size())
-        return -1;
-    if (num_pages <= 0)
-        return -1;
-
-    TransferCommand cmd;
-    cmd.uid = uid;
-    cmd.direction = (direction == 0) ? TransferDirection::ONLOAD
-                                     : TransferDirection::OFFLOAD;
-    cmd.stream_group = stream_group;
-    cmd.priority = std::max(0.0f, std::min(1.0f, priority));
-    cmd.num_pages = num_pages;
-    cmd.transfer_id = _next_transfer_id++;
-    cmd.submit_epoch = _current_epoch;
-
-    {
-        std::lock_guard<std::mutex> lock(_transfer_mutex);
-        _stream_groups[stream_group].cmd_queue.push(cmd);
-    }
-    _transfer_cv.notify_one();
-
-    return cmd.transfer_id;
-}
-
-int64_t GPUKVCacheMangerImpl::get_user_page_count(int64_t uid) {
-    auto it = _uid_to_page_id.find(uid);
-    if (it == _uid_to_page_id.end()) return 0;
-    return static_cast<int64_t>(it->second.size());
-}
 
 int64_t GPUKVCacheMangerImpl::get_empty_page_count() {
     return static_cast<int64_t>(_empty_pages.size());

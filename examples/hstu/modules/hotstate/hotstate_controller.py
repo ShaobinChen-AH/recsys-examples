@@ -77,12 +77,11 @@ class HotStateController:
             self.registry.snapshot(), demand):
             scoring_map[s.handle.logical_key] = s
         
-        if self.enable_transfer_scheduler:
-            self.scheduler.plan_and_submit(
-                current_batch=batch_idx,
-                evicted_keys=result.evicted_keys,
-                scoring_map=scoring_map,
-                epoch=self.epoch)
+        self.scheduler.plan_and_submit(
+            current_batch=batch_idx,
+            evicted_keys=result.evicted_keys,
+            scoring_map=scoring_map,
+            epoch=self.epoch)
 
         # 4. Track access
         for key in result.evicted_keys + result.admitted_keys:
