@@ -85,7 +85,7 @@ class HotSetManager:
         # 5. Admit: load highest-scored non-HBM objects if budget allows
         non_residents = [s for s in scored
                          if Placement.HBM not in s.handle.placement
-                         and s.score > 0]
+                         and s.benefit_density > s.semantic_risk]
         non_residents.sort(key=lambda s: s.score, reverse=True)
 
         admitted = []
