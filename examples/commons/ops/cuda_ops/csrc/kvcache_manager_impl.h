@@ -283,16 +283,8 @@ public:
     uint16_t *get_cache_table(void);
     uint16_t *get_cache_table_by_layer(int layer_idx);
 
-public:
-
-
-
 
 private:
-
-
-
-
     cudaStream_t onload_stream;
     cudaStream_t offload_stream;
 

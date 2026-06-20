@@ -379,9 +379,9 @@ def main():
     parser.add_argument("--max-incremental-seqlen", type=int, default=64)
     parser.add_argument("--num-users", type=int, default=8)
     # Arbiter config
-    parser.add_argument("--thresholds", type=str, required=True,
+    parser.add_argument("--thresholds", type=str, default=None,
                         help="Threshold policy, e.g. '3072:50:50'")
-    parser.add_argument("--default-split", type=str, required=True,
+    parser.add_argument("--default-split", type=str, default=None,
                         help="Default emb:kv split, e.g. '70:30'")
     parser.add_argument("--total-hbm-budget-gib", type=float, default=1.0)
     # Run config
