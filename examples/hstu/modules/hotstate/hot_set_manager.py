@@ -57,7 +57,7 @@ class HotSetManager:
             self.registry.snapshot(), demand)
 
         # 3. Current HBM state
-        hbm_used = self.registry.hbm_footprint()
+        hbm_used = self.kv.total_hbm_bytes()
 
         # 4. Evict: remove lowest-scored HBM residents until under budget
         hbm_residents = [s for s in scored

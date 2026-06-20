@@ -363,10 +363,108 @@ def parse_split(s):
     parts = s.split(":")
     return (int(parts[0]), int(parts[1]))
 
+def run_hotstate_arbiter(dataset, total_available, warmup_batches,
+                         measure_batches, num_users, out_jsonl,
+                         hidden_dim, num_layers, num_heads, head_dim,
+                         dtype, max_seqlen, total_hbm_bytes):
+    """Run with full HotState controller — zero rebuilds, self-discovering."""
+
+    # Build ONE model with max KV pages
+    max_pages = compute_split_params(total_hbm_bytes, 20, 80,
+        num_layers, num_heads, head_dim, DEFAULT_KV_PAGE_SIZE, dtype)[2]
+
+    model = build_inference_model(hidden_dim, num_layers, num_heads,
+                                  head_dim, dtype, max_seqlen, max_pages)
+
+    emb_module = model.sparse_module
+
+    model.dense_module.enable_hotstate(
+        total_hbm_bytes=total_hbm_bytes,
+    )
+    model.dense_module.set_hotstate_embedding_module(emb_module)
+    controller = model.dense_module.hotstate
+
+    print(f"=== HotState: Unified HBM Control Plane ===")
+    print(f"Total HBM: {total_hbm_bytes / 1024**3:.2f} GiB")
+    print(f"KV pages: {max_pages} (max), dynamically managed")
+    print(f"Embedding: hot/cold row-group granularity")
+    print(f"")
+
+    dataset._iloc = 0
+    dataloader = get_data_loader(dataset)
+    it = iter(dataloader)
+
+    # Warmup
+    print(f"Warming up ({warmup_batches} batches)...")
+    for _ in range(warmup_batches):
+        batch, uids, thl = next(it)
+        controller.before_batch(batch, uids, thl)
+        with torch.inference_mode():
+            model.forward_with_kvcache(batch, uids, thl)
+
+    # Measure
+    trace_records = []
+    kv_budget_history = []
+    print(f"\nMeasuring ({measure_batches} batches)...")
+    for i in range(measure_batches):
+        batch, uids, thl = next(it)
+        control = controller.before_batch(batch, uids, thl)
+
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        with torch.inference_mode():
+            logits = model.forward_with_kvcache(batch, uids, thl)
+        torch.cuda.synchronize()
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+
+        controller.after_batch(batch, latency_ms)
+
+        hist_len = thl[0].item() // 2
+        user_id = int(uids[0].item())
+        kv_budget_history.append(control["kv_page_budget"])
+
+        trace_records.append({
+            "split": "hotstate",
+            "split_lhs": 0, "split_rhs": 0,
+            "kv_page_budget": control["kv_page_budget"],
+            "hbm_bytes_used": control["hbm_bytes_used"],
+            "evicted": control["evicted"],
+            "admitted": control["admitted"],
+            "batch_idx": i,
+            "latency_ms": latency_ms,
+            "seq_history_len": hist_len,
+            "user_id": user_id,
+            "epoch": control["epoch"],
+        })
+        if i % 20 == 0:
+            print(f"  [{i+1}/{measure_batches}] latency={latency_ms:.2f}ms "
+                  f"hist={hist_len} kv_pages={control['kv_page_budget']}")
+
+    teardown_model(model)
+
+    lats = sorted(r["latency_ms"] for r in trace_records)
+    n = len(lats)
+    def pct(v, r):
+        return v[min(len(v)-1, int(len(v)*r))] if v else float("nan")
+
+    results = {
+        "mean": sum(lats)/n, "p50": pct(lats,0.5), "p95": pct(lats,0.95),
+        "p99": pct(lats,0.99), "p99_9": pct(lats,0.999),
+        "max": max(lats), "num_records": n,
+        "switch_count": 0,
+        "kv_budget_range": f"{min(kv_budget_history)}-{max(kv_budget_history)}",
+    }
+    with open(out_jsonl, "w") as f:
+        for r in trace_records:
+            f.write(json.dumps(r) + "\n")
+    return results
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Phase 2: Split-Switching HBM Arbiter")
+        description="Unified HBM Arbiter — exploit / calibrate / hotstate")
+    parser.add_argument("--mode", type=str, default="exploit",
+                        choices=["exploit", "calibrate", "hotstate"],
+                        help="exploit=Phase 2, calibrate=Phase 3, hotstate=full control plane")
     # Model config
     parser.add_argument("--hidden-dim", type=int, default=512)
     parser.add_argument("--num-layers", type=int, default=3)
@@ -380,21 +478,15 @@ def main():
     parser.add_argument("--num-users", type=int, default=8)
     # Arbiter config
     parser.add_argument("--thresholds", type=str, default=None,
-                        help="Threshold policy, e.g. '3072:50:50'")
+                        help="For exploit mode: e.g. '3072:50:50'")
     parser.add_argument("--default-split", type=str, default=None,
-                        help="Default emb:kv split, e.g. '70:30'")
+                        help="For exploit mode: default emb:kv split, e.g. '70:30'")
     parser.add_argument("--total-hbm-budget-gib", type=float, default=1.0)
     # Run config
     parser.add_argument("--warmup-ratio", type=float, default=0.1)
     parser.add_argument("--out-jsonl", type=str, required=True,
                         help="Output JSONL trace file")
     args = parser.parse_args()
-
-    # ── Parse policy ─────────────────────────────────────────────────────
-    policy = ThresholdPolicy(
-        thresholds=parse_thresholds(args.thresholds),
-        default=parse_split(args.default_split),
-    )
 
     # ── Build config dicts ──────────────────────────────────────────────
     dtype = (torch.bfloat16
@@ -411,28 +503,35 @@ def main():
     warmup_batches = max(1, int(total_available * args.warmup_ratio))
     measure_batches = total_available - warmup_batches
 
-    # ── Run arbiter ──────────────────────────────────────────────────────
-    results = run_arbiter(
-        dataset=dataset,
-        total_available=total_available,
-        warmup_batches=warmup_batches,
-        measure_batches=measure_batches,
-        num_users=args.num_users,
-        policy=policy,
-        model_config=None,         # not used — pass individual params below
+    common = dict(
+        dataset=dataset, total_available=total_available,
+        warmup_batches=warmup_batches, num_users=args.num_users,
         out_jsonl=args.out_jsonl,
-        hidden_dim=args.hidden_dim,
-        num_layers=args.num_layers,
-        num_heads=args.num_heads,
-        head_dim=args.head_dim,
-        dtype=dtype,
-        max_seqlen=max_seqlen,
-        total_hbm_bytes=total_hbm_bytes,
-    )
+        hidden_dim=args.hidden_dim, num_layers=args.num_layers,
+        num_heads=args.num_heads, head_dim=args.head_dim,
+        dtype=dtype, max_seqlen=max_seqlen, total_hbm_bytes=total_hbm_bytes)
+
+    # ── Dispatch by mode ────────────────────────────────────────────────
+    if args.mode == "exploit":
+        if args.thresholds is None:
+            parser.error("--thresholds required for exploit mode")
+        if args.default_split is None:
+            parser.error("--default-split required for exploit mode")
+        policy = ThresholdPolicy(
+            thresholds=parse_thresholds(args.thresholds),
+            default=parse_split(args.default_split))
+        results = run_exploit_arbiter(
+            measure_batches=measure_batches, policy=policy, **common)
+    elif args.mode == "calibrate":
+        results = run_calibrate_arbiter(
+            measure_batches=measure_batches, **common)
+    elif args.mode == "hotstate":
+        results = run_hotstate_arbiter(
+            measure_batches=measure_batches, **common)
 
     # ── Print summary ───────────────────────────────────────────────────
     print(f"\n{'=' * 60}")
-    print("RESULTS")
+    print(f"RESULTS ({args.mode} mode)")
     print(f"{'=' * 60}")
     print(f"  Mean:          {results['mean']:6.2f}ms")
     print(f"  P50:           {results['p50']:6.2f}ms")
@@ -442,7 +541,10 @@ def main():
     print(f"  Max:           {results['max']:6.2f}ms")
     print(f"  Switches:      {results['switch_count']}")
     print(f"  Records:       {results['num_records']}")
-
+    if "discovered_policy" in results:
+        print(f"  Discovered:    {results['discovered_policy']}")
+    if "calibration_cost_batches" in results:
+        print(f"  Calib cost:    {results['calibration_cost_batches']} batches")
 
 if __name__ == "__main__":
     main()

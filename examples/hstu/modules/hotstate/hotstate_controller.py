@@ -7,6 +7,7 @@ from modules.hotstate.embedding_adapter import EmbeddingAdapter
 from modules.hotstate.kv_adapter import KVAdapter
 from modules.hotstate.hot_set_manager import HotSetManager
 from modules.hotstate.transfer_scheduler import TransferScheduler
+import time
 
 
 class HotStateController:
@@ -48,6 +49,8 @@ class HotStateController:
 
     def before_batch(self, batch, user_ids, total_history_lengths, batch_idx=0) -> dict:
         """Called before each inference batch. Runs control epoch + transfer planning."""
+        t = time.perf_counter()
+
         uid = int(user_ids[0].item())
         hist_len = int(total_history_lengths[0].item()) // 2
 
@@ -57,7 +60,11 @@ class HotStateController:
         except Exception:
             item_indices = []
 
+        t1 = time.perf_counter()
+
         self.emb_adapter.record_batch_keys(item_indices)
+
+        t2 = time.perf_counter()
 
         demand = DemandSignal(
             current_user_id=uid, history_length=hist_len,
@@ -69,6 +76,7 @@ class HotStateController:
 
         # 2. Score and decide: what to keep, what to evict
         result = self.hot_set.run_epoch(self.epoch, demand)
+        t3 = time.perf_counter()
 
         # 3. Plan and submit transfers with priority ordering
         # Build a quick scoring lookup for reuse_imminence
@@ -82,6 +90,15 @@ class HotStateController:
             evicted_keys=result.evicted_keys,
             scoring_map=scoring_map,
             epoch=self.epoch)
+        t4 = time.perf_counter()
+
+        if self.epoch <= 5 or self.epoch % 50 == 0:
+            print(f"  [PROFILE epoch {self.epoch}] "
+                  f"extract={1000*(t1-t):.1f}ms "
+                  f"record_keys={1000*(t2-t1):.1f}ms "
+                  f"run_epoch={1000*(t3-t2):.1f}ms "
+                  f"scheduler={1000*(t4-t3):.1f}ms "
+                  f"total={1000*(t4-t):.1f}ms")
 
         # 4. Track access
         for key in result.evicted_keys + result.admitted_keys:
