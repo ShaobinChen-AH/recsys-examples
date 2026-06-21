@@ -436,6 +436,13 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
             "seq_history_len": hist_len,
             "user_id": user_id,
             "epoch": control["epoch"],
+            "active_kv_page_limit": controller.kv_adapter.get_current_page_limit(),
+            "resident_kv_pages": controller.kv_adapter.get_resident_page_count(),
+            "empty_kv_pages": controller.kv_adapter.get_empty_page_count(),
+            "withheld_kv_pages": controller.kv_adapter.get_withheld_page_count(),
+            "logical_kv_budget_bytes": controller.kv_adapter.logical_kv_budget_bytes(),
+            "physical_kv_cache_bytes": controller.kv_adapter.physical_kv_cache_bytes(),
+            "actual_resident_kv_bytes": controller.kv_adapter.actual_resident_kv_bytes(),
         })
         if i % 20 == 0:
             print(f"  [{i+1}/{measure_batches}] latency={latency_ms:.2f}ms "

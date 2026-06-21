@@ -385,6 +385,9 @@ public:
 public:
     int64_t get_empty_page_count();
     int64_t get_user_page_count(int64_t uid);
+    int64_t get_active_page_limit();
+    int64_t get_withheld_page_count();
+    int64_t get_resident_page_count();
     bool has_user(int64_t uid);
     bool evict_if_present(int64_t uid);
     void set_active_page_limit(int new_limit);

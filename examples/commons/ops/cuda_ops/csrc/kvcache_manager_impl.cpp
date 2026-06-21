@@ -629,6 +629,22 @@ int64_t GPUKVCacheMangerImpl::get_user_page_count(int64_t uid) {
         : 0;
 }
 
+int64_t GPUKVCacheMangerImpl::get_active_page_limit() {
+    return static_cast<int64_t>(_active_page_limit);
+}
+
+int64_t GPUKVCacheMangerImpl::get_withheld_page_count() {
+    return static_cast<int64_t>(_withheld_pages.size());
+}
+
+int64_t GPUKVCacheMangerImpl::get_resident_page_count() {
+    int64_t resident = 0;
+    for (const auto& kv : _uid_to_page_id) {
+        resident += static_cast<int64_t>(kv.second.size());
+    }
+    return resident;
+}
+
 bool GPUKVCacheMangerImpl::has_user(int64_t uid) {
     return _lru_lookup_table.find(uid) != _lru_lookup_table.end();
 }
