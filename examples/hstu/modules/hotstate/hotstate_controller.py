@@ -72,7 +72,9 @@ class HotStateController:
             epoch=self.epoch, item_indices=item_indices)
 
         # 1. Check completed offloads from previous epochs
-        completed = self.scheduler.poll_completions(self.epoch)
+        completed = []
+        if self.enable_transfer_scheduler:
+            completed = self.scheduler.poll_completions(self.epoch)
 
         # 2. Score and decide: what to keep, what to evict
         result = self.hot_set.run_epoch(self.epoch, demand)
@@ -80,16 +82,18 @@ class HotStateController:
 
         # 3. Plan and submit transfers with priority ordering
         # Build a quick scoring lookup for reuse_imminence
-        scoring_map = {}
-        for s in self.value_engine.compute_scores(
-            self.registry.snapshot(), demand):
-            scoring_map[s.handle.logical_key] = s
-        
-        self.scheduler.plan_and_submit(
-            current_batch=batch_idx,
-            evicted_keys=result.evicted_keys,
-            scoring_map=scoring_map,
-            epoch=self.epoch)
+        if self.enable_transfer_scheduler:
+            scoring_map = {}
+            for s in self.value_engine.compute_scores(
+                self.registry.snapshot(), demand):
+                scoring_map[s.handle.logical_key] = s
+
+            self.scheduler.plan_and_submit(
+                current_batch=batch_idx,
+                evicted_keys=result.evicted_keys,
+                scoring_map=scoring_map,
+                epoch=self.epoch)
+
         t4 = time.perf_counter()
 
         if self.epoch <= 5 or self.epoch % 50 == 0:

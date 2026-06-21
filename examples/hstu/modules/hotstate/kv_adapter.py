@@ -49,14 +49,37 @@ class KVAdapter:
     def get_empty_page_count(self) -> int:
         """Number of free pages in the pool."""
         return self._gpu_mgr.get_empty_page_count()
+    
+    def get_withheld_page_count(self) -> int:
+        if hasattr(self._gpu_mgr, "get_withheld_page_count"):
+            return int(self._gpu_mgr.get_withheld_page_count())
+        return 0
+
+    def get_resident_page_count(self) -> int:
+        if hasattr(self._gpu_mgr, "get_resident_page_count"):
+            return int(self._gpu_mgr.get_resident_page_count())
+        resident = 0
+        for uid in range(self.num_users):
+            resident += int(self.get_page_count_for_user(uid))
+        return resident
+
+    def get_physical_page_count(self) -> int:
+        return int(self._kvcache.num_primary_cache_pages)
 
     def get_current_page_limit(self) -> int:
-        return self._active_page_limit
+        if hasattr(self._gpu_mgr, "get_active_page_limit"):
+            return int(self._gpu_mgr.get_active_page_limit())
+        return int(self._active_page_limit)
 
-    def set_page_limit(self, new_limit: int) -> None:
-        """Dynamically adjust the KV page budget."""
-        self._gpu_mgr.set_active_page_limit(new_limit)
-        self._active_page_limit = new_limit
+    def set_page_limit(self, new_limit: int) -> bool:
+        """Adjust logical KV budget; physical KV tensor size is unchanged."""
+        new_limit = int(new_limit)
+        if hasattr(self._gpu_mgr, "set_active_page_limit"):
+            self._gpu_mgr.set_active_page_limit(new_limit)
+            self._active_page_limit = self.get_current_page_limit()
+            return self._active_page_limit == new_limit
+        self._active_page_limit = self.get_current_page_limit()
+        return new_limit == self._active_page_limit
 
     def evict_user(self, uid: int) -> None:
         """Release all pages for a user back to the empty pool."""
@@ -80,6 +103,15 @@ class KVAdapter:
                 consistency_class="derived_recomputable",
             ))
         return handles
+    
+    def logical_kv_budget_bytes(self) -> int:
+        return self.get_current_page_limit() * self._page_bytes()
+
+    def physical_kv_cache_bytes(self) -> int:
+        return self.get_physical_page_count() * self._page_bytes()
+
+    def actual_resident_kv_bytes(self) -> int:
+        return self.get_resident_page_count() * self._page_bytes()
 
     def total_hbm_bytes(self) -> int:
-        return self.get_current_page_limit() * self._page_bytes()
+        return self.logical_kv_budget_bytes()
