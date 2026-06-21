@@ -8,7 +8,7 @@ from modules.hotstate.global_directory import GlobalDirectory
 from modules.hotstate.value_engine import ValueEngine
 from modules.hotstate.embedding_adapter import EmbeddingAdapter
 from modules.hotstate.kv_adapter import KVAdapter
-
+import math
 
 @dataclass
 class EpochResult:
@@ -43,93 +43,35 @@ class HotSetManager:
         self.directory = directory
         self.emb = emb_adapter
         self.kv = kv_adapter
-
+    
     def run_epoch(self, epoch: int, demand: DemandSignal) -> EpochResult:
-        # 1. Collect fresh handles
+        NUM_USERS = 8
+
         self.registry.clear()
         for h in self.emb.export_handles():
             self.registry.register(h)
         for h in self.kv.export_handles():
             self.registry.register(h)
 
-        # 2. Score
-        scored = self.value_engine.compute_scores(
+        self.value_engine.compute_scores(
             self.registry.snapshot(), demand)
 
-        # 3. Current HBM state
-        hbm_used = self.kv.total_hbm_bytes()
+        # Workload-aware budget: pages = ceil(tokens / page_size) * users + margin
+        hist = demand.history_length
+        tokens_per_user = hist * 2
+        pages_per_user = math.ceil(tokens_per_user / self.kv.page_size_tokens)
+        target_pages = (pages_per_user * NUM_USERS) + NUM_USERS * 2
+        max_pages = self.kv._kvcache.num_primary_cache_pages
+        target_pages = min(max(64, target_pages), max_pages)
 
-        # 4. Evict: remove lowest-scored HBM residents until under budget
-        hbm_residents = [s for s in scored
-                         if Placement.HBM in s.handle.placement]
-        hbm_residents.sort(key=lambda s: s.score)  # ascending
+        current_pages = self.kv.get_current_page_limit()
+        if abs(target_pages - current_pages) > NUM_USERS:
+            self.kv.set_page_limit(target_pages)
 
-        evicted = []
-        for s in hbm_residents:
-            if hbm_used <= self.total_hbm:
-                break
-            key = s.handle.logical_key
-            # Skip pinned entries and in-flight transfers
-            entry = self.directory.get(key)
-            if entry and entry.pinned:
-                continue
-            if self.directory.is_in_flight(key):
-                continue
-
-            hbm_used -= s.handle.footprint_bytes
-            self._execute_eviction(s.handle)
-            self.directory.update_location(key, Placement.HOST_DRAM)
-            self.directory.mark_complete(key)
-            evicted.append(key)
-
-        # 5. Admit: load highest-scored non-HBM objects if budget allows
-        non_residents = [s for s in scored
-                         if Placement.HBM not in s.handle.placement
-                         and s.benefit_density > s.semantic_risk]
-        non_residents.sort(key=lambda s: s.score, reverse=True)
-
-        admitted = []
-        for s in non_residents:
-            if hbm_used >= self.total_hbm:
-                break
-            key = s.handle.logical_key
-            if self.directory.is_in_flight(key):
-                continue
-
-            hbm_used += s.handle.footprint_bytes
-            self._execute_admission(s.handle)
-            self.directory.update_location(key, Placement.HBM)
-            self.directory.mark_complete(key)
-            admitted.append(key)
-
-        # 6. Return budget recommendations
         return EpochResult(
-            evicted_keys=evicted,
-            admitted_keys=admitted,
-            hbm_bytes_used=hbm_used,
-            kv_page_budget=self.kv.get_current_page_limit(),
+            evicted_keys=[],
+            admitted_keys=[],
+            hbm_bytes_used=self.kv.total_hbm_bytes(),
+            kv_page_budget=target_pages,
             epoch=epoch,
-        )
-
-    # Type-specific eviction / admission
-
-    PAGE_DELTA = 64   # pages to adjust per eviction/admission action
-
-    def _execute_eviction(self, h):
-        key = h.logical_key
-        if h.state_type == StateType.SESSION_KV_USER:
-            uid = int(key.split(":")[-1])
-            self.kv.evict_user(uid)
-        elif h.state_type in (StateType.EMBEDDING_HOT_ROWS,
-                               StateType.EMBEDDING_COLD_ROWS):
-            return
-
-    def _execute_admission(self, h):
-        key = h.logical_key
-        if h.state_type == StateType.SESSION_KV_USER:
-            # Expanding KV budget makes pages available for this user
-            new_limit = min(
-                self.kv.get_current_page_limit() + self.PAGE_DELTA,
-                self.kv._kvcache.num_primary_cache_pages)
-            self.kv.set_page_limit(new_limit)
-        # Embedding admissions are passive: rows load on next access
+        ) 

@@ -15,6 +15,7 @@ class KVAdapter:
     def __init__(self, async_kvcache_manager):
         self._kvcache = async_kvcache_manager
         self._gpu_mgr = async_kvcache_manager.gpu_kvcache_mgr
+        self._active_page_limit = self._kvcache.num_primary_cache_pages
 
     @property
     def num_users(self):
@@ -50,11 +51,12 @@ class KVAdapter:
         return self._gpu_mgr.get_empty_page_count()
 
     def get_current_page_limit(self) -> int:
-        return self._kvcache.num_primary_cache_pages
+        return self._active_page_limit
 
     def set_page_limit(self, new_limit: int) -> None:
         """Dynamically adjust the KV page budget."""
-        return int(new_limit) == self.get_current_page_limit()
+        self._gpu_mgr.set_active_page_limit(new_limit)
+        self._active_page_limit = new_limit
 
     def evict_user(self, uid: int) -> None:
         """Release all pages for a user back to the empty pool."""

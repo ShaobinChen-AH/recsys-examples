@@ -46,6 +46,7 @@ from configs import (
     get_kvcache_config,
 )
 from inference_ranking_gr import get_inference_ranking_gr
+import math
 
 # ── Constants ────────────────────────────────────────────────────────────────
 DEFAULT_KV_PAGE_SIZE = 32
@@ -379,7 +380,7 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
     emb_module = model.sparse_module
 
     model.dense_module.enable_hotstate(
-        total_hbm_bytes=min(total_hbm_bytes, 308_000_000),
+        total_hbm_bytes=total_hbm_bytes,
     )
     model.dense_module.set_hotstate_embedding_module(emb_module)
     controller = model.dense_module.hotstate
