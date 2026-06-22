@@ -288,12 +288,32 @@ def run_arbiter(dataset, total_available, warmup_batches, measure_batches,
             continue       # back to while loop — these batches consumed
 
         # Normal measurement
+        origin_cached_length = None
+        max_origin_cached_length = None
+        new_tokens = None
+        offload_pages = None
+
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         with torch.inference_mode():
-            model.forward_with_kvcache(batch, uids, thl)
+            logits = model.forward_with_kvcache(batch, uids, thl)
         torch.cuda.synchronize()
         latency_ms = (time.perf_counter() - t0) * 1000.0
+
+        try:
+            async_kvcache = model.dense_module.async_kvcache
+            uid = int(uids[0].item())
+            total_history_len = int(thl[0].item())
+
+            cached = async_kvcache.gpu_kvcache_mgr.get_total_cache_length([uid])
+            origin_cached_length = int(cached[0])
+            max_origin_cached_length = origin_cached_length
+            new_tokens = max(0, total_history_len - origin_cached_length)
+
+            offload_pages = None  # still unavailable unless captured inside prepare_kvcache path
+        except Exception as e:
+            if i == 0:
+                print(f"[HotState metric debug] failed to collect KV metrics: {repr(e)}")
 
         user_id = int(uids[0].item())
 
@@ -411,6 +431,11 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
         batch, uids, thl = next(it)
         control = controller.before_batch(batch, uids, thl)
 
+        origin_cached_length = None
+        max_origin_cached_length = None
+        new_tokens = None
+        offload_pages = None
+
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         with torch.inference_mode():
@@ -443,6 +468,10 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
             "logical_kv_budget_bytes": controller.kv_adapter.logical_kv_budget_bytes(),
             "physical_kv_cache_bytes": controller.kv_adapter.physical_kv_cache_bytes(),
             "actual_resident_kv_bytes": controller.kv_adapter.actual_resident_kv_bytes(),
+            "origin_cached_length": origin_cached_length,
+            "max_origin_cached_length": max_origin_cached_length,
+            "new_tokens": new_tokens,
+            "offload_pages": offload_pages,
         })
         if i % 20 == 0:
             print(f"  [{i+1}/{measure_batches}] latency={latency_ms:.2f}ms "
