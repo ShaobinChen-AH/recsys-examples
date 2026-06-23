@@ -113,6 +113,11 @@ class AsyncHSTUKVCacheManager:
             self.cache_table[idx] for idx in range(self.num_layers)
         ]
 
+        self.last_origin_cached_lengths = None
+        self.last_new_tokens = None
+        self.last_num_offload_pages = None
+        self.last_max_seqlen = None
+
     def prepare_kvcache_async(
         self,
         batch_size,
@@ -130,6 +135,9 @@ class AsyncHSTUKVCacheManager:
                 for idx in range(batch_size)
             ]
         )
+
+        self.last_origin_cached_lengths = list(origin_cached_lengths)
+        self.last_new_tokens = int(new_tokens)
 
         offload_uids_buffer = torch.empty(
             [
@@ -230,6 +238,12 @@ class AsyncHSTUKVCacheManager:
             offload_handle = paged_kvcache_ops.KVOffloadHandle(
                 self.num_layers, self.gpu_kvcache_mgr, True
             )
+
+        self.last_num_offload_pages = int(metadata_host_buffer[batch_size * 7 + 5])
+        self.last_max_seqlen = int(
+            torch.max(metadata_host_buffer[batch_size * 2 + 1 : batch_size * 3 + 1]).item()
+        )
+
         return KVCacheMetadata(
             kv_indices=static_page_ids_gpu_buffer[
                 : metadata_host_buffer[batch_size * 7 + 4]

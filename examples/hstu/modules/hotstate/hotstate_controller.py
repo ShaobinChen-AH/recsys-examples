@@ -71,6 +71,8 @@ class HotStateController:
             num_candidates=batch.max_num_candidates or 100,
             epoch=self.epoch, item_indices=item_indices)
 
+        self._last_demand = demand
+
         # 1. Check completed offloads from previous epochs
         completed = []
         if self.enable_transfer_scheduler:
@@ -120,14 +122,49 @@ class HotStateController:
             "evicted": len(result.evicted_keys),
             "admitted": len(result.admitted_keys),
             "epoch": self.epoch - 1,
+            "completed_transfers": len(completed),
+            "profile_ms": {
+                "extract": 1000 * (t1 - t),
+                "record_keys": 1000 * (t2 - t1),
+                "run_epoch": 1000 * (t3 - t2),
+                "scheduler": 1000 * (t4 - t3),
+                "total": 1000 * (t4 - t),
+            },
+            "state_trace": self._state_trace_records(result),
         }
 
 
     def after_batch(self, batch, latency_ms: float):
-        """Called after inference. Updates access statistics."""
+        """Called after inference. Updates access statistics and snapshots post-forward state."""
+        demand = getattr(self, "_last_demand", None)
+        post_state_trace = []
+
+        if demand is not None:
+            handles = []
+            handles.extend(self.emb_adapter.export_handles())
+            handles.extend(self.kv_adapter.export_handles())
+
+            scored_handles = self.value_engine.compute_scores(handles, demand)
+            decision_by_key = {}
+            for scored in scored_handles:
+                handle = scored.handle
+                decision_by_key[handle.logical_key] = (
+                    "resident" if Placement.HBM in handle.placement else "not_resident"
+                )
+
+            post_state_trace = self._state_trace_records_from_scored(
+                scored_handles,
+                decision_by_key,
+            )
+
         for feature_name in batch.features.keys():
             self.value_engine.record_access(
                 f"emb:{feature_name}", self.epoch)
+
+        return {
+            "post_num_state_handles": len(post_state_trace),
+            "post_state_trace": post_state_trace,
+        }
 
     def _check_completions(self):
         """Check subsystem-level transfer completion."""
@@ -135,3 +172,31 @@ class HotStateController:
         # so there's nothing async to check here.
         # In V2: poll cudaEventQuery on onload/offload events.
         pass
+   
+    def _state_trace_records(self, result):
+        return self._state_trace_records_from_scored(
+            result.scored_handles,
+            result.decision_by_key,
+        )
+
+    def _state_trace_records_from_scored(self, scored_handles, decision_by_key):
+        records = []
+        for scored in scored_handles:
+            handle = scored.handle
+            records.append({
+                "logical_key": handle.logical_key,
+                "state_type": handle.state_type.name,
+                "footprint_bytes": int(handle.footprint_bytes),
+                "placement": sorted(p.name for p in handle.placement),
+                "reconstructability": handle.reconstructability.name,
+                "consistency_class": handle.consistency_class,
+                "reuse_imminence": float(handle.reuse_imminence),
+                "stall_sensitivity_ms": float(handle.stall_sensitivity_ms),
+                "movement_cost_ms": float(handle.movement_cost_ms),
+                "score": float(scored.score),
+                "benefit_density": float(scored.benefit_density),
+                "occupancy_penalty": float(scored.occupancy_penalty),
+                "semantic_risk": float(scored.semantic_risk),
+                "decision": decision_by_key.get(handle.logical_key, "unknown"),
+            })
+        return records

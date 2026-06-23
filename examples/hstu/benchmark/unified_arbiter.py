@@ -302,18 +302,22 @@ def run_arbiter(dataset, total_available, warmup_batches, measure_batches,
 
         try:
             async_kvcache = model.dense_module.async_kvcache
-            uid = int(uids[0].item())
-            total_history_len = int(thl[0].item())
-
-            cached = async_kvcache.gpu_kvcache_mgr.get_total_cache_length([uid])
-            origin_cached_length = int(cached[0])
-            max_origin_cached_length = origin_cached_length
-            new_tokens = max(0, total_history_len - origin_cached_length)
-
-            offload_pages = None  # still unavailable unless captured inside prepare_kvcache path
+            origin_cached_lengths = async_kvcache.last_origin_cached_lengths
+            origin_cached_length = (
+                int(origin_cached_lengths[0])
+                if origin_cached_lengths is not None and len(origin_cached_lengths) > 0
+                else None
+            )
+            max_origin_cached_length = (
+                max(int(x) for x in origin_cached_lengths)
+                if origin_cached_lengths is not None
+                else None
+            )
+            new_tokens = async_kvcache.last_new_tokens
+            offload_pages = async_kvcache.last_num_offload_pages
         except Exception as e:
             if i == 0:
-                print(f"[HotState metric debug] failed to collect KV metrics: {repr(e)}")
+                print(f"[HotState metric debug] failed: {repr(e)}")
 
         user_id = int(uids[0].item())
 
@@ -435,6 +439,7 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
         max_origin_cached_length = None
         new_tokens = None
         offload_pages = None
+        max_seqlen = None
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -443,7 +448,27 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
         torch.cuda.synchronize()
         latency_ms = (time.perf_counter() - t0) * 1000.0
 
-        controller.after_batch(batch, latency_ms)
+        try:
+            async_kvcache = model.dense_module.async_kvcache
+            origin_cached_lengths = async_kvcache.last_origin_cached_lengths
+            origin_cached_length = (
+                int(origin_cached_lengths[0])
+                if origin_cached_lengths is not None and len(origin_cached_lengths) > 0
+                else None
+            )
+            max_origin_cached_length = (
+                max(int(x) for x in origin_cached_lengths)
+                if origin_cached_lengths is not None
+                else None
+            )
+            new_tokens = async_kvcache.last_new_tokens
+            offload_pages = async_kvcache.last_num_offload_pages
+            max_seqlen = async_kvcache.last_max_seqlen
+        except Exception as e:
+            if i == 0:
+                print(f"[HotState metric debug] failed: {repr(e)}")
+
+        post_control = controller.after_batch(batch, latency_ms)
 
         hist_len = thl[0].item() // 2
         user_id = int(uids[0].item())
@@ -472,7 +497,21 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
             "max_origin_cached_length": max_origin_cached_length,
             "new_tokens": new_tokens,
             "offload_pages": offload_pages,
+            "max_seqlen": max_seqlen,
+            "completed_transfers": control.get("completed_transfers", 0),
+            "hotstate_profile_ms": control.get("profile_ms", {}),
+            "num_state_handles": len(control.get("state_trace", [])),
+            "state_trace": control.get("state_trace", []),
+            "post_num_state_handles": post_control.get("post_num_state_handles", 0),
+            "post_state_trace": post_control.get("post_state_trace", []),
         })
+        if i < 5 or latency_ms > 10:
+            print(
+                f"[KVDBG {i+1}] latency={latency_ms:.2f}ms hist={hist_len} "
+                f"origin={origin_cached_length} max_origin={max_origin_cached_length} "
+                f"new_tokens={new_tokens} offload_pages={offload_pages} "
+                f"max_seqlen={max_seqlen}"
+        )
         if i % 20 == 0:
             print(f"  [{i+1}/{measure_batches}] latency={latency_ms:.2f}ms "
                   f"hist={hist_len} kv_pages={control['kv_page_budget']}")

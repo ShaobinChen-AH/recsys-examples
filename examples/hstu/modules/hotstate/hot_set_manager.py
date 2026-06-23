@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List
+from typing import Dict, List
 
 from modules.hotstate.state_handle import StateType, ScoredHandle, Placement
 from modules.hotstate.demand_signal import DemandSignal
@@ -17,6 +17,8 @@ class EpochResult:
     hbm_bytes_used: int = 0
     kv_page_budget: int = 0
     epoch: int = 0
+    scored_handles: List[ScoredHandle] = field(default_factory=list)
+    decision_by_key: Dict[str, str] = field(default_factory=dict)
 
 
 class HotSetManager:
@@ -53,8 +55,16 @@ class HotSetManager:
         for h in self.kv.export_handles():
             self.registry.register(h)
 
-        self.value_engine.compute_scores(
+        scored_handles = self.value_engine.compute_scores(
             self.registry.snapshot(), demand)
+
+        decision_by_key = {}
+        for scored in scored_handles:
+            handle = scored.handle
+            if Placement.HBM in handle.placement:
+                decision_by_key[handle.logical_key] = "kept"
+            else:
+                decision_by_key[handle.logical_key] = "not_admitted"
 
         # Workload-aware budget: pages = ceil(tokens / page_size) * users + margin
         hist = demand.history_length
@@ -74,4 +84,6 @@ class HotSetManager:
             hbm_bytes_used=self.kv.total_hbm_bytes(),
             kv_page_budget=target_pages,
             epoch=epoch,
+            scored_handles=scored_handles,
+            decision_by_key=decision_by_key,
         ) 
