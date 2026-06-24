@@ -53,6 +53,7 @@ class HotStateController:
 
         uid = int(user_ids[0].item())
         hist_len = int(total_history_lengths[0].item()) // 2
+        self.kv_adapter.record_batch_users(user_ids)
 
         try:
             item_values = batch.features["item_feat"].values()

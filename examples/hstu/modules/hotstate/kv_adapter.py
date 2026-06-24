@@ -1,4 +1,4 @@
-from typing import List
+from typing import Iterable, List, Set
 
 from modules.hotstate.state_handle import (
     StateHandle, StateType, Placement, Reconstructability
@@ -16,6 +16,7 @@ class KVAdapter:
         self._kvcache = async_kvcache_manager
         self._gpu_mgr = async_kvcache_manager.gpu_kvcache_mgr
         self._active_page_limit = self._kvcache.num_primary_cache_pages
+        self._known_user_ids: Set[int] = set()
 
     @property
     def num_users(self):
@@ -36,6 +37,19 @@ class KVAdapter:
     @property
     def num_layers(self):
         return self._kvcache.num_layers
+
+    def record_batch_users(self, user_ids) -> None:
+        if hasattr(user_ids, "detach"):
+            user_ids = user_ids.detach().cpu().tolist()
+        for uid in user_ids:
+            self._known_user_ids.add(int(uid))
+
+    def _candidate_user_ids(self):
+        if self._known_user_ids:
+            return sorted(self._known_user_ids)
+        if self.num_users is not None and self.num_users > 0:
+            return range(int(self.num_users))
+        return []
 
     def _page_bytes(self) -> int:
         """Bytes per KV page across all layers."""
@@ -59,7 +73,7 @@ class KVAdapter:
         if hasattr(self._gpu_mgr, "get_resident_page_count"):
             return int(self._gpu_mgr.get_resident_page_count())
         resident = 0
-        for uid in range(self.num_users):
+        for uid in self._candidate_user_ids():
             resident += int(self.get_page_count_for_user(uid))
         return resident
 
@@ -89,7 +103,7 @@ class KVAdapter:
         """Export one handle per user with pages allocated to them."""
         handles = []
         page_bytes = self._page_bytes()
-        for uid in range(self.num_users):
+        for uid in self._candidate_user_ids():
             page_count = self.get_page_count_for_user(uid)
             if page_count == 0:
                 continue
