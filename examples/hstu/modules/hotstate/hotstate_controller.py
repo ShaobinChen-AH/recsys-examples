@@ -132,6 +132,9 @@ class HotStateController:
                 "total": 1000 * (t4 - t),
             },
             "state_trace": self._state_trace_records(result),
+            "selected_hbm_bytes": result.selected_hbm_bytes,
+            "selected_kv_bytes": result.selected_kv_bytes,
+            "selected_embedding_bytes": result.selected_embedding_bytes,
         }
 
 
@@ -179,7 +182,7 @@ class HotStateController:
             result.scored_handles,
             result.decision_by_key,
         )
-
+    
     def _state_trace_records_from_scored(self, scored_handles, decision_by_key):
         records = []
         for scored in scored_handles:
@@ -198,6 +201,13 @@ class HotStateController:
                 "benefit_density": float(scored.benefit_density),
                 "occupancy_penalty": float(scored.occupancy_penalty),
                 "semantic_risk": float(scored.semantic_risk),
+                "gross_benefit_ms": float(getattr(scored, "gross_benefit_ms", 0.0)),
+                "movement_penalty_ms": float(getattr(scored, "movement_penalty_ms", 0.0)),
+                "semantic_risk_ms": float(getattr(scored, "semantic_risk_ms", 0.0)),
+                "net_benefit_ms": float(getattr(scored, "net_benefit_ms", 0.0)),
+                "value_density_ms_per_byte": float(
+                    getattr(scored, "value_density_ms_per_byte", 0.0)
+                ),
                 "decision": decision_by_key.get(handle.logical_key, "unknown"),
             })
         return records

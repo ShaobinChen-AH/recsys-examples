@@ -504,6 +504,9 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
             "state_trace": control.get("state_trace", []),
             "post_num_state_handles": post_control.get("post_num_state_handles", 0),
             "post_state_trace": post_control.get("post_state_trace", []),
+            "selected_hbm_bytes": control.get("selected_hbm_bytes", 0),
+            "selected_kv_bytes": control.get("selected_kv_bytes", 0),
+            "selected_embedding_bytes": control.get("selected_embedding_bytes", 0),
         })
         if i < 5 or latency_ms > 10:
             print(

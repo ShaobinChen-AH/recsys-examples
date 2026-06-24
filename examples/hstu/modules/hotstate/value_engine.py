@@ -3,7 +3,7 @@ from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 from modules.hotstate.state_handle import (
-    StateHandle, StateType, ScoredHandle, Reconstructability
+    StateHandle, StateType, ScoredHandle, Reconstructability, Placement
 )
 from modules.hotstate.demand_signal import DemandSignal
 
@@ -27,46 +27,54 @@ class ValueEngine:
     # PCIe Gen4 x16: ~25 GB/s to 0.025 MB/ms to 25,000 B/ms
     PCIE_BANDWIDTH_BYTES_PER_MS = 25_000_000
 
-    WRITEBACK_PENALTY = 0.05   # base penalty for authoritative (mutable) state
+    SEMANTIC_RISK_MS = 0.05
 
     def __init__(self, total_hbm_bytes: int):
         self.total_hbm = total_hbm_bytes
         self._access_log: Dict[str, List[int]] = defaultdict(list)
         self._hot_key_counts: Dict[str, int] = {}    # key to unique hot row count
 
-    # Public API
+    def _semantic_risk_ms(self, h: StateHandle) -> float:
+        if h.consistency_class == "mutable_writeback":
+            return self.SEMANTIC_RISK_MS
+        return 0.0
 
     def compute_scores(self, handles: List[StateHandle],
                        demand: DemandSignal) -> List[ScoredHandle]:
         """Compute scores for all handles given the current batch context."""
         scored = []
         for h in handles:
-            # Step 1: predict reuse from batch context
             reuse = self._reuse_imminence(h, demand)
             h.reuse_imminence = reuse
 
-            # Step 2: lookup/estimate stall sensitivity
             stall = self._stall_sensitivity(h, demand)
             h.stall_sensitivity_ms = stall
 
-            # Step 3: compute movement cost
             move = h.footprint_bytes / self.PCIE_BANDWIDTH_BYTES_PER_MS
             h.movement_cost_ms = move
 
-            # Step 4: assemble score
-            benefit_density = (reuse * stall) / max(1, h.footprint_bytes)
-            occupancy = h.footprint_bytes / self.total_hbm
-            risk = (self.WRITEBACK_PENALTY
-                    if h.reconstructability == Reconstructability.REFETCHABLE
-                    else 0.0)
+            gross_benefit_ms = reuse * stall
+            movement_penalty_ms = 0.0 if Placement.HBM in h.placement else move
+            semantic_risk_ms = self._semantic_risk_ms(h)
 
-            score = benefit_density - occupancy - risk
+            net_benefit_ms = gross_benefit_ms - movement_penalty_ms - semantic_risk_ms
+            value_density_ms_per_byte = net_benefit_ms / max(1, h.footprint_bytes)
+
+            benefit_density = gross_benefit_ms / max(1, h.footprint_bytes)
+            occupancy = h.footprint_bytes / self.total_hbm
+
+            score = value_density_ms_per_byte
             scored.append(ScoredHandle(
                 handle=h,
                 score=score,
                 benefit_density=benefit_density,
                 occupancy_penalty=occupancy,
-                semantic_risk=risk,
+                semantic_risk=semantic_risk_ms,
+                gross_benefit_ms=gross_benefit_ms,
+                movement_penalty_ms=movement_penalty_ms,
+                semantic_risk_ms=semantic_risk_ms,
+                net_benefit_ms=net_benefit_ms,
+                value_density_ms_per_byte=value_density_ms_per_byte,
             ))
         scored.sort(key=lambda s: s.score, reverse=True)
         return scored
