@@ -391,7 +391,7 @@ def parse_split(s):
 def run_hotstate_arbiter(dataset, total_available, warmup_batches,
                          measure_batches, num_users, out_jsonl,
                          hidden_dim, num_layers, num_heads, head_dim,
-                         dtype, max_seqlen, total_hbm_bytes):
+                         dtype, max_seqlen, total_hbm_bytes, hotstate_trace_detail="scalar"):
     """Run with full HotState controller — zero rebuilds, self-discovering."""
 
     # Build ONE model with max KV pages
@@ -408,6 +408,9 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
     )
     model.dense_module.set_hotstate_embedding_module(emb_module)
     controller = model.dense_module.hotstate
+
+    controller.set_trace_detail(hotstate_trace_detail)
+    print(f"Trace detail: {hotstate_trace_detail}")
 
     print(f"=== HotState: Unified HBM Control Plane ===")
     print(f"Total HBM: {total_hbm_bytes / 1024**3:.2f} GiB")
@@ -565,6 +568,10 @@ def main():
     parser.add_argument("--warmup-ratio", type=float, default=0.1)
     parser.add_argument("--out-jsonl", type=str, required=True,
                         help="Output JSONL trace file")
+
+    parser.add_argument("--hotstate-trace-detail", type=str, default="scalar",
+                    choices=["scalar", "full"],
+                    help="scalar=performance-safe, full=offline state trace collection")
     args = parser.parse_args()
 
     # ── Build config dicts ──────────────────────────────────────────────
@@ -606,7 +613,8 @@ def main():
             measure_batches=measure_batches, **common)
     elif args.mode == "hotstate":
         results = run_hotstate_arbiter(
-            measure_batches=measure_batches, **common)
+            measure_batches=measure_batches,
+            hotstate_trace_detail=args.hotstate_trace_detail, **common)
 
     # ── Print summary ───────────────────────────────────────────────────
     print(f"\n{'=' * 60}")

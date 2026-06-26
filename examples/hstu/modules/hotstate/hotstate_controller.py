@@ -28,6 +28,8 @@ class HotStateController:
 
         self.enable_transfer_scheduler = False
 
+        self.trace_detail = "scalar"
+
         # Calibrate adapter (read actual table sizes)
         self.emb_adapter.calibrate()
 
@@ -41,6 +43,11 @@ class HotStateController:
             self.registry.register(h)
             self.directory.register(
                 h.logical_key, Placement.HBM, authoritative=False)
+
+    def set_trace_detail(self, trace_detail: str):
+        if trace_detail not in ("scalar", "full"):
+            raise ValueError(f"unknown trace_detail: {trace_detail}")
+        self.trace_detail = trace_detail
 
     # Public API
     def set_embedding_module(self, embedding_module):
@@ -131,7 +138,11 @@ class HotStateController:
                 "scheduler": 1000 * (t4 - t3),
                 "total": 1000 * (t4 - t),
             },
-            "state_trace": self._state_trace_records(result),
+            "state_trace": (
+                self._state_trace_records(result)
+                if self.trace_detail == "full"
+                else []
+            ),
             "selected_hbm_bytes": result.selected_hbm_bytes,
             "selected_kv_bytes": result.selected_kv_bytes,
             "selected_embedding_bytes": result.selected_embedding_bytes,
@@ -140,6 +151,12 @@ class HotStateController:
 
     def after_batch(self, batch, latency_ms: float):
         """Called after inference. Updates access statistics and snapshots post-forward state."""
+        for feature_name in batch.features.keys():
+            self.value_engine.record_access(f"emb:{feature_name}", self.epoch)
+
+        if self.trace_detail != "full":
+            return {"post_num_state_handles": 0, "post_state_trace": []}
+
         demand = getattr(self, "_last_demand", None)
         post_state_trace = []
 
@@ -160,10 +177,6 @@ class HotStateController:
                 scored_handles,
                 decision_by_key,
             )
-
-        for feature_name in batch.features.keys():
-            self.value_engine.record_access(
-                f"emb:{feature_name}", self.epoch)
 
         return {
             "post_num_state_handles": len(post_state_trace),
