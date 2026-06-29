@@ -50,7 +50,7 @@ class HotSetManager:
         self.directory = directory
         self.emb = emb_adapter
         self.kv = kv_adapter
-   
+
     def run_epoch(self, epoch: int, demand: DemandSignal) -> EpochResult:
         NUM_USERS = 8
         MIN_KV_PAGES = 64
@@ -89,10 +89,9 @@ class HotSetManager:
 
             selected.append(h)
             used_bytes += h.footprint_bytes
-            if Placement.HBM in h.placement:
-                decision_by_key[h.logical_key] = "keep_selected"
-            else:
-                decision_by_key[h.logical_key] = "admit_planned"
+            decision_by_key[h.logical_key] = (
+                "keep_selected" if Placement.HBM in h.placement else "admit_planned"
+            )
 
         selected_keys = {h.logical_key for h in selected}
 
@@ -100,10 +99,9 @@ class HotSetManager:
             h = s.handle
             if h.logical_key in decision_by_key:
                 continue
-            if Placement.HBM in h.placement:
-                decision_by_key[h.logical_key] = "evict_candidate"
-            else:
-                decision_by_key[h.logical_key] = "not_admitted"
+            decision_by_key[h.logical_key] = (
+                "evict_candidate" if Placement.HBM in h.placement else "not_admitted"
+            )
 
         page_bytes = self.kv._page_bytes()
         selected_kv_bytes = sum(
@@ -123,10 +121,15 @@ class HotSetManager:
             else self.kv._kvcache.num_primary_cache_pages
         )
 
-        # Conservative: do not force active limit below current residency until
-        # we deliberately enable real KV eviction.
         target_pages = selected_kv_pages + APPEND_MARGIN_PAGES
         target_pages = max(target_pages, resident_pages + APPEND_MARGIN_PAGES)
+
+        hist = demand.history_length
+        pages_per_user = math.ceil((hist * 2) / self.kv.page_size_tokens)
+        old_safe_pages = pages_per_user * NUM_USERS + APPEND_MARGIN_PAGES
+        old_safe_pages = min(max(MIN_KV_PAGES, old_safe_pages), max_pages)
+
+        target_pages = max(target_pages, old_safe_pages)
         target_pages = min(max(MIN_KV_PAGES, target_pages), max_pages)
 
         current_pages = self.kv.get_current_page_limit()
