@@ -153,6 +153,8 @@ def get_inference_ranking_gr(
     use_cudagraph=False,
     cudagraph_configs=None,
     sparse_shareables=None,
+    hotstate_admit_strategy=None,
+    hotstate_admission_counters=None,
 ):
     for ebc_config in task_config.embedding_configs:
         assert (
@@ -161,7 +163,9 @@ def get_inference_ranking_gr(
 
     inference_sparse = InferenceEmbedding(
         task_config.embedding_configs,
-        sparse_shareables,
+        sparse_shareables=sparse_shareables,
+        hotstate_admit_strategy=hotstate_admit_strategy,
+        hotstate_admission_counters=hotstate_admission_counters,
     )
     inference_dense = InferenceDenseModule(
         hstu_config,

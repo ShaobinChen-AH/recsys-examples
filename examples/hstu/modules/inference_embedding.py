@@ -17,7 +17,7 @@ import os
 import warnings
 
 # pyre-strict
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 from configs import EmbeddingBackend, InferenceEmbeddingConfig
@@ -28,6 +28,7 @@ from dynamicemb import (
     DynamicEmbTableOptions,
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
+from dynamicemb.embedding_admission import KVCounter
 from torchrec.modules.embedding_configs import EmbeddingConfig, dtype_to_data_type
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
@@ -57,38 +58,61 @@ class DummyParameterServer(ParameterServer):
     def forward(self, features: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:
         return self._embedding_collection(features)
 
-
 def create_dynamic_embedding_tables(
     embedding_configs: List[InferenceEmbeddingConfig],
     output_dtype: torch.dtype = torch.float32,
     device: torch.device = None,
     ps: Optional[ParameterServer] = None,
     sparse_shareables=None,
+    admit_strategy: Optional[Any] = None,
+    admission_counters: Optional[Sequence[Any]] = None,
 ):
-    table_options = [
-        DynamicEmbTableOptions(
-            index_type=torch.int64,
-            embedding_dtype=torch.float32,
-            dim=config.dim,
-            max_capacity=config.vocab_size,
-            local_hbm_for_values=0,
-            bucket_capacity=128,
-            initializer_args=DynamicEmbInitializerArgs(
-                mode=DynamicEmbInitializerMode.NORMAL,
-            ),
-            training=False,
+    admission_enabled = admit_strategy is not None
+    table_options = []
+
+    for table_index, config in enumerate(embedding_configs):
+        admission_counter = None
+        if admission_enabled:
+            admission_counter = (
+                admission_counters[table_index]
+                if admission_counters is not None
+                else KVCounter(
+                    capacity=config.vocab_size,
+                    bucket_capacity=1024,
+                    key_type=torch.int64,
+                )
+            )
+
+        table_options.append(
+            DynamicEmbTableOptions(
+                index_type=torch.int64,
+                embedding_dtype=torch.float32,
+                dim=config.dim,
+                max_capacity=config.vocab_size,
+                local_hbm_for_values=0,
+                bucket_capacity=128,
+                initializer_args=DynamicEmbInitializerArgs(
+                    mode=DynamicEmbInitializerMode.NORMAL,
+                ),
+                training=admission_enabled,
+                admit_strategy=admit_strategy,
+                admission_counter=admission_counter,
+            )
         )
-        for config in embedding_configs
-    ]
 
     table_names = [config.table_name for config in embedding_configs]
 
-    return BatchedDynamicEmbeddingTablesV2(
+    tables = BatchedDynamicEmbeddingTablesV2(
         table_options=table_options,
         table_names=table_names,
         pooling_mode=DynamicEmbPoolingMode.NONE,
         output_dtype=output_dtype,
     )
+
+    if admission_enabled:
+        tables.train(True)
+
+    return tables
 
 
 class InferenceDynamicEmbeddingCollection(torch.nn.Module):
@@ -98,28 +122,47 @@ class InferenceDynamicEmbeddingCollection(torch.nn.Module):
         ps: Optional[ParameterServer] = None,
         enable_cache: bool = False,
         sparse_shareables=None,
+        admit_strategy: Optional[Any] = None,
+        admission_counters: Optional[Sequence[Any]] = None,
     ):
         super().__init__()
 
+        self._hotstate_admit_strategy = admit_strategy
+
         self._embedding_tables = create_dynamic_embedding_tables(
-            embedding_configs, ps=ps, sparse_shareables=sparse_shareables
+            embedding_configs,
+            ps=ps,
+            sparse_shareables=sparse_shareables,
+            admit_strategy=admit_strategy,
+            admission_counters=admission_counters,
         )
 
-        self._cache = (
-            create_dynamic_embedding_tables(
-                embedding_configs, device=torch.cuda.current_device()
-            )
-            if enable_cache
-            else None
+    def _force_admission_training_path(self) -> None:
+        if self._hotstate_admit_strategy is None:
+            return
+        self._embedding_tables.train(True)
+        for option in self._embedding_tables._dynamicemb_options:
+            option.training = True
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self._force_admission_training_path()
+        return self
+
+    def update_hotstate_admission_policy(
+        self,
+        item_indices=None,
+        max_admitted_keys=None,
+        enabled: bool = True,
+    ) -> None:
+        if self._hotstate_admit_strategy is None:
+            return
+        self._hotstate_admit_strategy.update_policy(
+            item_indices=item_indices,
+            max_admitted_keys=max_admitted_keys,
+            enabled=enabled,
         )
-
-        self._feature_names = [
-            feature for config in embedding_configs for feature in config.feature_names
-        ]
-
-        self._features_split_sizes: List[int] = []
-        self._features_split_indices: List[int] = []
-
+    
     def set_feature_splits(self, features_split_size, features_split_indices):
         self._features_split_sizes = features_split_size
         self._features_split_indices = features_split_indices
@@ -146,6 +189,7 @@ class InferenceDynamicEmbeddingCollection(torch.nn.Module):
             )
 
     def forward(self, features: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:
+        self._force_admission_training_path()
         with torch.no_grad():
             if len(self._features_split_indices) > 0:
                 features_split = features.split(self._features_split_sizes)
@@ -188,7 +232,12 @@ def create_embedding_collection(configs, backend, use_static: bool = False, **kw
         enable_cache = kwargs.get("enable_cache", False)
         sparse_shareables = kwargs.get("sparse_shareables", False)
         return InferenceDynamicEmbeddingCollection(
-            configs, ps, enable_cache, sparse_shareables
+            configs,
+            ps,
+            enable_cache,
+            sparse_shareables,
+            admit_strategy=kwargs.get("admit_strategy", None),
+            admission_counters=kwargs.get("admission_counters", None),
         )
     elif backend == EmbeddingBackend.NVEMB:
         from modules.nve_embeddingcollection import InferenceNVEEmbeddingCollection
@@ -232,6 +281,8 @@ class InferenceEmbedding(torch.nn.Module):
         embedding_configs: List[InferenceEmbeddingConfig],
         embedding_backend: Optional[EmbeddingBackend] = None,
         sparse_shareables=None,
+        hotstate_admit_strategy: Optional[Any] = None,
+        hotstate_admission_counters: Optional[Sequence[Any]] = None,
     ):
         super(InferenceEmbedding, self).__init__()
 
@@ -261,6 +312,8 @@ class InferenceEmbedding(torch.nn.Module):
             enable_cache=False,
             gpu_cache_ratio=0.05,
             sparse_shareables=sparse_shareables,
+            admit_strategy=hotstate_admit_strategy,
+            admission_counters=hotstate_admission_counters,
         )
 
         self._static_embedding_collection = create_embedding_collection(
@@ -279,6 +332,24 @@ class InferenceEmbedding(torch.nn.Module):
         self._dynamic_embedding_collection.set_feature_splits(
             features_split_sizes, features_split_indices
         )
+    
+    def update_hotstate_admission_policy(
+        self,
+        item_indices=None,
+        max_admitted_keys=None,
+        enabled: bool = True,
+    ) -> None:
+        updater = getattr(
+            self._dynamic_embedding_collection,
+            "update_hotstate_admission_policy",
+            None,
+        )
+        if updater is not None:
+            updater(
+                item_indices=item_indices,
+                max_admitted_keys=max_admitted_keys,
+                enabled=enabled,
+            )
 
     def load_checkpoint(self, checkpoint_dir, model_state_dict=None):
         if checkpoint_dir is None:
@@ -422,9 +493,13 @@ def get_inference_sparse_model(
     embedding_configs: List[InferenceEmbeddingConfig],
     embedding_backend=None,
     sparse_shareables=None,
+    hotstate_admit_strategy=None,
+    hotstate_admission_counters=None,
 ):
     return InferenceEmbedding(
         embedding_configs,
         embedding_backend,
         sparse_shareables,
+        hotstate_admit_strategy=hotstate_admit_strategy,
+        hotstate_admission_counters=hotstate_admission_counters,
     )

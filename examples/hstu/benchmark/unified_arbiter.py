@@ -47,6 +47,7 @@ from configs import (
 )
 from inference_ranking_gr import get_inference_ranking_gr
 import math
+from modules.hotstate.admission_adapter import HotStateAdmissionStrategy
 
 # ── Constants ────────────────────────────────────────────────────────────────
 DEFAULT_KV_PAGE_SIZE = 32
@@ -61,7 +62,7 @@ def count_dataset_batches(max_history_length, max_incremental_seqlen, num_users)
 
 
 def build_inference_model(hidden_dim, num_layers, num_heads, head_dim, dtype,
-                          max_seqlen, blocks_in_primary_pool, max_batch_size=1):
+                          max_seqlen, blocks_in_primary_pool, max_batch_size=1, hotstate_admit_strategy=None, hotstate_admission_counters=None):
     hstu_config = get_inference_hstu_config(
         hidden_size=hidden_dim,
         num_layers=num_layers,
@@ -96,6 +97,8 @@ def build_inference_model(hidden_dim, num_layers, num_heads, head_dim, dtype,
         kvcache_config=kv_cache_config,
         task_config=task_config,
         use_cudagraph=False,
+        hotstate_admit_strategy=hotstate_admit_strategy,
+        hotstate_admission_counters=hotstate_admission_counters,
     )
     if dtype == torch.bfloat16:
         model.bfloat16()
@@ -397,9 +400,11 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
     # Build ONE model with max KV pages
     max_pages = compute_split_params(total_hbm_bytes, 20, 80,
         num_layers, num_heads, head_dim, DEFAULT_KV_PAGE_SIZE, dtype)[2]
+    
+    hotstate_admit_strategy = HotStateAdmissionStrategy(admit_all_when_empty=True)
 
     model = build_inference_model(hidden_dim, num_layers, num_heads,
-                                  head_dim, dtype, max_seqlen, max_pages)
+                                  head_dim, dtype, max_seqlen, max_pages, hotstate_admit_strategy=hotstate_admit_strategy,)
 
     emb_module = model.sparse_module
 
@@ -510,6 +515,9 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
             "selected_hbm_bytes": control.get("selected_hbm_bytes", 0),
             "selected_kv_bytes": control.get("selected_kv_bytes", 0),
             "selected_embedding_bytes": control.get("selected_embedding_bytes", 0),
+            "embedding_admission_policy_size": hotstate_admit_strategy.last_policy_size,
+            "embedding_admission_accepts": hotstate_admit_strategy.num_accepted,
+            "embedding_admission_rejects": hotstate_admit_strategy.num_rejected,
         })
         if i < 5 or latency_ms > 10:
             print(

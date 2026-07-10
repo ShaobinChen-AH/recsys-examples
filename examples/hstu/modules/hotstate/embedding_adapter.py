@@ -80,3 +80,22 @@ class EmbeddingAdapter:
     def trigger_flush(self):
         if self._module is not None and hasattr(self._module, 'flush'):
             self._module.flush()
+
+    def update_admission_policy(
+        self,
+        item_indices,
+        max_admitted_keys=None,
+        enabled: bool = True,
+    ):
+        if self._module is None:
+            return
+
+        updater = getattr(self._module, "update_hotstate_admission_policy", None)
+        if updater is None:
+            return
+
+        updater(
+            item_indices=item_indices,
+            max_admitted_keys=max_admitted_keys,
+            enabled=enabled,
+        )

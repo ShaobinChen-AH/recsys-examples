@@ -72,6 +72,11 @@ class HotStateController:
 
         self.emb_adapter.record_batch_keys(item_indices)
 
+        self.emb_adapter.update_admission_policy(
+            item_indices=item_indices,
+            enabled=True,
+        )
+
         t2 = time.perf_counter()
 
         demand = DemandSignal(

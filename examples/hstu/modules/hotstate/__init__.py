@@ -8,3 +8,4 @@ from .embedding_adapter import EmbeddingAdapter
 from .kv_adapter import KVAdapter
 from .hot_set_manager import HotSetManager
 from .hotstate_controller import HotStateController
+from .admission_adapter import HotStateAdmissionStrategy
