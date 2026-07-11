@@ -13,7 +13,7 @@ import time
 class HotStateController:
     """Unified HBM control plane for generative recommendation inference."""
 
-    def __init__(self, total_hbm_bytes: int, kv_module, embedding_module = None, skip_kv_handles_for_admission_smoke: bool = False,):
+    def __init__(self, total_hbm_bytes: int, kv_module, embedding_module = None, skip_kv_handles_for_admission_smoke: bool = False, admission_smoke_max_admitted_keys=None,):
         self.emb_adapter = EmbeddingAdapter(embedding_module)
         self.kv_adapter = KVAdapter(kv_module)
         self.registry = StateRegistry()
@@ -27,6 +27,8 @@ class HotStateController:
         self.epoch = 0
 
         self.enable_transfer_scheduler = False
+
+        self.admission_smoke_max_admitted_keys = admission_smoke_max_admitted_keys
 
         self.trace_detail = "scalar"
 
@@ -75,6 +77,7 @@ class HotStateController:
 
         self.emb_adapter.update_admission_policy(
             item_indices=item_indices,
+            max_admitted_keys=self.admission_smoke_max_admitted_keys,
             enabled=True,
         )
 
@@ -152,6 +155,7 @@ class HotStateController:
             "selected_hbm_bytes": result.selected_hbm_bytes,
             "selected_kv_bytes": result.selected_kv_bytes,
             "selected_embedding_bytes": result.selected_embedding_bytes,
+            "embedding_admission_max_keys": self.admission_smoke_max_admitted_keys,
         }
 
 

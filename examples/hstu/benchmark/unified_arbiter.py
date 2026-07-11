@@ -394,7 +394,7 @@ def parse_split(s):
 def run_hotstate_arbiter(dataset, total_available, warmup_batches,
                          measure_batches, num_users, out_jsonl,
                          hidden_dim, num_layers, num_heads, head_dim,
-                         dtype, max_seqlen, total_hbm_bytes, hotstate_trace_detail="scalar", skip_hotstate_kv_handles_for_admission_smoke=False):
+                         dtype, max_seqlen, total_hbm_bytes, hotstate_trace_detail="scalar", skip_hotstate_kv_handles_for_admission_smoke=False, hotstate_admission_smoke_max_keys=None):
     """Run with full HotState controller — zero rebuilds, self-discovering."""
 
     # Build ONE model with max KV pages
@@ -411,6 +411,7 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
     model.dense_module.enable_hotstate(
         total_hbm_bytes=total_hbm_bytes,
         skip_kv_handles_for_admission_smoke=skip_hotstate_kv_handles_for_admission_smoke,
+        admission_smoke_max_admitted_keys=hotstate_admission_smoke_max_keys,
     )
     model.dense_module.set_hotstate_embedding_module(emb_module)
     controller = model.dense_module.hotstate
@@ -537,6 +538,8 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
             "embedding_admission_policy_size": hotstate_admit_strategy.last_policy_size,
             "embedding_admission_accepts": hotstate_admit_strategy.num_accepted,
             "embedding_admission_rejects": hotstate_admit_strategy.num_rejected,
+            "embedding_admission_calls": hotstate_admit_strategy.num_admit_calls,
+            "embedding_admission_cap": hotstate_admission_smoke_max_keys,
         })
         if i < 5 or latency_ms > 10:
             print(
@@ -604,6 +607,12 @@ def main():
         action="store_true",
         help="Skip KV HotState handle export/page-budget mutation; only for DynamicEmb admission smoke tests.",
     )
+    parser.add_argument(
+        "--hotstate-admission-smoke-max-keys",
+        type=int,
+        default=None,
+        help="Smoke-only cap on admitted DynamicEmb keys per batch.",
+    )
     args = parser.parse_args()
 
     # ── Build config dicts ──────────────────────────────────────────────
@@ -648,6 +657,7 @@ def main():
             measure_batches=measure_batches,
             hotstate_trace_detail=args.hotstate_trace_detail,
             skip_hotstate_kv_handles_for_admission_smoke=args.skip_hotstate_kv_handles_for_admission_smoke,
+            hotstate_admission_smoke_max_keys=args.hotstate_admission_smoke_max_keys,
             **common)
 
     # ── Print summary ───────────────────────────────────────────────────

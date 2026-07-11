@@ -33,16 +33,19 @@ class HotStateAdmissionStrategy(AdmissionStrategy):
             self.last_policy_size = 0
             return
 
+        if max_admitted_keys is not None:
+            max_admitted_keys = max(0, int(max_admitted_keys))
+
         selected_keys = []
         seen_keys = set()
         for raw_key in item_indices:
+            if max_admitted_keys is not None and len(selected_keys) >= max_admitted_keys:
+                break
             key = int(raw_key)
             if key in seen_keys:
                 continue
             seen_keys.add(key)
             selected_keys.append(key)
-            if max_admitted_keys is not None and len(selected_keys) >= max_admitted_keys:
-                break
 
         self._allowed_keys_cpu = torch.tensor(selected_keys, dtype=torch.int64)
         self.last_policy_size = len(selected_keys)
