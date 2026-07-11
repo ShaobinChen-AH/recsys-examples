@@ -43,13 +43,15 @@ class HotSetManager:
                  registry: StateRegistry,
                  directory: GlobalDirectory,
                  emb_adapter: EmbeddingAdapter,
-                 kv_adapter: KVAdapter):
+                 kv_adapter: KVAdapter,
+                 skip_kv_handles_for_admission_smoke: bool = False):
         self.total_hbm = total_hbm_bytes
         self.value_engine = value_engine
         self.registry = registry
         self.directory = directory
         self.emb = emb_adapter
         self.kv = kv_adapter
+        self.skip_kv_handles_for_admission_smoke = skip_kv_handles_for_admission_smoke
 
     def run_epoch(self, epoch: int, demand: DemandSignal) -> EpochResult:
         NUM_USERS = 8
@@ -62,9 +64,10 @@ class HotSetManager:
         for h in self.emb.export_handles():
             self.registry.register(h)
             handles.append(h)
-        for h in self.kv.export_handles():
-            self.registry.register(h)
-            handles.append(h)
+        if not self.skip_kv_handles_for_admission_smoke:
+            for h in self.kv.export_handles():
+                self.registry.register(h)
+                handles.append(h)
 
         scored = self.value_engine.compute_scores(handles, demand)
 
@@ -103,38 +106,46 @@ class HotSetManager:
                 "evict_candidate" if Placement.HBM in h.placement else "not_admitted"
             )
 
-        page_bytes = self.kv._page_bytes()
-        selected_kv_bytes = sum(
-            h.footprint_bytes for h in selected
-            if h.state_type == StateType.SESSION_KV_USER
-        )
-        selected_embedding_bytes = sum(
-            h.footprint_bytes for h in selected
-            if h.state_type != StateType.SESSION_KV_USER
-        )
+        if self.skip_kv_handles_for_admission_smoke:
+            selected_kv_bytes = 0
+            selected_embedding_bytes = sum(
+                h.footprint_bytes for h in selected
+                if h.state_type != StateType.SESSION_KV_USER
+            )
+            target_pages = self.kv.get_current_page_limit()
+        else:
+            page_bytes = self.kv._page_bytes()
+            selected_kv_bytes = sum(
+                h.footprint_bytes for h in selected
+                if h.state_type == StateType.SESSION_KV_USER
+            )
+            selected_embedding_bytes = sum(
+                h.footprint_bytes for h in selected
+                if h.state_type != StateType.SESSION_KV_USER
+            )
 
-        selected_kv_pages = math.ceil(selected_kv_bytes / page_bytes) if selected_kv_bytes else 0
-        resident_pages = self.kv.get_resident_page_count()
-        max_pages = (
-            self.kv.get_physical_page_count()
-            if hasattr(self.kv, "get_physical_page_count")
-            else self.kv._kvcache.num_primary_cache_pages
-        )
+            selected_kv_pages = math.ceil(selected_kv_bytes / page_bytes) if selected_kv_bytes else 0
+            resident_pages = self.kv.get_resident_page_count()
+            max_pages = (
+                self.kv.get_physical_page_count()
+                if hasattr(self.kv, "get_physical_page_count")
+                else self.kv._kvcache.num_primary_cache_pages
+            )
 
-        target_pages = selected_kv_pages + APPEND_MARGIN_PAGES
-        target_pages = max(target_pages, resident_pages + APPEND_MARGIN_PAGES)
+            target_pages = selected_kv_pages + APPEND_MARGIN_PAGES
+            target_pages = max(target_pages, resident_pages + APPEND_MARGIN_PAGES)
 
-        hist = demand.history_length
-        pages_per_user = math.ceil((hist * 2) / self.kv.page_size_tokens)
-        old_safe_pages = pages_per_user * NUM_USERS + APPEND_MARGIN_PAGES
-        old_safe_pages = min(max(MIN_KV_PAGES, old_safe_pages), max_pages)
+            hist = demand.history_length
+            pages_per_user = math.ceil((hist * 2) / self.kv.page_size_tokens)
+            old_safe_pages = pages_per_user * NUM_USERS + APPEND_MARGIN_PAGES
+            old_safe_pages = min(max(MIN_KV_PAGES, old_safe_pages), max_pages)
 
-        target_pages = max(target_pages, old_safe_pages)
-        target_pages = min(max(MIN_KV_PAGES, target_pages), max_pages)
+            target_pages = max(target_pages, old_safe_pages)
+            target_pages = min(max(MIN_KV_PAGES, target_pages), max_pages)
 
-        current_pages = self.kv.get_current_page_limit()
-        if abs(target_pages - current_pages) > NUM_USERS:
-            self.kv.set_page_limit(target_pages)
+            current_pages = self.kv.get_current_page_limit()
+            if abs(target_pages - current_pages) > NUM_USERS:
+                self.kv.set_page_limit(target_pages)
 
         return EpochResult(
             evicted_keys=[],

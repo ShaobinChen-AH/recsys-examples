@@ -13,7 +13,7 @@ import time
 class HotStateController:
     """Unified HBM control plane for generative recommendation inference."""
 
-    def __init__(self, total_hbm_bytes: int, kv_module, embedding_module = None):
+    def __init__(self, total_hbm_bytes: int, kv_module, embedding_module = None, skip_kv_handles_for_admission_smoke: bool = False,):
         self.emb_adapter = EmbeddingAdapter(embedding_module)
         self.kv_adapter = KVAdapter(kv_module)
         self.registry = StateRegistry()
@@ -22,7 +22,7 @@ class HotStateController:
         self.hot_set = HotSetManager(
             total_hbm_bytes, self.value_engine,
             self.registry, self.directory,
-            self.emb_adapter, self.kv_adapter)
+            self.emb_adapter, self.kv_adapter, skip_kv_handles_for_admission_smoke=skip_kv_handles_for_admission_smoke,)
         self.scheduler = TransferScheduler(self.kv_adapter, self.directory, self.value_engine)
         self.epoch = 0
 
@@ -39,10 +39,11 @@ class HotStateController:
             if Placement.HBM in h.placement:
                 self.directory.register(
                     h.logical_key, Placement.HBM, authoritative=False)
-        for h in self.kv_adapter.export_handles():
-            self.registry.register(h)
-            self.directory.register(
-                h.logical_key, Placement.HBM, authoritative=False)
+        if not skip_kv_handles_for_admission_smoke:
+            for h in self.kv_adapter.export_handles():
+                self.registry.register(h)
+                self.directory.register(
+                    h.logical_key, Placement.HBM, authoritative=False)
 
     def set_trace_detail(self, trace_detail: str):
         if trace_detail not in ("scalar", "full"):

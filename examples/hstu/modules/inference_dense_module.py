@@ -191,11 +191,12 @@ class InferenceDenseModule(torch.nn.Module):
         self.hotstate = None
 
     def enable_hotstate(self, total_hbm_bytes: int,
-                    embedding_module, kv_module):
+                    embedding_module, kv_module, skip_kv_handles_for_admission_smoke: bool = False,):
         self.hotstate = HotStateController(
             total_hbm_bytes=total_hbm_bytes,
             embedding_module=embedding_module,
             kv_module=kv_module,
+            skip_kv_handles_for_admission_smoke=skip_kv_handles_for_admission_smoke,
         )
 
     def setup_for_kvcache(self, hstu_config, kvcache_config):
@@ -284,7 +285,7 @@ class InferenceDenseModule(torch.nn.Module):
         self._mlp.bfloat16()
         return self
 
-    def enable_hotstate(self, total_hbm_bytes: int):
+    def enable_hotstate(self, total_hbm_bytes: int, skip_kv_handles_for_admission_smoke: bool = False,):
         """Enable the HotState unified HBM control plane.
 
         Must be called after model construction and after the sparse
@@ -297,6 +298,7 @@ class InferenceDenseModule(torch.nn.Module):
         self.hotstate = HotStateController(
             total_hbm_bytes=total_hbm_bytes,
             kv_module=self.async_kvcache,
+            skip_kv_handles_for_admission_smoke=skip_kv_handles_for_admission_smoke,
         )
 
 

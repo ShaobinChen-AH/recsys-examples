@@ -394,7 +394,7 @@ def parse_split(s):
 def run_hotstate_arbiter(dataset, total_available, warmup_batches,
                          measure_batches, num_users, out_jsonl,
                          hidden_dim, num_layers, num_heads, head_dim,
-                         dtype, max_seqlen, total_hbm_bytes, hotstate_trace_detail="scalar"):
+                         dtype, max_seqlen, total_hbm_bytes, hotstate_trace_detail="scalar", skip_hotstate_kv_handles_for_admission_smoke=False):
     """Run with full HotState controller — zero rebuilds, self-discovering."""
 
     # Build ONE model with max KV pages
@@ -410,6 +410,7 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
 
     model.dense_module.enable_hotstate(
         total_hbm_bytes=total_hbm_bytes,
+        skip_kv_handles_for_admission_smoke=skip_hotstate_kv_handles_for_admission_smoke,
     )
     model.dense_module.set_hotstate_embedding_module(emb_module)
     controller = model.dense_module.hotstate
@@ -482,6 +483,23 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
         user_id = int(uids[0].item())
         kv_budget_history.append(control["kv_page_budget"])
 
+        if skip_hotstate_kv_handles_for_admission_smoke:
+            active_kv_page_limit = control["kv_page_budget"]
+            resident_kv_pages = None
+            empty_kv_pages = None
+            withheld_kv_pages = None
+            logical_kv_budget_bytes = None
+            physical_kv_cache_bytes = None
+            actual_resident_kv_bytes = None
+        else:
+            active_kv_page_limit = controller.kv_adapter.get_current_page_limit()
+            resident_kv_pages = controller.kv_adapter.get_resident_page_count()
+            empty_kv_pages = controller.kv_adapter.get_empty_page_count()
+            withheld_kv_pages = controller.kv_adapter.get_withheld_page_count()
+            logical_kv_budget_bytes = controller.kv_adapter.logical_kv_budget_bytes()
+            physical_kv_cache_bytes = controller.kv_adapter.physical_kv_cache_bytes()
+            actual_resident_kv_bytes = controller.kv_adapter.actual_resident_kv_bytes()
+
         trace_records.append({
             "split": "hotstate",
             "split_lhs": 0, "split_rhs": 0,
@@ -494,13 +512,14 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
             "seq_history_len": hist_len,
             "user_id": user_id,
             "epoch": control["epoch"],
-            "active_kv_page_limit": controller.kv_adapter.get_current_page_limit(),
-            "resident_kv_pages": controller.kv_adapter.get_resident_page_count(),
-            "empty_kv_pages": controller.kv_adapter.get_empty_page_count(),
-            "withheld_kv_pages": controller.kv_adapter.get_withheld_page_count(),
-            "logical_kv_budget_bytes": controller.kv_adapter.logical_kv_budget_bytes(),
-            "physical_kv_cache_bytes": controller.kv_adapter.physical_kv_cache_bytes(),
-            "actual_resident_kv_bytes": controller.kv_adapter.actual_resident_kv_bytes(),
+            "active_kv_page_limit": active_kv_page_limit,
+            "resident_kv_pages": resident_kv_pages,
+            "empty_kv_pages": empty_kv_pages,
+            "withheld_kv_pages": withheld_kv_pages,
+            "logical_kv_budget_bytes": logical_kv_budget_bytes,
+            "physical_kv_cache_bytes": physical_kv_cache_bytes,
+            "actual_resident_kv_bytes": actual_resident_kv_bytes,
+            "embedding_admission_calls": hotstate_admit_strategy.num_admit_calls,
             "origin_cached_length": origin_cached_length,
             "max_origin_cached_length": max_origin_cached_length,
             "new_tokens": new_tokens,
@@ -580,6 +599,11 @@ def main():
     parser.add_argument("--hotstate-trace-detail", type=str, default="scalar",
                     choices=["scalar", "full"],
                     help="scalar=performance-safe, full=offline state trace collection")
+    parser.add_argument(
+        "--skip-hotstate-kv-handles-for-admission-smoke",
+        action="store_true",
+        help="Skip KV HotState handle export/page-budget mutation; only for DynamicEmb admission smoke tests.",
+    )
     args = parser.parse_args()
 
     # ── Build config dicts ──────────────────────────────────────────────
@@ -622,7 +646,9 @@ def main():
     elif args.mode == "hotstate":
         results = run_hotstate_arbiter(
             measure_batches=measure_batches,
-            hotstate_trace_detail=args.hotstate_trace_detail, **common)
+            hotstate_trace_detail=args.hotstate_trace_detail,
+            skip_hotstate_kv_handles_for_admission_smoke=args.skip_hotstate_kv_handles_for_admission_smoke,
+            **common)
 
     # ── Print summary ───────────────────────────────────────────────────
     print(f"\n{'=' * 60}")
