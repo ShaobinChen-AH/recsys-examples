@@ -75,12 +75,6 @@ class HotStateController:
 
         self.emb_adapter.record_batch_keys(item_indices)
 
-        self.emb_adapter.update_admission_policy(
-            item_indices=item_indices,
-            max_admitted_keys=self.admission_smoke_max_admitted_keys,
-            enabled=True,
-        )
-
         t2 = time.perf_counter()
 
         demand = DemandSignal(
@@ -97,6 +91,24 @@ class HotStateController:
 
         # 2. Score and decide: what to keep, what to evict
         result = self.hot_set.run_epoch(self.epoch, demand)
+
+        embedding_budget_bytes = int(getattr(result, "selected_embedding_bytes", 0))
+        row_size_bytes = max(1, self.emb_adapter.row_size_bytes())
+        hotstate_admission_budget_keys = embedding_budget_bytes // row_size_bytes
+
+        admission_max_keys = hotstate_admission_budget_keys
+        if self.admission_smoke_max_admitted_keys is not None:
+            admission_max_keys = min(
+                admission_max_keys,
+                int(self.admission_smoke_max_admitted_keys),
+            )
+
+        self.emb_adapter.update_admission_policy(
+            item_indices=item_indices,
+            max_admitted_keys=admission_max_keys,
+            enabled=True,
+        )
+
         t3 = time.perf_counter()
 
         # 3. Plan and submit transfers with priority ordering
@@ -155,7 +167,10 @@ class HotStateController:
             "selected_hbm_bytes": result.selected_hbm_bytes,
             "selected_kv_bytes": result.selected_kv_bytes,
             "selected_embedding_bytes": result.selected_embedding_bytes,
-            "embedding_admission_max_keys": self.admission_smoke_max_admitted_keys,
+            "embedding_admission_budget_bytes": embedding_budget_bytes,
+            "embedding_admission_budget_keys": hotstate_admission_budget_keys,
+            "embedding_admission_smoke_max_keys": self.admission_smoke_max_admitted_keys,
+            "embedding_admission_max_keys": admission_max_keys,
         }
 
 

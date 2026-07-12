@@ -44,7 +44,10 @@ class EmbeddingAdapter:
     def set_module(self, embedding_module):
         self._module = embedding_module
         self._total_size_bytes = 0
-        self.calibrate()    
+        self.calibrate()
+
+    def row_size_bytes(self) -> int:
+        return int(self._row_size_bytes)
 
     def hot_key_count(self) -> int:
         """Number of unique keys seen in the recent window."""

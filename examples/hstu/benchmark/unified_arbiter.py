@@ -540,6 +540,9 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
             "embedding_admission_rejects": hotstate_admit_strategy.num_rejected,
             "embedding_admission_calls": hotstate_admit_strategy.num_admit_calls,
             "embedding_admission_cap": hotstate_admission_smoke_max_keys,
+            "embedding_admission_budget_bytes": control.get("embedding_admission_budget_bytes", 0),
+            "embedding_admission_budget_keys": control.get("embedding_admission_budget_keys", 0),
+            "embedding_admission_max_keys": control.get("embedding_admission_max_keys", None),
         })
         if i < 5 or latency_ms > 10:
             print(
