@@ -397,7 +397,10 @@ def parse_split(s):
 def run_hotstate_arbiter(dataset, total_available, warmup_batches,
                          measure_batches, num_users, out_jsonl,
                          hidden_dim, num_layers, num_heads, head_dim,
-                         dtype, max_seqlen, total_hbm_bytes, hotstate_trace_detail="scalar", skip_hotstate_kv_handles_for_admission_smoke=False, hotstate_admission_smoke_max_keys=None):
+                         dtype, max_seqlen, total_hbm_bytes, hotstate_trace_detail="scalar",
+                         skip_hotstate_kv_handles_for_admission_smoke=False,
+                         hotstate_admission_smoke_max_keys=None,
+                         hotstate_admission_admit_all_control=False):
     """Run with full HotState controller — zero rebuilds, self-discovering."""
 
     # Build ONE model with max KV pages
@@ -419,7 +422,10 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
     model.dense_module.set_hotstate_embedding_module(emb_module)
     controller = model.dense_module.hotstate
 
+    controller.admission_admit_all_control = hotstate_admission_admit_all_control
+
     controller.set_trace_detail(hotstate_trace_detail)
+
     print(f"Trace detail: {hotstate_trace_detail}")
 
     print(f"=== HotState: Unified HBM Control Plane ===")
@@ -457,8 +463,18 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()
+
+        accepts_before = int(getattr(hotstate_admit_strategy, "num_accepted", 0) or 0)
+        rejects_before = int(getattr(hotstate_admit_strategy, "num_rejected", 0) or 0)
+
         with torch.inference_mode():
             logits = model.forward_with_kvcache(batch, uids, thl)
+
+        accepts_after = int(getattr(hotstate_admit_strategy, "num_accepted", 0) or 0)
+        rejects_after = int(getattr(hotstate_admit_strategy, "num_rejected", 0) or 0)
+        accept_delta = accepts_after - accepts_before
+        reject_delta = rejects_after - rejects_before
+
         torch.cuda.synchronize()
         latency_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -550,6 +566,10 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
             "embedding_selected_budget_bytes": control.get("embedding_selected_budget_bytes", 0),
             "embedding_kv_reserved_bytes": control.get("embedding_kv_reserved_bytes", 0),
             "embedding_residual_budget_bytes": control.get("embedding_residual_budget_bytes", 0),
+            "embedding_requested_unique_keys": control.get("embedding_requested_unique_keys", 0),
+            "embedding_admission_cap_source": control.get("embedding_admission_cap_source", ""),
+            "embedding_admission_accept_delta": accept_delta,
+            "embedding_admission_reject_delta": reject_delta,
         })
         if i < 5 or latency_ms > 10:
             print(
@@ -623,6 +643,7 @@ def main():
         default=None,
         help="Smoke-only cap on admitted DynamicEmb keys per batch.",
     )
+    parser.add_argument("--hotstate-admission-admit-all-control", action="store_true")
     args = parser.parse_args()
 
     # ── Build config dicts ──────────────────────────────────────────────
@@ -668,6 +689,7 @@ def main():
             hotstate_trace_detail=args.hotstate_trace_detail,
             skip_hotstate_kv_handles_for_admission_smoke=args.skip_hotstate_kv_handles_for_admission_smoke,
             hotstate_admission_smoke_max_keys=args.hotstate_admission_smoke_max_keys,
+            hotstate_admission_admit_all_control=args.hotstate_admission_admit_all_control,
             **common)
 
     # ── Print summary ───────────────────────────────────────────────────

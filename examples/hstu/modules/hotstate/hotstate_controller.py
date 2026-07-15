@@ -71,6 +71,8 @@ class HotStateController:
         except Exception:
             item_indices = []
 
+        requested_unique_keys = len(set(int(x) for x in item_indices))
+
         t1 = time.perf_counter()
 
         self.emb_adapter.record_batch_keys(item_indices)
@@ -113,18 +115,29 @@ class HotStateController:
         row_size_bytes = max(1, self.emb_adapter.row_size_bytes())
         hotstate_admission_budget_keys = embedding_budget_bytes // row_size_bytes
 
-        if self.admission_smoke_max_admitted_keys is not None:
+        admit_all_control = bool(getattr(self, "admission_admit_all_control", False))
+
+        if admit_all_control:
+            admission_max_keys = None
+            admission_cap_source = "admit_all_control"
+        elif self.admission_smoke_max_admitted_keys is not None:
             admission_max_keys = min(
                 self.admission_smoke_max_admitted_keys,
                 hotstate_admission_budget_keys,
             )
+            admission_cap_source = "manual_smoke_clamp"
         else:
             admission_max_keys = hotstate_admission_budget_keys
+            admission_cap_source = "hotstate_residual_budget"
 
         self.emb_adapter.update_admission_policy(
             item_indices=item_indices,
             max_admitted_keys=admission_max_keys,
             enabled=True,
+        )
+
+        trace_admission_max_keys = (
+            requested_unique_keys if admission_max_keys is None else admission_max_keys
         )
 
         t3 = time.perf_counter()
@@ -185,13 +198,16 @@ class HotStateController:
             "selected_hbm_bytes": result.selected_hbm_bytes,
             "selected_kv_bytes": result.selected_kv_bytes,
             "selected_embedding_bytes": result.selected_embedding_bytes,
-            "embedding_admission_budget_bytes": embedding_budget_bytes,
-            "embedding_admission_budget_keys": hotstate_admission_budget_keys,
-            "embedding_admission_smoke_max_keys": self.admission_smoke_max_admitted_keys,
-            "embedding_admission_max_keys": admission_max_keys,
+
+            "embedding_requested_unique_keys": requested_unique_keys,
             "embedding_selected_budget_bytes": selected_embedding_budget_bytes,
             "embedding_kv_reserved_bytes": kv_reserved_bytes,
             "embedding_residual_budget_bytes": residual_embedding_budget_bytes,
+            "embedding_admission_budget_bytes": embedding_budget_bytes,
+            "embedding_admission_budget_keys": hotstate_admission_budget_keys,
+            "embedding_admission_smoke_max_keys": self.admission_smoke_max_admitted_keys,
+            "embedding_admission_max_keys": trace_admission_max_keys,
+            "embedding_admission_cap_source": admission_cap_source,
         }
 
 
