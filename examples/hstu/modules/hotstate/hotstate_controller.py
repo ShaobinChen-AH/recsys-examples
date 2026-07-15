@@ -92,16 +92,34 @@ class HotStateController:
         # 2. Score and decide: what to keep, what to evict
         result = self.hot_set.run_epoch(self.epoch, demand)
 
-        embedding_budget_bytes = int(getattr(result, "selected_embedding_bytes", 0))
+        selected_embedding_budget_bytes = int(getattr(result, "selected_embedding_bytes", 0) or 0)
+
+        kv_page_budget = int(getattr(result, "kv_page_budget", 0) or 0)
+        kv_page_bytes = int(self.kv_adapter._page_bytes())
+        kv_reserved_bytes = kv_page_budget * kv_page_bytes
+
+        total_hbm_bytes = int(getattr(self.hot_set, "total_hbm", 0) or 0)
+        residual_embedding_budget_bytes = (
+            max(0, total_hbm_bytes - kv_reserved_bytes)
+            if total_hbm_bytes > 0
+            else selected_embedding_budget_bytes
+        )
+
+        embedding_budget_bytes = min(
+            selected_embedding_budget_bytes,
+            residual_embedding_budget_bytes,
+        )
+
         row_size_bytes = max(1, self.emb_adapter.row_size_bytes())
         hotstate_admission_budget_keys = embedding_budget_bytes // row_size_bytes
 
-        admission_max_keys = hotstate_admission_budget_keys
         if self.admission_smoke_max_admitted_keys is not None:
             admission_max_keys = min(
-                admission_max_keys,
-                int(self.admission_smoke_max_admitted_keys),
+                self.admission_smoke_max_admitted_keys,
+                hotstate_admission_budget_keys,
             )
+        else:
+            admission_max_keys = hotstate_admission_budget_keys
 
         self.emb_adapter.update_admission_policy(
             item_indices=item_indices,
@@ -171,6 +189,9 @@ class HotStateController:
             "embedding_admission_budget_keys": hotstate_admission_budget_keys,
             "embedding_admission_smoke_max_keys": self.admission_smoke_max_admitted_keys,
             "embedding_admission_max_keys": admission_max_keys,
+            "embedding_selected_budget_bytes": selected_embedding_budget_bytes,
+            "embedding_kv_reserved_bytes": kv_reserved_bytes,
+            "embedding_residual_budget_bytes": residual_embedding_budget_bytes,
         }
 
 

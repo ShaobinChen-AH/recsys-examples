@@ -147,19 +147,22 @@ def compute_split_params(total_hbm_bytes, emb_pct, kv_pct, num_layers,
     return emb_budget, kv_budget, blocks
 
 
-def teardown_model(model):
-    """Safely destroy model and release all GPU memory."""
+def teardown_model(model, wait_for_workers=True):
     try:
         kvcache = model.dense_module.async_kvcache
-        kvcache.executor.shutdown(wait=True)
-        kvcache.onload_worker.shutdown(wait=True)
+        if wait_for_workers:
+            kvcache.executor.shutdown(wait=True)
+            kvcache.onload_worker.shutdown(wait=True)
+        else:
+            kvcache.executor.shutdown(wait=False, cancel_futures=True)
+            kvcache.onload_worker.shutdown(wait=False, cancel_futures=True)
     except Exception:
         pass
-    torch.cuda.synchronize()
+    if wait_for_workers:
+        torch.cuda.synchronize()
     del model
     gc.collect()
     torch.cuda.empty_cache()
-
 
 # ── Threshold Policy ─────────────────────────────────────────────────────────
 
@@ -443,6 +446,7 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
     print(f"\nMeasuring ({measure_batches} batches)...")
     for i in range(measure_batches):
         batch, uids, thl = next(it)
+        
         control = controller.before_batch(batch, uids, thl)
 
         origin_cached_length = None
@@ -543,6 +547,9 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
             "embedding_admission_budget_bytes": control.get("embedding_admission_budget_bytes", 0),
             "embedding_admission_budget_keys": control.get("embedding_admission_budget_keys", 0),
             "embedding_admission_max_keys": control.get("embedding_admission_max_keys", None),
+            "embedding_selected_budget_bytes": control.get("embedding_selected_budget_bytes", 0),
+            "embedding_kv_reserved_bytes": control.get("embedding_kv_reserved_bytes", 0),
+            "embedding_residual_budget_bytes": control.get("embedding_residual_budget_bytes", 0),
         })
         if i < 5 or latency_ms > 10:
             print(
@@ -555,7 +562,7 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
             print(f"  [{i+1}/{measure_batches}] latency={latency_ms:.2f}ms "
                   f"hist={hist_len} kv_pages={control['kv_page_budget']}")
 
-    teardown_model(model)
+    teardown_model(model, wait_for_workers=False)
 
     lats = sorted(r["latency_ms"] for r in trace_records)
     n = len(lats)
