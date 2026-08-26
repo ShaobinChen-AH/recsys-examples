@@ -400,7 +400,10 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
                          dtype, max_seqlen, total_hbm_bytes, hotstate_trace_detail="scalar",
                          skip_hotstate_kv_handles_for_admission_smoke=False,
                          hotstate_admission_smoke_max_keys=None,
-                         hotstate_admission_admit_all_control=False):
+                         hotstate_admission_admit_all_control=False,
+                         hotstate_admission_batch_order_control=False,
+                         hotstate_value_kv_ms_per_1k_tokens=3.5,
+                         hotstate_value_emb_ms_per_key=1.5):
     """Run with full HotState controller — zero rebuilds, self-discovering."""
 
     # Build ONE model with max KV pages
@@ -421,6 +424,13 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
     )
     model.dense_module.set_hotstate_embedding_module(emb_module)
     controller = model.dense_module.hotstate
+
+    controller.num_users = num_users
+    controller.admission_batch_order_control = hotstate_admission_batch_order_control
+    controller.value_engine.configure(
+        kv_ms_per_1k_tokens=hotstate_value_kv_ms_per_1k_tokens,
+        emb_ms_per_key=hotstate_value_emb_ms_per_key,
+    )
 
     controller.admission_admit_all_control = hotstate_admission_admit_all_control
 
@@ -643,6 +653,9 @@ def main():
         help="Smoke-only cap on admitted DynamicEmb keys per batch.",
     )
     parser.add_argument("--hotstate-admission-admit-all-control", action="store_true")
+    parser.add_argument("--hotstate-admission-batch-order-control", action="store_true")
+    parser.add_argument("--hotstate-value-kv-ms-per-1k-tokens", type=float, default=3.5)
+    parser.add_argument("--hotstate-value-emb-ms-per-key", type=float, default=1.5)
     args = parser.parse_args()
 
     # ── Build config dicts ──────────────────────────────────────────────
@@ -689,6 +702,9 @@ def main():
             skip_hotstate_kv_handles_for_admission_smoke=args.skip_hotstate_kv_handles_for_admission_smoke,
             hotstate_admission_smoke_max_keys=args.hotstate_admission_smoke_max_keys,
             hotstate_admission_admit_all_control=args.hotstate_admission_admit_all_control,
+            hotstate_admission_batch_order_control=args.hotstate_admission_batch_order_control,
+            hotstate_value_kv_ms_per_1k_tokens=args.hotstate_value_kv_ms_per_1k_tokens,
+            hotstate_value_emb_ms_per_key=args.hotstate_value_emb_ms_per_key,
             **common)
 
     # ── Print summary ───────────────────────────────────────────────────
