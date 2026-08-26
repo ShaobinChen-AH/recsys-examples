@@ -32,6 +32,9 @@ class HotStateController:
 
         self.trace_detail = "scalar"
 
+        self.num_users = 8
+        self.admission_batch_order_control = False
+
         # Calibrate adapter (read actual table sizes)
         self.emb_adapter.calibrate()
 
@@ -67,11 +70,19 @@ class HotStateController:
 
         try:
             item_values = batch.features["item_feat"].values()
-            item_indices = item_values.unique().tolist()
+            item_sequence = [int(x) for x in item_values.detach().cpu().reshape(-1).tolist()]
+            item_indices = []
+            seen_item_indices = set()
+            for item_idx in item_sequence:
+                if item_idx in seen_item_indices:
+                    continue
+                seen_item_indices.add(item_idx)
+                item_indices.append(item_idx)
         except Exception:
+            item_sequence = []
             item_indices = []
 
-        requested_unique_keys = len(set(int(x) for x in item_indices))
+        requested_unique_keys = len(item_indices)
 
         t1 = time.perf_counter()
 
@@ -79,11 +90,20 @@ class HotStateController:
 
         t2 = time.perf_counter()
 
-        demand = DemandSignal(
-            current_user_id=uid, history_length=hist_len,
-            num_candidates=batch.max_num_candidates or 100,
-            epoch=self.epoch, item_indices=item_indices)
+        demand_kwargs = {
+            "current_user_id": uid,
+            "history_length": hist_len,
+            "num_candidates": batch.max_num_candidates or 100,
+            "epoch": self.epoch,
+            "item_indices": item_indices,
+        }
+        demand_fields = getattr(DemandSignal, "__dataclass_fields__", {})
+        if "num_users" in demand_fields:
+            demand_kwargs["num_users"] = getattr(self, "num_users", 8)
+        if "item_sequence" in demand_fields:
+            demand_kwargs["item_sequence"] = item_sequence
 
+        demand = DemandSignal(**demand_kwargs)
         self._last_demand = demand
 
         # 1. Check completed offloads from previous epochs
@@ -94,7 +114,9 @@ class HotStateController:
         # 2. Score and decide: what to keep, what to evict
         result = self.hot_set.run_epoch(self.epoch, demand)
 
-        selected_embedding_budget_bytes = int(getattr(result, "selected_embedding_bytes", 0) or 0)
+        selected_hbm_bytes = int(getattr(result, "selected_hbm_bytes", 0) or 0)
+        selected_kv_bytes = int(getattr(result, "selected_kv_bytes", 0) or 0)
+        selected_embedding_bytes = int(getattr(result, "selected_embedding_bytes", 0) or 0)
 
         kv_page_budget = int(getattr(result, "kv_page_budget", 0) or 0)
         kv_page_bytes = int(self.kv_adapter._page_bytes())
@@ -104,11 +126,11 @@ class HotStateController:
         residual_embedding_budget_bytes = (
             max(0, total_hbm_bytes - kv_reserved_bytes)
             if total_hbm_bytes > 0
-            else selected_embedding_budget_bytes
+            else selected_embedding_bytes
         )
 
         embedding_budget_bytes = min(
-            selected_embedding_budget_bytes,
+            selected_embedding_bytes,
             residual_embedding_budget_bytes,
         )
 
@@ -116,29 +138,51 @@ class HotStateController:
         hotstate_admission_budget_keys = embedding_budget_bytes // row_size_bytes
 
         admit_all_control = bool(getattr(self, "admission_admit_all_control", False))
+        batch_order_control = bool(getattr(self, "admission_batch_order_control", False))
+        smoke_cap = getattr(self, "admission_smoke_max_admitted_keys", None)
 
         if admit_all_control:
-            admission_max_keys = None
+            admission_max_keys = requested_unique_keys
+            admission_item_indices = item_indices
             admission_cap_source = "admit_all_control"
-        elif self.admission_smoke_max_admitted_keys is not None:
-            admission_max_keys = min(
-                self.admission_smoke_max_admitted_keys,
-                hotstate_admission_budget_keys,
-            )
-            admission_cap_source = "manual_smoke_clamp"
+            admission_order = "batch_order"
         else:
             admission_max_keys = hotstate_admission_budget_keys
-            admission_cap_source = "hotstate_residual_budget"
+            if smoke_cap is not None:
+                admission_max_keys = min(admission_max_keys, max(0, int(smoke_cap)))
+                admission_cap_source = "manual_smoke_clamp"
+            else:
+                admission_cap_source = "hotstate_residual_budget"
+
+            if batch_order_control:
+                admission_item_indices = item_indices
+                admission_order = "batch_order"
+            else:
+                if hasattr(self.value_engine, "rank_embedding_item_indices"):
+                    admission_item_indices = self.value_engine.rank_embedding_item_indices(
+                        item_indices=item_indices,
+                        item_sequence=item_sequence,
+                        demand=demand,
+                        row_size_bytes=row_size_bytes,
+                    )
+                else:
+                    admission_item_indices = item_indices
+                admission_order = "value_ranked"
 
         self.emb_adapter.update_admission_policy(
-            item_indices=item_indices,
+            item_indices=admission_item_indices,
             max_admitted_keys=admission_max_keys,
             enabled=True,
         )
 
-        trace_admission_max_keys = (
-            requested_unique_keys if admission_max_keys is None else admission_max_keys
-        )
+        if hasattr(self.value_engine, "record_embedding_accesses"):
+            self.value_engine.record_embedding_accesses(item_sequence, self.epoch)
+        else:
+            for key in item_indices:
+                self.value_engine.record_access(f"emb:item:{key}", self.epoch)
+
+        policy_keys = admission_item_indices[:admission_max_keys]
+        rejected_policy_keys = admission_item_indices[admission_max_keys:]
 
         t3 = time.perf_counter()
 
@@ -176,6 +220,8 @@ class HotStateController:
 
         self.epoch += 1
 
+        trace_detail = getattr(self, "trace_detail", "scalar")
+
         return {
             "kv_page_budget": result.kv_page_budget,
             "hbm_bytes_used": result.hbm_bytes_used,
@@ -192,24 +238,27 @@ class HotStateController:
             },
             "state_trace": (
                 self._state_trace_records(result)
-                if self.trace_detail == "full"
+                if trace_detail == "full"
                 else []
             ),
-            "selected_hbm_bytes": result.selected_hbm_bytes,
-            "selected_kv_bytes": result.selected_kv_bytes,
-            "selected_embedding_bytes": result.selected_embedding_bytes,
-
+            "selected_hbm_bytes": selected_hbm_bytes,
+            "selected_kv_bytes": selected_kv_bytes,
+            "selected_embedding_bytes": selected_embedding_bytes,
             "embedding_requested_unique_keys": requested_unique_keys,
-            "embedding_selected_budget_bytes": selected_embedding_budget_bytes,
+            "embedding_selected_budget_bytes": selected_embedding_bytes,
             "embedding_kv_reserved_bytes": kv_reserved_bytes,
             "embedding_residual_budget_bytes": residual_embedding_budget_bytes,
             "embedding_admission_budget_bytes": embedding_budget_bytes,
             "embedding_admission_budget_keys": hotstate_admission_budget_keys,
-            "embedding_admission_smoke_max_keys": self.admission_smoke_max_admitted_keys,
-            "embedding_admission_max_keys": trace_admission_max_keys,
+            "embedding_admission_policy_size": len(policy_keys),
+            "embedding_admission_smoke_max_keys": smoke_cap,
+            "embedding_admission_max_keys": admission_max_keys,
             "embedding_admission_cap_source": admission_cap_source,
+            "embedding_admission_order": admission_order,
+            "embedding_requested_keys": item_indices if trace_detail == "full" else [],
+            "embedding_selected_policy_keys": policy_keys if trace_detail == "full" else [],
+            "embedding_rejected_policy_keys": rejected_policy_keys if trace_detail == "full" else [],
         }
-
 
     def after_batch(self, batch, latency_ms: float):
         """Called after inference. Updates access statistics and snapshots post-forward state."""

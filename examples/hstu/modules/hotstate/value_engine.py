@@ -39,47 +39,48 @@ class ValueEngine:
             return self.SEMANTIC_RISK_MS
         return 0.0
 
-    def compute_scores(self, handles: List[StateHandle],
-                       demand: DemandSignal) -> List[ScoredHandle]:
-        """Compute scores for all handles given the current batch context."""
+    def configure(self, kv_ms_per_1k_tokens=None, emb_ms_per_key=None):
+        if kv_ms_per_1k_tokens is not None:
+            self.DEFAULT_KV_STALL_PER_1000_TOKENS_MS = float(kv_ms_per_1k_tokens)
+        if emb_ms_per_key is not None:
+            self.DEFAULT_EMB_STALL_PER_MISS_MS = float(emb_ms_per_key)
+
+    def compute_scores(self, handles: List[StateHandle], demand: DemandSignal) -> List[ScoredHandle]:
         scored = []
         for h in handles:
             reuse = self._reuse_imminence(h, demand)
+            miss_cost = self._stall_sensitivity(h, demand)
+            movement_cost = h.footprint_bytes / self.PCIE_BANDWIDTH_BYTES_PER_MS
+            risk_cost = self.WRITEBACK_PENALTY if "writeback" in h.consistency_class else 0.0
+
+            gross_benefit = reuse * miss_cost
+            net_benefit = gross_benefit - movement_cost - risk_cost
+            value_density = net_benefit / max(1, h.footprint_bytes)
+
             h.reuse_imminence = reuse
+            h.stall_sensitivity_ms = miss_cost
+            h.movement_cost_ms = movement_cost
 
-            stall = self._stall_sensitivity(h, demand)
-            h.stall_sensitivity_ms = stall
-
-            move = h.footprint_bytes / self.PCIE_BANDWIDTH_BYTES_PER_MS
-            h.movement_cost_ms = move
-
-            gross_benefit_ms = reuse * stall
-            movement_penalty_ms = 0.0 if Placement.HBM in h.placement else move
-            semantic_risk_ms = self._semantic_risk_ms(h)
-
-            net_benefit_ms = gross_benefit_ms - movement_penalty_ms - semantic_risk_ms
-            value_density_ms_per_byte = net_benefit_ms / max(1, h.footprint_bytes)
-
-            benefit_density = gross_benefit_ms / max(1, h.footprint_bytes)
-            occupancy = h.footprint_bytes / self.total_hbm
-
-            score = value_density_ms_per_byte
             scored.append(ScoredHandle(
                 handle=h,
-                score=score,
-                benefit_density=benefit_density,
-                occupancy_penalty=occupancy,
-                semantic_risk=semantic_risk_ms,
-                gross_benefit_ms=gross_benefit_ms,
-                movement_penalty_ms=movement_penalty_ms,
-                semantic_risk_ms=semantic_risk_ms,
-                net_benefit_ms=net_benefit_ms,
-                value_density_ms_per_byte=value_density_ms_per_byte,
+                score=value_density,
+                benefit_density=value_density,
+                occupancy_penalty=0.0,
+                semantic_risk=risk_cost,
+                reuse_probability=reuse,
+                miss_cost_ms=miss_cost,
+                gross_benefit_ms=gross_benefit,
+                movement_cost_ms=movement_cost,
+                risk_cost_ms=risk_cost,
+                net_benefit_ms=net_benefit,
+                value_density_ms_per_byte=value_density,
             ))
-        scored.sort(key=lambda s: s.score, reverse=True)
-        return scored
 
-    # Stall sensitivity
+        scored.sort(
+            key=lambda s: (s.value_density_ms_per_byte, s.net_benefit_ms),
+            reverse=True,
+        )
+        return scored
 
     def _stall_sensitivity(self, h: StateHandle, demand: DemandSignal) -> float:
         if h.state_type == StateType.SESSION_KV_USER:
@@ -136,3 +137,67 @@ class ValueEngine:
             ]
             if not self._access_log[key]:
                 del self._access_log[key]
+    
+    def rank_embedding_item_indices(self, item_indices, demand, row_size_bytes, item_sequence=None):
+        sequence = [int(x) for x in (item_sequence or item_indices)]
+        seen = set()
+        unique_keys = []
+        for raw_key in item_indices:
+            key = int(raw_key)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_keys.append(key)
+
+        counts = {}
+        last_pos = {}
+        for pos, key in enumerate(sequence):
+            counts[key] = counts.get(key, 0) + 1
+            last_pos[key] = pos
+
+        ranked = []
+        seq_len = max(1, len(sequence))
+        hist_len = max(0, int(getattr(demand, "history_length", 0)))
+
+        for ordinal, key in enumerate(unique_keys):
+            count = counts.get(key, 1)
+            pos = last_pos.get(key, -1)
+            in_history = 1.0 if 0 <= pos < hist_len else 0.0
+            position_score = (pos + 1) / seq_len if pos >= 0 else 0.0
+
+            prior = self._access_log.get(f"emb:item:{key}", [])
+            recent_score = 0.0
+            if prior:
+                age = max(0, demand.epoch - prior[-1])
+                recent_score = math.exp(-age / 8.0)
+
+            reuse = min(
+                1.0,
+                0.65
+                + 0.20 * in_history
+                + 0.05 * min(1.0, math.log1p(count))
+                + 0.05 * position_score
+                + 0.05 * recent_score,
+            )
+
+            miss_cost = self.DEFAULT_EMB_STALL_PER_MISS_MS * max(1, count)
+            movement_cost = row_size_bytes / self.PCIE_BANDWIDTH_BYTES_PER_MS
+            net_benefit = reuse * miss_cost - movement_cost
+            value_density = net_benefit / max(1, row_size_bytes)
+
+            if net_benefit <= 0.0:
+                continue
+
+            ranked.append((value_density, net_benefit, in_history, count, recent_score, -ordinal, key))
+
+        ranked.sort(reverse=True)
+        return [key for *_, key in ranked]
+
+    def record_embedding_accesses(self, item_indices, epoch: int):
+        seen = set()
+        for raw_key in item_indices:
+            key = int(raw_key)
+            if key in seen:
+                continue
+            seen.add(key)
+            self._access_log[f"emb:item:{key}"].append(epoch)

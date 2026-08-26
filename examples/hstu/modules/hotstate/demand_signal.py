@@ -10,3 +10,5 @@ class DemandSignal:
     num_candidates: int
     epoch: int
     item_indices: List[int] = field(default_factory=list)
+    num_users: int = 8
+    item_sequence: List[int] = field(default_factory=list)

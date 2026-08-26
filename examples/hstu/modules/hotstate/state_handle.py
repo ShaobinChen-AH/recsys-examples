@@ -41,14 +41,16 @@ class StateHandle:
 
 @dataclass
 class ScoredHandle:
-    """A StateHandle with unit-correct value-model fields."""
+    """A StateHandle with its computed arbitration score."""
     handle: StateHandle
     score: float
-    benefit_density: float
-    occupancy_penalty: float
-    semantic_risk: float
+    benefit_density: float = 0.0
+    occupancy_penalty: float = 0.0
+    semantic_risk: float = 0.0
+    reuse_probability: float = 0.0
+    miss_cost_ms: float = 0.0
     gross_benefit_ms: float = 0.0
-    movement_penalty_ms: float = 0.0
-    semantic_risk_ms: float = 0.0
+    movement_cost_ms: float = 0.0
+    risk_cost_ms: float = 0.0
     net_benefit_ms: float = 0.0
     value_density_ms_per_byte: float = 0.0
