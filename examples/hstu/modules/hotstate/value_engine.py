@@ -51,7 +51,7 @@ class ValueEngine:
             reuse = self._reuse_imminence(h, demand)
             miss_cost = self._stall_sensitivity(h, demand)
             movement_cost = h.footprint_bytes / self.PCIE_BANDWIDTH_BYTES_PER_MS
-            risk_cost = self.WRITEBACK_PENALTY if "writeback" in h.consistency_class else 0.0
+            risk_cost = self.SEMANTIC_RISK_MS if "writeback" in h.consistency_class else 0.0
 
             gross_benefit = reuse * miss_cost
             net_benefit = gross_benefit - movement_cost - risk_cost
@@ -116,7 +116,7 @@ class ValueEngine:
 
         current_uid = demand.current_user_id
         # Same seqlen group: (h_uid - current_uid + N) % N
-        steps = (h_uid - current_uid + 8) % 8
+        steps = (h_uid - current_uid + max(1, int(demand.num_users))) % max(1, int(demand.num_users))
         # For next seqlen round, add more steps
         import math
         return math.exp(-0.5 * steps)
