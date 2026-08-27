@@ -138,7 +138,7 @@ class ValueEngine:
             if not self._access_log[key]:
                 del self._access_log[key]
     
-    def rank_embedding_item_indices(self, item_indices, demand, row_size_bytes, item_sequence=None):
+    def rank_embedding_item_indices(self, item_indices, item_sequence, demand, row_size_bytes, return_trace: bool = False):
         sequence = [int(x) for x in (item_sequence or item_indices)]
         seen = set()
         unique_keys = []
@@ -191,7 +191,28 @@ class ValueEngine:
             ranked.append((value_density, net_benefit, in_history, count, recent_score, -ordinal, key))
 
         ranked.sort(reverse=True)
-        return [key for *_, key in ranked]
+
+        ranked_ids = [key for *_, key in ranked]
+
+        if not return_trace:
+            return ranked_ids
+
+        ranked_trace = []
+        for rank, (value_density, net_benefit, in_history, count, recent_score, _neg_ordinal, key) in enumerate(ranked):
+            ranked_trace.append(
+                {
+                    "item_id": key,
+                    "score": value_density,
+                    "rank": rank,
+                    "net_benefit_ms": net_benefit,
+                    "value_density_ms_per_byte": value_density,
+                    "in_history": in_history,
+                    "count": count,
+                    "recent_score": recent_score,
+                }
+            )
+
+        return ranked_ids, ranked_trace
 
     def record_embedding_accesses(self, item_indices, epoch: int):
         seen = set()

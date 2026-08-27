@@ -583,6 +583,7 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
             "embedding_rejected_policy_keys": control.get("embedding_rejected_policy_keys", []),
             "embedding_admission_accept_delta": accept_delta,
             "embedding_admission_reject_delta": reject_delta,
+            "embedding_admission_trace": control.get("embedding_admission_trace", []),
         })
         if i < 5 or latency_ms > 10:
             print(

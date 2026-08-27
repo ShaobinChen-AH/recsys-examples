@@ -146,6 +146,15 @@ class HotStateController:
             admission_item_indices = item_indices
             admission_cap_source = "admit_all_control"
             admission_order = "batch_order"
+            admission_trace = [
+                {
+                    "item_id": int(key),
+                    "score": None,
+                    "rank": rank,
+                    "admitted": True,
+                }
+                for rank, key in enumerate(admission_item_indices)
+            ]
         else:
             admission_max_keys = hotstate_admission_budget_keys
             if smoke_cap is not None:
@@ -157,16 +166,42 @@ class HotStateController:
             if batch_order_control:
                 admission_item_indices = item_indices
                 admission_order = "batch_order"
+                admission_trace = [
+                    {
+                        "item_id": int(key),
+                        "score": None,
+                        "rank": rank,
+                        "admitted": rank < admission_max_keys,
+                    }
+                    for rank, key in enumerate(admission_item_indices)
+                ]
             else:
                 if hasattr(self.value_engine, "rank_embedding_item_indices"):
-                    admission_item_indices = self.value_engine.rank_embedding_item_indices(
+                    admission_item_indices, admission_trace = self.value_engine.rank_embedding_item_indices(
                         item_indices=item_indices,
                         item_sequence=item_sequence,
                         demand=demand,
                         row_size_bytes=row_size_bytes,
+                        return_trace=True,
                     )
+                    admission_trace = [
+                        {
+                            **entry,
+                            "admitted": int(entry["rank"]) < admission_max_keys,
+                        }
+                        for entry in admission_trace
+                    ]
                 else:
                     admission_item_indices = item_indices
+                    admission_trace = [
+                        {
+                            "item_id": int(key),
+                            "score": None,
+                            "rank": rank,
+                            "admitted": rank < admission_max_keys,
+                        }
+                        for rank, key in enumerate(admission_item_indices)
+                    ]
                 admission_order = "value_ranked"
 
         self.emb_adapter.update_admission_policy(
@@ -255,6 +290,7 @@ class HotStateController:
             "embedding_admission_max_keys": admission_max_keys,
             "embedding_admission_cap_source": admission_cap_source,
             "embedding_admission_order": admission_order,
+            "embedding_admission_trace": admission_trace if trace_detail == "full" else [],
             "embedding_requested_keys": item_indices if trace_detail == "full" else [],
             "embedding_selected_policy_keys": policy_keys if trace_detail == "full" else [],
             "embedding_rejected_policy_keys": rejected_policy_keys if trace_detail == "full" else [],
