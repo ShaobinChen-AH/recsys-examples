@@ -57,6 +57,9 @@ class ValueEngine:
             net_benefit = gross_benefit - movement_cost - risk_cost
             value_density = net_benefit / max(1, h.footprint_bytes)
 
+            if net_benefit <= 0.0:
+                continue
+
             h.reuse_imminence = reuse
             h.stall_sensitivity_ms = miss_cost
             h.movement_cost_ms = movement_cost
@@ -76,10 +79,7 @@ class ValueEngine:
                 value_density_ms_per_byte=value_density,
             ))
 
-        scored.sort(
-            key=lambda s: (s.value_density_ms_per_byte, s.net_benefit_ms),
-            reverse=True,
-        )
+        scored.sort(key=lambda s: s.score, reverse=True)
         return scored
 
     def _stall_sensitivity(self, h: StateHandle, demand: DemandSignal) -> float:
@@ -137,7 +137,7 @@ class ValueEngine:
             ]
             if not self._access_log[key]:
                 del self._access_log[key]
-    
+
     def rank_embedding_item_indices(self, item_indices, item_sequence, demand, row_size_bytes, return_trace: bool = False):
         sequence = [int(x) for x in (item_sequence or item_indices)]
         seen = set()
@@ -159,7 +159,7 @@ class ValueEngine:
         seq_len = max(1, len(sequence))
         hist_len = max(0, int(getattr(demand, "history_length", 0)))
 
-        for ordinal, key in enumerate(unique_keys):
+        for key in unique_keys:
             count = counts.get(key, 1)
             pos = last_pos.get(key, -1)
             in_history = 1.0 if 0 <= pos < hist_len else 0.0
@@ -182,38 +182,43 @@ class ValueEngine:
 
             miss_cost = self.DEFAULT_EMB_STALL_PER_MISS_MS * max(1, count)
             movement_cost = row_size_bytes / self.PCIE_BANDWIDTH_BYTES_PER_MS
-            net_benefit = reuse * miss_cost - movement_cost
+            gross_benefit = reuse * miss_cost
+            net_benefit = gross_benefit - movement_cost
             value_density = net_benefit / max(1, row_size_bytes)
 
             if net_benefit <= 0.0:
                 continue
 
-            ranked.append((value_density, net_benefit, in_history, count, recent_score, -ordinal, key))
+            ranked.append({
+                "item_id": key,
+                "score": value_density,
+                "value_density_ms_per_byte": value_density,
+                "reuse_probability": reuse,
+                "miss_cost_ms": miss_cost,
+                "gross_benefit_ms": gross_benefit,
+                "movement_cost_ms": movement_cost,
+                "risk_cost_ms": 0.0,
+                "net_benefit_ms": net_benefit,
+                "in_history": in_history,
+                "position_score": position_score,
+                "count": count,
+                "recent_score": recent_score,
+            })
 
-        ranked.sort(reverse=True)
+        ranked.sort(key=lambda entry: entry["score"], reverse=True)
 
-        ranked_ids = [key for *_, key in ranked]
-
+        ranked_ids = [entry["item_id"] for entry in ranked]
         if not return_trace:
             return ranked_ids
 
         ranked_trace = []
-        for rank, (value_density, net_benefit, in_history, count, recent_score, _neg_ordinal, key) in enumerate(ranked):
-            ranked_trace.append(
-                {
-                    "item_id": key,
-                    "score": value_density,
-                    "rank": rank,
-                    "net_benefit_ms": net_benefit,
-                    "value_density_ms_per_byte": value_density,
-                    "in_history": in_history,
-                    "count": count,
-                    "recent_score": recent_score,
-                }
-            )
+        for rank, entry in enumerate(ranked):
+            traced = dict(entry)
+            traced["rank"] = rank
+            ranked_trace.append(traced)
 
         return ranked_ids, ranked_trace
-
+    
     def record_embedding_accesses(self, item_indices, epoch: int):
         seen = set()
         for raw_key in item_indices:
