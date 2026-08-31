@@ -140,8 +140,7 @@ class ValueEngine:
 
     def rank_embedding_item_indices(self, item_indices, item_sequence, demand, row_size_bytes, return_trace: bool = False):
         sequence = [int(x) for x in (item_sequence or item_indices)]
-        seen = set()
-        unique_keys = []
+        seen, unique_keys = set(), []
         for raw_key in item_indices:
             key = int(raw_key)
             if key in seen:
@@ -149,17 +148,15 @@ class ValueEngine:
             seen.add(key)
             unique_keys.append(key)
 
-        counts = {}
-        last_pos = {}
+        counts, last_pos = {}, {}
         for pos, key in enumerate(sequence):
             counts[key] = counts.get(key, 0) + 1
             last_pos[key] = pos
 
-        ranked = []
         seq_len = max(1, len(sequence))
         hist_len = max(0, int(getattr(demand, "history_length", 0)))
 
-        for key in unique_keys:
+        def score_key(key):
             count = counts.get(key, 1)
             pos = last_pos.get(key, -1)
             in_history = 1.0 if 0 <= pos < hist_len else 0.0
@@ -182,48 +179,42 @@ class ValueEngine:
 
             miss_cost = self.DEFAULT_EMB_STALL_PER_MISS_MS * max(1, count)
             movement_cost = row_size_bytes / self.PCIE_BANDWIDTH_BYTES_PER_MS
-            gross_benefit = reuse * miss_cost
-            net_benefit = gross_benefit - movement_cost
-            value_density = net_benefit / max(1, row_size_bytes)
+            net_benefit = reuse * miss_cost - movement_cost
+            score = net_benefit / max(1, row_size_bytes)
+            return score, net_benefit, in_history, count, recent_score, position_score
 
-            if net_benefit <= 0.0:
-                continue
-
-            ranked.append({
-                "item_id": key,
-                "score": value_density,
-                "value_density_ms_per_byte": value_density,
-                "reuse_probability": reuse,
-                "miss_cost_ms": miss_cost,
-                "gross_benefit_ms": gross_benefit,
-                "movement_cost_ms": movement_cost,
-                "risk_cost_ms": 0.0,
-                "net_benefit_ms": net_benefit,
-                "in_history": in_history,
-                "position_score": position_score,
-                "count": count,
-                "recent_score": recent_score,
-            })
-
-        ranked.sort(key=lambda entry: entry["score"], reverse=True)
-
-        ranked_ids = [entry["item_id"] for entry in ranked]
         if not return_trace:
-            return ranked_ids
+            ranked = []
+            for ordinal, key in enumerate(unique_keys):
+                score, net_benefit, *_ = score_key(key)
+                if net_benefit <= 0.0:
+                    continue
+                ranked.append((score, ordinal, key))
+            ranked.sort(key=lambda x: x[0], reverse=True)
+            return [key for _, _, key in ranked]
 
         ranked_trace = []
-        for rank, entry in enumerate(ranked):
-            traced = dict(entry)
-            traced["rank"] = rank
-            ranked_trace.append(traced)
-
-        return ranked_ids, ranked_trace
-    
-    def record_embedding_accesses(self, item_indices, epoch: int):
-        seen = set()
-        for raw_key in item_indices:
-            key = int(raw_key)
-            if key in seen:
+        for ordinal, key in enumerate(unique_keys):
+            score, net_benefit, in_history, count, recent_score, position_score = score_key(key)
+            if net_benefit <= 0.0:
                 continue
-            seen.add(key)
-            self._access_log[f"emb:item:{key}"].append(epoch)
+            ranked_trace.append({
+                "item_id": key,
+                "score": score,
+                "value_density_ms_per_byte": score,
+                "net_benefit_ms": net_benefit,
+                "in_history": in_history,
+                "count": count,
+                "recent_score": recent_score,
+                "position_score": position_score,
+            })
+
+        ranked_trace.sort(key=lambda e: e["score"], reverse=True)
+        ranked_ids = [e["item_id"] for e in ranked_trace]
+        for rank, entry in enumerate(ranked_trace):
+            entry["rank"] = rank
+        return ranked_ids, ranked_trace
+
+    def record_embedding_accesses(self, item_sequence: List[int], epoch: int) -> None:
+        for key in item_sequence:
+            self.record_access(f"emb:item:{int(key)}", epoch)

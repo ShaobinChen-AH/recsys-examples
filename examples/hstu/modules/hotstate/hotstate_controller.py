@@ -51,10 +51,8 @@ class HotStateController:
                     h.logical_key, Placement.HBM, authoritative=False)
 
     def set_trace_detail(self, trace_detail: str):
-        if trace_detail not in ("scalar", "full"):
-            raise ValueError(f"unknown trace_detail: {trace_detail}")
         self.trace_detail = trace_detail
-
+    
     # Public API
     def set_embedding_module(self, embedding_module):
         """Connect the embedding adapter after both dense and sparse modules exist."""
@@ -140,21 +138,24 @@ class HotStateController:
         admit_all_control = bool(getattr(self, "admission_admit_all_control", False))
         batch_order_control = bool(getattr(self, "admission_batch_order_control", False))
         smoke_cap = getattr(self, "admission_smoke_max_admitted_keys", None)
+        trace_detail = getattr(self, "trace_detail", "scalar")
+        admission_trace = []
 
         if admit_all_control:
             admission_max_keys = requested_unique_keys
             admission_item_indices = item_indices
             admission_cap_source = "admit_all_control"
             admission_order = "batch_order"
-            admission_trace = [
-                {
-                    "item_id": int(key),
-                    "score": None,
-                    "rank": rank,
-                    "admitted": True,
-                }
-                for rank, key in enumerate(admission_item_indices)
-            ]
+            if trace_detail == "full":
+                admission_trace = [
+                    {
+                        "item_id": int(key),
+                        "score": None,
+                        "rank": rank,
+                        "admitted": rank < admission_max_keys,
+                    }
+                    for rank, key in enumerate(admission_item_indices)
+                ]
         else:
             admission_max_keys = hotstate_admission_budget_keys
             if smoke_cap is not None:
@@ -166,33 +167,7 @@ class HotStateController:
             if batch_order_control:
                 admission_item_indices = item_indices
                 admission_order = "batch_order"
-                admission_trace = [
-                    {
-                        "item_id": int(key),
-                        "score": None,
-                        "rank": rank,
-                        "admitted": rank < admission_max_keys,
-                    }
-                    for rank, key in enumerate(admission_item_indices)
-                ]
-            else:
-                if hasattr(self.value_engine, "rank_embedding_item_indices"):
-                    admission_item_indices, admission_trace = self.value_engine.rank_embedding_item_indices(
-                        item_indices=item_indices,
-                        item_sequence=item_sequence,
-                        demand=demand,
-                        row_size_bytes=row_size_bytes,
-                        return_trace=True,
-                    )
-                    admission_trace = [
-                        {
-                            **entry,
-                            "admitted": int(entry["rank"]) < admission_max_keys,
-                        }
-                        for entry in admission_trace
-                    ]
-                else:
-                    admission_item_indices = item_indices
+                if trace_detail == "full":
                     admission_trace = [
                         {
                             "item_id": int(key),
@@ -202,6 +177,43 @@ class HotStateController:
                         }
                         for rank, key in enumerate(admission_item_indices)
                     ]
+            else:
+                if hasattr(self.value_engine, "rank_embedding_item_indices"):
+                    if trace_detail == "full":
+                        admission_item_indices, admission_trace = self.value_engine.rank_embedding_item_indices(
+                            item_indices=item_indices,
+                            item_sequence=item_sequence,
+                            demand=demand,
+                            row_size_bytes=row_size_bytes,
+                            return_trace=True,
+                        )
+                        admission_trace = [
+                            {
+                                **entry,
+                                "admitted": int(entry["rank"]) < admission_max_keys,
+                            }
+                            for entry in admission_trace
+                        ]
+                    else:
+                        admission_item_indices = self.value_engine.rank_embedding_item_indices(
+                            item_indices=item_indices,
+                            item_sequence=item_sequence,
+                            demand=demand,
+                            row_size_bytes=row_size_bytes,
+                            return_trace=False,
+                        )
+                else:
+                    admission_item_indices = item_indices
+                    if trace_detail == "full":
+                        admission_trace = [
+                            {
+                                "item_id": int(key),
+                                "score": None,
+                                "rank": rank,
+                                "admitted": rank < admission_max_keys,
+                            }
+                            for rank, key in enumerate(admission_item_indices)
+                        ]
                 admission_order = "value_ranked"
 
         self.emb_adapter.update_admission_policy(
