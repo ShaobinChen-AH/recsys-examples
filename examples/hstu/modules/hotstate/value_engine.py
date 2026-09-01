@@ -33,6 +33,7 @@ class ValueEngine:
         self.total_hbm = total_hbm_bytes
         self._access_log: Dict[str, List[int]] = defaultdict(list)
         self._hot_key_counts: Dict[str, int] = {}    # key to unique hot row count
+        self._embedding_rank_profile_calls = 0
 
     def _semantic_risk_ms(self, h: StateHandle) -> float:
         if h.consistency_class == "mutable_writeback":
@@ -138,25 +139,49 @@ class ValueEngine:
             if not self._access_log[key]:
                 del self._access_log[key]
 
-    def rank_embedding_item_indices(self, item_indices, item_sequence, demand, row_size_bytes, return_trace: bool = False):
+    def rank_embedding_item_indices(
+        self,
+        item_indices,
+        item_sequence,
+        demand,
+        row_size_bytes,
+        return_trace: bool = False,
+    ):
+        import time
+
+        self._embedding_rank_profile_calls = getattr(
+            self, "_embedding_rank_profile_calls", 0
+        ) + 1
+        profile_call = self._embedding_rank_profile_calls
+        rank_start = time.perf_counter()
+
+        prep_start = time.perf_counter()
         sequence = [int(x) for x in (item_sequence or item_indices)]
-        seen, unique_keys = set(), []
+        seen = set()
+        unique_keys = []
         for raw_key in item_indices:
             key = int(raw_key)
             if key in seen:
                 continue
             seen.add(key)
             unique_keys.append(key)
+        prep_ms = 1000 * (time.perf_counter() - prep_start)
 
-        counts, last_pos = {}, {}
+        context_start = time.perf_counter()
+        counts = {}
+        last_pos = {}
         for pos, key in enumerate(sequence):
             counts[key] = counts.get(key, 0) + 1
             last_pos[key] = pos
 
         seq_len = max(1, len(sequence))
         hist_len = max(0, int(getattr(demand, "history_length", 0)))
+        context_ms = 1000 * (time.perf_counter() - context_start)
 
-        def score_key(key):
+        score_start = time.perf_counter()
+        ranked = []
+
+        for ordinal, key in enumerate(unique_keys):
             count = counts.get(key, 1)
             pos = last_pos.get(key, -1)
             in_history = 1.0 if 0 <= pos < hist_len else 0.0
@@ -180,40 +205,87 @@ class ValueEngine:
             miss_cost = self.DEFAULT_EMB_STALL_PER_MISS_MS * max(1, count)
             movement_cost = row_size_bytes / self.PCIE_BANDWIDTH_BYTES_PER_MS
             net_benefit = reuse * miss_cost - movement_cost
-            score = net_benefit / max(1, row_size_bytes)
-            return score, net_benefit, in_history, count, recent_score, position_score
+            value_density = net_benefit / max(1, row_size_bytes)
 
-        if not return_trace:
-            ranked = []
-            for ordinal, key in enumerate(unique_keys):
-                score, net_benefit, *_ = score_key(key)
-                if net_benefit <= 0.0:
-                    continue
-                ranked.append((score, ordinal, key))
-            ranked.sort(key=lambda x: x[0], reverse=True)
-            return [key for _, _, key in ranked]
-
-        ranked_trace = []
-        for ordinal, key in enumerate(unique_keys):
-            score, net_benefit, in_history, count, recent_score, position_score = score_key(key)
             if net_benefit <= 0.0:
                 continue
-            ranked_trace.append({
-                "item_id": key,
-                "score": score,
-                "value_density_ms_per_byte": score,
-                "net_benefit_ms": net_benefit,
-                "in_history": in_history,
-                "count": count,
-                "recent_score": recent_score,
-                "position_score": position_score,
-            })
 
-        ranked_trace.sort(key=lambda e: e["score"], reverse=True)
-        ranked_ids = [e["item_id"] for e in ranked_trace]
-        for rank, entry in enumerate(ranked_trace):
-            entry["rank"] = rank
-        return ranked_ids, ranked_trace
+            if return_trace:
+                ranked.append(
+                    (
+                        value_density,
+                        ordinal,
+                        key,
+                        net_benefit,
+                        in_history,
+                        count,
+                        recent_score,
+                        position_score,
+                    )
+                )
+            else:
+                ranked.append((value_density, ordinal, key))
+
+        score_ms = 1000 * (time.perf_counter() - score_start)
+
+        sort_start = time.perf_counter()
+        ranked.sort(key=lambda entry: entry[0], reverse=True)
+        sort_ms = 1000 * (time.perf_counter() - sort_start)
+
+        ids_start = time.perf_counter()
+        ranked_ids = [entry[2] for entry in ranked]
+        ids_ms = 1000 * (time.perf_counter() - ids_start)
+
+        trace_ms = 0.0
+        ranked_trace = []
+
+        if return_trace:
+            trace_start = time.perf_counter()
+            for rank, (
+                value_density,
+                _ordinal,
+                key,
+                net_benefit,
+                in_history,
+                count,
+                recent_score,
+                position_score,
+            ) in enumerate(ranked):
+                ranked_trace.append(
+                    {
+                        "item_id": key,
+                        "score": value_density,
+                        "value_density_ms_per_byte": value_density,
+                        "rank": rank,
+                        "net_benefit_ms": net_benefit,
+                        "in_history": in_history,
+                        "count": count,
+                        "recent_score": recent_score,
+                        "position_score": position_score,
+                    }
+                )
+            trace_ms = 1000 * (time.perf_counter() - trace_start)
+
+        total_ms = 1000 * (time.perf_counter() - rank_start)
+
+        print(
+            f"[EMB_RANK_PROFILE call={profile_call}] "
+            f"items={len(unique_keys)} "
+            f"positive={len(ranked)} "
+            f"prep={prep_ms:.3f}ms "
+            f"context={context_ms:.3f}ms "
+            f"score={score_ms:.3f}ms "
+            f"sort={sort_ms:.3f}ms "
+            f"ids={ids_ms:.3f}ms "
+            f"trace={trace_ms:.3f}ms "
+            f"total={total_ms:.3f}ms",
+            flush=True,
+        )
+
+        if return_trace:
+            return ranked_ids, ranked_trace
+
+        return ranked_ids
 
     def record_embedding_accesses(self, item_sequence: List[int], epoch: int) -> None:
         for key in item_sequence:

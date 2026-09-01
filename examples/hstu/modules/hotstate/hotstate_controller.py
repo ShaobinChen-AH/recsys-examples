@@ -110,7 +110,9 @@ class HotStateController:
             completed = self.scheduler.poll_completions(self.epoch)
 
         # 2. Score and decide: what to keep, what to evict
+        t_hotset_start = time.perf_counter()
         result = self.hot_set.run_epoch(self.epoch, demand)
+        hotset_ms = 1000 * (time.perf_counter() - t_hotset_start)
 
         selected_hbm_bytes = int(getattr(result, "selected_hbm_bytes", 0) or 0)
         selected_kv_bytes = int(getattr(result, "selected_kv_bytes", 0) or 0)
@@ -141,6 +143,8 @@ class HotStateController:
         trace_detail = getattr(self, "trace_detail", "scalar")
         admission_trace = []
 
+        admission_start = time.perf_counter()
+        ranking_ms = 0.0
         if admit_all_control:
             admission_max_keys = requested_unique_keys
             admission_item_indices = item_indices
@@ -180,6 +184,7 @@ class HotStateController:
             else:
                 if hasattr(self.value_engine, "rank_embedding_item_indices"):
                     if trace_detail == "full":
+                        rank_start = time.perf_counter()
                         admission_item_indices, admission_trace = self.value_engine.rank_embedding_item_indices(
                             item_indices=item_indices,
                             item_sequence=item_sequence,
@@ -187,6 +192,7 @@ class HotStateController:
                             row_size_bytes=row_size_bytes,
                             return_trace=True,
                         )
+                        ranking_ms = 1000 * (time.perf_counter() - rank_start)
                         admission_trace = [
                             {
                                 **entry,
@@ -195,6 +201,7 @@ class HotStateController:
                             for entry in admission_trace
                         ]
                     else:
+                        rank_start = time.perf_counter()
                         admission_item_indices = self.value_engine.rank_embedding_item_indices(
                             item_indices=item_indices,
                             item_sequence=item_sequence,
@@ -202,6 +209,7 @@ class HotStateController:
                             row_size_bytes=row_size_bytes,
                             return_trace=False,
                         )
+                        ranking_ms = 1000 * (time.perf_counter() - rank_start)
                 else:
                     admission_item_indices = item_indices
                     if trace_detail == "full":
@@ -215,12 +223,14 @@ class HotStateController:
                             for rank, key in enumerate(admission_item_indices)
                         ]
                 admission_order = "value_ranked"
-
+       
+        t_policy_start = time.perf_counter()
         self.emb_adapter.update_admission_policy(
             item_indices=admission_item_indices,
             max_admitted_keys=admission_max_keys,
             enabled=True,
         )
+        policy_ms = 1000 * (time.perf_counter() - t_policy_start)
 
         if hasattr(self.value_engine, "record_embedding_accesses"):
             self.value_engine.record_embedding_accesses(item_sequence, self.epoch)
@@ -230,6 +240,7 @@ class HotStateController:
 
         policy_keys = admission_item_indices[:admission_max_keys]
         rejected_policy_keys = admission_item_indices[admission_max_keys:]
+        admission_ms = 1000 * (time.perf_counter() - admission_start)
 
         t3 = time.perf_counter()
 
@@ -255,7 +266,13 @@ class HotStateController:
                   f"record_keys={1000*(t2-t1):.1f}ms "
                   f"run_epoch={1000*(t3-t2):.1f}ms "
                   f"scheduler={1000*(t4-t3):.1f}ms "
-                  f"total={1000*(t4-t):.1f}ms")
+                  f"total={1000*(t4-t):.1f}ms"
+                  f"hotset={hotset_ms:.1f}ms "
+                  f"admission={admission_ms:.1f}ms "
+                  f"ranking={ranking_ms:.1f}ms "
+                  f"policy={policy_ms:.1f}ms ")
+                  
+
 
         # 4. Track access
         for key in result.evicted_keys + result.admitted_keys:
