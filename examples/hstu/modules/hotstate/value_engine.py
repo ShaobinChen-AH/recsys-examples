@@ -34,6 +34,7 @@ class ValueEngine:
         self._access_log: Dict[str, List[int]] = defaultdict(list)
         self._hot_key_counts: Dict[str, int] = {}    # key to unique hot row count
         self._embedding_rank_profile_calls = 0
+        self._embedding_last_access_epoch_by_item = {}
 
     def _semantic_risk_ms(self, h: StateHandle) -> float:
         if h.consistency_class == "mutable_writeback":
@@ -138,7 +139,10 @@ class ValueEngine:
             ]
             if not self._access_log[key]:
                 del self._access_log[key]
-
+        for key, last_epoch in list(self._embedding_last_access_epoch_by_item.items()):
+            if current_epoch - last_epoch > max_age:
+                del self._embedding_last_access_epoch_by_item[key]
+    
     def rank_embedding_item_indices(
         self,
         item_indices,
@@ -157,6 +161,7 @@ class ValueEngine:
 
         prep_start = time.perf_counter()
         sequence = [int(x) for x in (item_sequence or item_indices)]
+
         seen = set()
         unique_keys = []
         for raw_key in item_indices:
@@ -165,66 +170,136 @@ class ValueEngine:
                 continue
             seen.add(key)
             unique_keys.append(key)
+
         prep_ms = 1000 * (time.perf_counter() - prep_start)
 
         context_start = time.perf_counter()
-        counts = {}
-        last_pos = {}
-        for pos, key in enumerate(sequence):
-            counts[key] = counts.get(key, 0) + 1
-            last_pos[key] = pos
+        fast_unique_sequence = (
+            len(sequence) == len(unique_keys)
+            and all(seq_key == unique_key for seq_key, unique_key in zip(sequence, unique_keys))
+        )
+
+        counts = None
+        last_pos = None
+        if not fast_unique_sequence:
+            counts = {}
+            last_pos = {}
+            for pos, key in enumerate(sequence):
+                counts[key] = counts.get(key, 0) + 1
+                last_pos[key] = pos
 
         seq_len = max(1, len(sequence))
+        inv_seq_len = 1.0 / seq_len
         hist_len = max(0, int(getattr(demand, "history_length", 0)))
         context_ms = 1000 * (time.perf_counter() - context_start)
 
         score_start = time.perf_counter()
+
         ranked = []
+        epoch = demand.epoch
+        last_access = getattr(self, "_embedding_last_access_epoch_by_item", {})
+        has_last_access = bool(last_access)
 
-        for ordinal, key in enumerate(unique_keys):
-            count = counts.get(key, 1)
-            pos = last_pos.get(key, -1)
-            in_history = 1.0 if 0 <= pos < hist_len else 0.0
-            position_score = (pos + 1) / seq_len if pos >= 0 else 0.0
+        row_size = max(1, row_size_bytes)
+        inv_row_size = 1.0 / row_size
+        movement_cost = row_size / self.PCIE_BANDWIDTH_BYTES_PER_MS
+        stall_per_miss = self.DEFAULT_EMB_STALL_PER_MISS_MS
 
-            prior = self._access_log.get(f"emb:item:{key}", [])
-            recent_score = 0.0
-            if prior:
-                age = max(0, demand.epoch - prior[-1])
-                recent_score = math.exp(-age / 8.0)
+        base_reuse = 0.65
+        history_bonus = 0.20
+        count_bonus_one = 0.05 * math.log1p(1)
+        position_weight = 0.05
+        recent_weight = 0.05
+        recent_decay_inv = 1.0 / 8.0
 
-            reuse = min(
-                1.0,
-                0.65
-                + 0.20 * in_history
-                + 0.05 * min(1.0, math.log1p(count))
-                + 0.05 * position_score
-                + 0.05 * recent_score,
-            )
+        if fast_unique_sequence:
+            for ordinal, key in enumerate(unique_keys):
+                position_score = (ordinal + 1) * inv_seq_len
+                in_history = 1.0 if ordinal < hist_len else 0.0
 
-            miss_cost = self.DEFAULT_EMB_STALL_PER_MISS_MS * max(1, count)
-            movement_cost = row_size_bytes / self.PCIE_BANDWIDTH_BYTES_PER_MS
-            net_benefit = reuse * miss_cost - movement_cost
-            value_density = net_benefit / max(1, row_size_bytes)
+                recent_score = 0.0
+                if has_last_access:
+                    prior_epoch = last_access.get(key)
+                    if prior_epoch is not None:
+                        age = max(0, epoch - prior_epoch)
+                        recent_score = math.exp(-age * recent_decay_inv)
 
-            if net_benefit <= 0.0:
-                continue
-
-            if return_trace:
-                ranked.append(
-                    (
-                        value_density,
-                        ordinal,
-                        key,
-                        net_benefit,
-                        in_history,
-                        count,
-                        recent_score,
-                        position_score,
-                    )
+                reuse = (
+                    base_reuse
+                    + history_bonus * in_history
+                    + count_bonus_one
+                    + position_weight * position_score
+                    + recent_weight * recent_score
                 )
-            else:
-                ranked.append((value_density, ordinal, key))
+                if reuse > 1.0:
+                    reuse = 1.0
+
+                net_benefit = reuse * stall_per_miss - movement_cost
+                if net_benefit <= 0.0:
+                    continue
+
+                value_density = net_benefit * inv_row_size
+
+                if return_trace:
+                    ranked.append(
+                        (
+                            value_density,
+                            key,
+                            net_benefit,
+                            in_history,
+                            1,
+                            recent_score,
+                            position_score,
+                        )
+                    )
+                else:
+                    ranked.append((value_density, key))
+        else:
+            for key in unique_keys:
+                count = counts.get(key, 1)
+                pos = last_pos.get(key, -1)
+                in_history = 1.0 if 0 <= pos < hist_len else 0.0
+                position_score = (pos + 1) * inv_seq_len if pos >= 0 else 0.0
+
+                recent_score = 0.0
+                if has_last_access:
+                    prior_epoch = last_access.get(key)
+                    if prior_epoch is not None:
+                        age = max(0, epoch - prior_epoch)
+                        recent_score = math.exp(-age * recent_decay_inv)
+
+                count_bonus = 0.05 * min(1.0, math.log1p(count))
+                reuse = (
+                    base_reuse
+                    + history_bonus * in_history
+                    + count_bonus
+                    + position_weight * position_score
+                    + recent_weight * recent_score
+                )
+                if reuse > 1.0:
+                    reuse = 1.0
+
+                miss_cost = stall_per_miss * max(1, count)
+                net_benefit = reuse * miss_cost - movement_cost
+                if net_benefit <= 0.0:
+                    continue
+
+                value_density = net_benefit * inv_row_size
+
+                if return_trace:
+                    ranked.append(
+                        (
+                            value_density,
+                            key,
+                            net_benefit,
+                            in_history,
+                            count,
+                            recent_score,
+                            position_score,
+                        )
+                    )
+                else:
+                    ranked.append((value_density, key))
 
         score_ms = 1000 * (time.perf_counter() - score_start)
 
@@ -233,17 +308,15 @@ class ValueEngine:
         sort_ms = 1000 * (time.perf_counter() - sort_start)
 
         ids_start = time.perf_counter()
-        ranked_ids = [entry[2] for entry in ranked]
+        ranked_ids = [entry[1] for entry in ranked]
         ids_ms = 1000 * (time.perf_counter() - ids_start)
 
         trace_ms = 0.0
         ranked_trace = []
-
         if return_trace:
             trace_start = time.perf_counter()
             for rank, (
                 value_density,
-                _ordinal,
                 key,
                 net_benefit,
                 in_history,
@@ -272,6 +345,7 @@ class ValueEngine:
             f"[EMB_RANK_PROFILE call={profile_call}] "
             f"items={len(unique_keys)} "
             f"positive={len(ranked)} "
+            f"fast_unique={fast_unique_sequence} "
             f"prep={prep_ms:.3f}ms "
             f"context={context_ms:.3f}ms "
             f"score={score_ms:.3f}ms "
@@ -287,6 +361,7 @@ class ValueEngine:
 
         return ranked_ids
 
-    def record_embedding_accesses(self, item_sequence: List[int], epoch: int) -> None:
-        for key in item_sequence:
-            self.record_access(f"emb:item:{int(key)}", epoch)
+    def record_embedding_accesses(self, item_sequence, epoch: int):
+        last_access = self._embedding_last_access_epoch_by_item
+        for raw_key in item_sequence:
+            last_access[int(raw_key)] = epoch
