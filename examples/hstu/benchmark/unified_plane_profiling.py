@@ -12,6 +12,7 @@ latency into a JSONL trace file. Offline analysis will compute:
 """
 import argparse
 import gc
+import hashlib
 import json
 import math
 import os
@@ -133,6 +134,25 @@ def build_dataset(
     )
     return dataset, total_batches
 
+def make_batch_fingerprint(batch, user_ids, total_history_lengths):
+    digest = hashlib.sha256()
+    fields = [
+        ("item_feat", batch.features["item_feat"].values()),
+        ("act_feat", batch.features["act_feat"].values()),
+        ("user_ids", user_ids),
+        ("history_lengths", total_history_lengths),
+    ]
+
+    for name, value in fields:
+        tensor = value.detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(repr(tuple(tensor.shape)).encode("ascii"))
+        digest.update(tensor.numpy().tobytes())
+
+    return digest.hexdigest()
+
 
 def run_static_sweep(
     hidden_dim, num_layers, num_heads, head_dim, dtype_str,
@@ -202,12 +222,54 @@ def run_static_sweep(
             for i in range(measure_batches):
                 batch, user_ids, total_history_lengths = next(dataloader_iter)
 
+                batch_fingerprint = make_batch_fingerprint(
+                    batch, user_ids, total_history_lengths
+                )
+
                 torch.cuda.synchronize()
                 t0 = time.perf_counter()
                 with torch.inference_mode():
                     model.forward_with_kvcache(batch, user_ids, total_history_lengths)
                 torch.cuda.synchronize()
                 latency_ms = (time.perf_counter() - t0) * 1000.0
+
+                origin_cached_length = None
+                max_origin_cached_length = None
+                new_tokens = None
+                offload_pages = None
+                observed_max_seqlen = None
+
+                try:
+                    async_kvcache = model.dense_module.async_kvcache
+                    origin_cached_lengths = getattr(
+                        async_kvcache,
+                        "last_origin_cached_lengths",
+                        None,
+                    )
+
+                    if (
+                        origin_cached_lengths is not None
+                        and len(origin_cached_lengths) > 0
+                    ):
+                        origin_cached_length = int(origin_cached_lengths[0])
+                        max_origin_cached_length = max(
+                            int(value) for value in origin_cached_lengths
+                        )
+
+                    new_tokens = getattr(
+                        async_kvcache, "last_new_tokens", None
+                    )
+                    offload_pages = getattr(
+                        async_kvcache, "last_num_offload_pages", None
+                    )
+                    observed_max_seqlen = getattr(
+                        async_kvcache, "last_max_seqlen", None
+                    )
+                except Exception as exc:
+                    if i == 0:
+                        print(
+                            f"[Static metric debug] failed: {repr(exc)}"
+                        )
 
                 thl = total_history_lengths.tolist() if torch.is_tensor(total_history_lengths) else list(total_history_lengths)
                 hist_len = thl[0] // 2
@@ -221,8 +283,15 @@ def run_static_sweep(
                     "blocks_in_primary_pool": blocks,
                     "batch_idx": i,
                     "latency_ms": latency_ms,
+                    "latency_semantics": "inference_only",
+                    "batch_fingerprint": batch_fingerprint,
                     "seq_history_len": hist_len,
                     "user_id": int(user_ids[0].item()) if torch.is_tensor(user_ids) else int(user_ids[0]),
+                    "origin_cached_length": origin_cached_length,
+                    "max_origin_cached_length": max_origin_cached_length,
+                    "new_tokens": new_tokens,
+                    "offload_pages": offload_pages,
+                    "max_seqlen": observed_max_seqlen,
                 }
                 trace_records.append(record)
 

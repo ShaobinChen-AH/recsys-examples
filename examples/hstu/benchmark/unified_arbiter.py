@@ -19,6 +19,7 @@ Example:
 
 import argparse
 import gc
+import hashlib
 import json
 import math
 import os
@@ -394,6 +395,25 @@ def parse_split(s):
     parts = s.split(":")
     return (int(parts[0]), int(parts[1]))
 
+def make_batch_fingerprint(batch, user_ids, total_history_lengths):
+    digest = hashlib.sha256()
+    fields = [
+        ("item_feat", batch.features["item_feat"].values()),
+        ("act_feat", batch.features["act_feat"].values()),
+        ("user_ids", user_ids),
+        ("history_lengths", total_history_lengths),
+    ]
+
+    for name, value in fields:
+        tensor = value.detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(repr(tuple(tensor.shape)).encode("ascii"))
+        digest.update(tensor.numpy().tobytes())
+
+    return digest.hexdigest()
+
 def run_hotstate_arbiter(dataset, total_available, warmup_batches,
                          measure_batches, num_users, out_jsonl,
                          hidden_dim, num_layers, num_heads, head_dim,
@@ -462,8 +482,11 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
     print(f"\nMeasuring ({measure_batches} batches)...")
     for i in range(measure_batches):
         batch, uids, thl = next(it)
-        
+       
+        batch_fingerprint = make_batch_fingerprint(batch, uids, thl)
+        control_start = time.perf_counter()
         control = controller.before_batch(batch, uids, thl)
+        hotstate_control_ms = (time.perf_counter() - control_start) * 1000.0
 
         origin_cached_length = None
         max_origin_cached_length = None
@@ -507,8 +530,10 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
         except Exception as e:
             if i == 0:
                 print(f"[HotState metric debug] failed: {repr(e)}")
-
+        
+        post_control_start = time.perf_counter()
         post_control = controller.after_batch(batch, latency_ms)
+        hotstate_post_control_ms = (time.perf_counter() - post_control_start) * 1000.0
 
         hist_len = thl[0].item() // 2
         user_id = int(uids[0].item())
@@ -540,6 +565,10 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
             "admitted": control["admitted"],
             "batch_idx": i,
             "latency_ms": latency_ms,
+            "latency_semantics": "inference_only",
+            "batch_fingerprint": batch_fingerprint,
+            "hotstate_control_ms": hotstate_control_ms,
+            "hotstate_post_control_ms": hotstate_post_control_ms,
             "seq_history_len": hist_len,
             "user_id": user_id,
             "epoch": control["epoch"],
