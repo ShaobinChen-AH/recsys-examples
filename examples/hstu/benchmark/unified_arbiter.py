@@ -671,6 +671,7 @@ def main():
     total_hbm_bytes = int(args.total_hbm_budget_gib * 1024**3)
 
     # ── Create dataset ───────────────────────────────────────────────────
+    torch.manual_seed(42)
     dataset, total_available = build_dataset(
         args.max_history_seqlen, args.max_num_candidates,
         args.max_incremental_seqlen, args.num_users,

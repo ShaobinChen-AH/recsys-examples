@@ -144,7 +144,8 @@ def run_static_sweep(
 ):
     dtype = torch.bfloat16 if dtype_str in ("bfloat16", "float16") else torch.float32
     max_seqlen = max_history_length * 2 + max_num_candidates
-
+    
+    torch.manual_seed(42)
     dataset, total_available = build_dataset(
         max_history_length, max_num_candidates, max_incremental_seqlen, num_users,
     )
@@ -171,6 +172,7 @@ def run_static_sweep(
     results = []
 
     for lhs, rhs in splits:
+        dataset._iloc = 0
         split_name = f"static_{lhs}_{rhs}"
         emb_budget = math.floor(lhs / (lhs + rhs) * total_hbm_budget_bytes)
         kv_budget = total_hbm_budget_bytes - emb_budget

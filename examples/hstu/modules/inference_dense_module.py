@@ -388,10 +388,7 @@ class InferenceDenseModule(torch.nn.Module):
         prepare_kvcache_result: List,
     ):
         with torch.inference_mode():
-            control = None
-            if self.hotstate is not None:
-                control = self.hotstate.before_batch(
-                    batch, user_ids, total_history_lengths)
+            
             (
                 old_cached_lengths,
                 num_history_tokens,
