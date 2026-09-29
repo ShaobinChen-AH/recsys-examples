@@ -475,6 +475,7 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
         controller.before_batch(batch, uids, thl)
         with torch.inference_mode():
             model.forward_with_kvcache(batch, uids, thl)
+        torch.cuda.synchronize()
 
     # Measure
     trace_records = []

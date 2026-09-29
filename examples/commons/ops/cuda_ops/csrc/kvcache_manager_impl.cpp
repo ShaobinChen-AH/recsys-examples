@@ -1234,7 +1234,13 @@ void prepare_kvcache(
         for (int i = 0; i < num_onload_pages; i++) page_indices.push_back(onload_page_offset+i);
         page_indices.insert(page_indices.end(), page_ids.begin(), page_ids.end());
         page_indptr[seq_idx + 1] = page_indptr[seq_idx] + page_ids.size() + num_onload_pages;
-        last_page_len[seq_idx] = gpu_cache_length % gpu_mgr.num_tokens_per_page;
+	if (gpu_cache_length == 0) {
+            last_page_len[seq_idx] = 0;
+        } else {
+            const int remainder = gpu_cache_length % gpu_mgr.num_tokens_per_page;
+            last_page_len[seq_idx] =
+                remainder == 0 ? gpu_mgr.num_tokens_per_page : remainder;
+        }
         onload_page_offset += num_onload_pages;
 
         total_history_lengths[seq_idx] = total_history_length;

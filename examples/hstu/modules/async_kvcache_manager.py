@@ -1,4 +1,5 @@
 import math
+from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 
 import paged_kvcache_ops
@@ -333,7 +334,6 @@ class AsyncHSTUKVCacheManager:
             lengths=new_lengths.cuda(),
             keys=batch.features.keys(),
         )
-        batch.features = new_features
 
         torch.cuda.nvtx.range_pop()
-        return batch
+        return replace(batch, features=new_features)

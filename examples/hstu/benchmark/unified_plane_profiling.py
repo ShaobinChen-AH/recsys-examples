@@ -218,6 +218,7 @@ def run_static_sweep(
                 batch, user_ids, total_history_lengths = next(dataloader_iter)
                 with torch.inference_mode():
                     model.forward_with_kvcache(batch, user_ids, total_history_lengths)
+                torch.cuda.synchronize()
 
             for i in range(measure_batches):
                 batch, user_ids, total_history_lengths = next(dataloader_iter)
