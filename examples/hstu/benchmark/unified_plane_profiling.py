@@ -183,10 +183,24 @@ def run_static_sweep(
     print(f"  KV page cost: {kv_page_mib:.3f} MiB/page ({kv_page_bytes} bytes)")
     print(f"  Total HBM budget: {total_hbm_budget_bytes / 1024**3:.2f} GiB")
 
+    max_required_kv_tokens = 2 * (
+        max_history_length - max_incremental_seqlen
+    )
     for lhs, rhs in splits:
         kv_budget = total_hbm_budget_bytes - math.floor(lhs / (lhs + rhs) * total_hbm_budget_bytes)
         blocks = max(1, kv_budget // kv_page_bytes)
         max_kv_tokens = blocks * DEFAULT_KV_PAGE_SIZE
+        if (
+            max_kv_tokens < max_required_kv_tokens
+            and max_kv_tokens < DEFAULT_OFFLOAD_CHUNKSIZE
+        ):
+            raise ValueError(
+                f"Static split {lhs}:{rhs} is infeasible: "
+                f"KV capacity={max_kv_tokens} tokens, "
+                f"max workload={max_required_kv_tokens} tokens, "
+                f"offload chunk={DEFAULT_OFFLOAD_CHUNKSIZE} tokens. "
+                "KV capacity is exhausted before offloading can begin."
+            )
         print(f"  {lhs}:{rhs} → {blocks} pages → {max_kv_tokens} KV tokens max")
 
     results = []
