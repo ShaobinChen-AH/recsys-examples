@@ -2037,6 +2037,39 @@ class HybridStorage(Storage):
         """Collect per-table sizes from key_index_map into estimated_table_sizes (host tier only, async copy)."""
         collect_table_sizes_for_state(self._host, non_blocking=non_blocking)
 
+    def residency(
+        self,
+        unique_keys: torch.Tensor,
+        table_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the observed tier for each key.
+
+        The result is an int8 tensor aligned with ``unique_keys``: ``0`` means
+        absent from both tiers, ``1`` means HBM, and ``2`` means host DRAM.
+        This is intentionally a read-only lookup used by HotState's directory;
+        it does not update scores, allocate rows, or trigger promotion.
+        """
+        if unique_keys.numel() == 0:
+            return torch.empty_like(unique_keys, dtype=torch.int8)
+
+        h_keys = unique_keys.to(device=self._hbm.device, dtype=self._hbm.key_index_map.key_type)
+        h_table_ids = table_ids.to(device=self._hbm.device, dtype=torch.int64)
+        _missing, _mkeys, _midx, _mtids, _mscores, h_founds, _scores, _indices = _find_keys(
+            self._hbm, h_keys, h_table_ids, const_lookup=True
+        )
+        locations = torch.zeros(h_keys.numel(), dtype=torch.int8, device=h_keys.device)
+        locations[h_founds] = 1
+        missing_mask = ~h_founds
+        if bool(missing_mask.any()):
+            host_keys = h_keys[missing_mask]
+            host_table_ids = h_table_ids[missing_mask]
+            _missing, _mkeys, _midx, _mtids, _mscores, host_founds, _scores, _indices = _find_keys(
+                self._host, host_keys, host_table_ids, const_lookup=True
+            )
+            missing_positions = torch.nonzero(missing_mask, as_tuple=False).reshape(-1)
+            locations[missing_positions[host_founds]] = 2
+        return locations.to(device=unique_keys.device)
+
     # -- Two-tier find (with values) --
 
     def find(
@@ -2257,6 +2290,303 @@ class HybridStorage(Storage):
                 evicted_values,
                 evicted_scores,
             )
+
+    def promote_keys(
+        self,
+        unique_keys: torch.Tensor,
+        table_ids: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Move host-resident rows into HBM and return actual movements.
+
+        HybridStorage normally reads host rows in place.  HotState needs an
+        explicit, lossless promotion operation so a policy decision can change
+        residency before the next inference lookup.  Rows absent from both
+        tiers are ignored; they must still be initialized by the normal lookup
+        path.  HBM pressure uses the same scored eviction path as ``insert``,
+        and evicted values are written back to the host tier before the
+        promoted host rows are erased.
+        """
+        if unique_keys.numel() == 0:
+            empty = unique_keys[:0]
+            return empty, empty
+
+        (
+            h_num_missing_hbm,
+            missing_keys_hbm,
+            missing_indices_hbm,
+            missing_table_ids_hbm,
+            missing_scores_hbm,
+            _founds_hbm,
+            _scores_hbm,
+            _indices_hbm,
+        ) = _find_keys(self._hbm, unique_keys, table_ids)
+        if h_num_missing_hbm == 0:
+            empty = unique_keys[:0]
+            return empty, empty
+
+        (
+            _h_num_missing_host,
+            _missing_keys_host,
+            _missing_indices_host,
+            _missing_table_ids_host,
+            _missing_scores_host,
+            founds_host,
+            scores_host,
+            indices_host,
+        ) = _find_keys(
+            self._host,
+            missing_keys_hbm,
+            missing_table_ids_hbm,
+            missing_scores_hbm,
+        )
+        if not bool(founds_host.any()):
+            empty = unique_keys[:0]
+            return empty, empty
+
+        host_positions = missing_indices_hbm[founds_host]
+        promoted_keys = unique_keys[host_positions]
+        promoted_table_ids = table_ids[host_positions]
+        promoted_scores = scores_host[founds_host] if scores_host is not None else None
+        if self._hbm.evict_strategy == EvictStrategy.KLru:
+            # LRU owns insertion timestamps; host-tier logical row scores are
+            # not valid HBM timestamps.
+            promoted_scores = None
+        host_flat = _flat_row_indices_for_value_load(
+            self._host, founds_host, scores_host, indices_host
+        )
+        promoted_values = load_from_flat(
+            self._host,
+            host_flat[founds_host],
+            promoted_table_ids,
+            copy_mode=CopyMode.VALUE,
+        )
+
+        (
+            indices,
+            num_evicted,
+            evicted_keys,
+            evicted_table_ids,
+            evicted_indices,
+            evicted_scores,
+        ) = _insert_and_evict_keys(
+            self._hbm,
+            promoted_keys,
+            promoted_table_ids,
+            promoted_scores,
+            preserve_existing=False,
+        )
+        evicted_values = load_from_flat(
+            self._hbm, evicted_indices, evicted_table_ids, copy_mode=CopyMode.VALUE
+        )
+        select_insert_failed_values(evicted_indices, promoted_values, evicted_values)
+        store_to_flat(self._hbm, indices, promoted_table_ids, promoted_values)
+
+        if num_evicted != 0:
+            _insert_key_values(
+                self._host,
+                evicted_keys,
+                evicted_table_ids,
+                evicted_values,
+                evicted_scores,
+            )
+
+        # The tiers are intentionally disjoint.  Confirm the rows that are
+        # present in HBM after insertion before erasing their host copies;
+        # unusual hash-table insertion failures must not lose the host value.
+        (
+            _post_missing,
+            _post_missing_keys,
+            _post_missing_indices,
+            _post_missing_tids,
+            _post_missing_scores,
+            post_founds,
+            _post_scores,
+            _post_indices,
+        ) = _find_keys(self._hbm, promoted_keys, promoted_table_ids)
+        actual_promoted_keys = promoted_keys[post_founds]
+        actual_promoted_tids = promoted_table_ids[post_founds]
+        if actual_promoted_keys.numel() > 0:
+            self._host.key_index_map.erase(actual_promoted_keys, actual_promoted_tids)
+        return actual_promoted_keys, evicted_keys
+
+    def evict_keys(
+        self,
+        unique_keys: torch.Tensor,
+        table_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Move HBM-resident rows to host and return rows actually moved."""
+        if unique_keys.numel() == 0:
+            return unique_keys[:0]
+
+        (
+            _h_num_missing,
+            _missing_keys,
+            _missing_indices,
+            _missing_table_ids,
+            _missing_scores,
+            founds,
+            scores,
+            indices,
+        ) = _find_keys(self._hbm, unique_keys, table_ids)
+        if not bool(founds.any()):
+            return unique_keys[:0]
+
+        moved_keys = unique_keys[founds]
+        moved_table_ids = table_ids[founds]
+        moved_scores = scores[founds] if scores is not None else None
+        flat_rows = _flat_row_indices_for_value_load(
+            self._hbm, founds, scores, indices
+        )
+        moved_values = load_from_flat(
+            self._hbm, flat_rows[founds], moved_table_ids, copy_mode=CopyMode.VALUE
+        )
+        _insert_key_values(
+            self._host,
+            moved_keys,
+            moved_table_ids,
+            moved_values,
+            moved_scores,
+        )
+        self._hbm.key_index_map.erase(moved_keys, moved_table_ids)
+        return moved_keys
+
+    def admit_keys(
+        self,
+        unique_keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        initializer: Optional[Callable] = None,
+        *,
+        allow_initialize: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Promote existing rows, optionally initializing missing rows.
+
+        This is the physical-HBM counterpart to policy admission.  Existing
+        host rows retain their values; rows absent from both tiers are created
+        with the normal evaluation initializer and then inserted into HBM.
+        The returned tensors contain only rows confirmed resident after the
+        operation and rows displaced to host by HBM pressure.
+        ``allow_initialize`` is deliberately opt-in.  A physical residency
+        controller must never manufacture a value for a key absent from both
+        tiers; inference callers should only promote an authoritative host
+        row.  Admission smoke tests may opt into the historical initializer
+        behavior explicitly.
+        """
+        promoted, displaced = self.promote_keys(unique_keys, table_ids)
+        if unique_keys.numel() == 0:
+            return promoted, displaced
+
+        if not allow_initialize:
+            return promoted, displaced
+
+        (
+            h_num_missing_hbm,
+            missing_keys_hbm,
+            missing_indices_hbm,
+            missing_table_ids_hbm,
+            missing_scores_hbm,
+            _founds_hbm,
+            _scores_hbm,
+            _indices_hbm,
+        ) = _find_keys(self._hbm, unique_keys, table_ids)
+        if h_num_missing_hbm == 0:
+            return promoted, displaced
+
+        (
+            _h_num_missing_host,
+            _missing_keys_host,
+            _missing_indices_host,
+            _missing_table_ids_host,
+            _missing_scores_host,
+            founds_host,
+            _scores_host,
+            _indices_host,
+        ) = _find_keys(
+            self._host,
+            missing_keys_hbm,
+            missing_table_ids_hbm,
+            missing_scores_hbm,
+        )
+        missing_mask = ~founds_host
+        if not bool(missing_mask.any()):
+            return promoted, displaced
+
+        missing_keys = missing_keys_hbm[missing_mask]
+        missing_table_ids = missing_table_ids_hbm[missing_mask]
+        missing_scores = (
+            missing_scores_hbm[missing_mask]
+            if missing_scores_hbm is not None
+            else None
+        )
+        values = torch.empty(
+            missing_keys.numel(),
+            self._hbm.value_dim,
+            dtype=self._hbm.emb_dtype,
+            device=self._hbm.device,
+        )
+        init_indices = torch.arange(
+            missing_keys.numel(), dtype=torch.int64, device=missing_keys.device
+        )
+        if initializer is None:
+            values[:, : self._hbm.emb_dim].zero_()
+        else:
+            initializer(values[:, : self._hbm.emb_dim], init_indices, missing_keys)
+        if self._hbm.value_dim > self._hbm.emb_dim:
+            values[:, self._hbm.emb_dim :] = self._hbm.initial_optim_state
+
+        (
+            insert_indices,
+            num_evicted,
+            newly_evicted_keys,
+            newly_evicted_table_ids,
+            newly_evicted_indices,
+            newly_evicted_scores,
+        ) = _insert_and_evict_keys(
+            self._hbm,
+            missing_keys,
+            missing_table_ids,
+            missing_scores,
+            preserve_existing=False,
+        )
+        newly_evicted_values = load_from_flat(
+            self._hbm,
+            newly_evicted_indices,
+            newly_evicted_table_ids,
+            copy_mode=CopyMode.VALUE,
+        )
+        select_insert_failed_values(newly_evicted_indices, values, newly_evicted_values)
+        store_to_flat(self._hbm, insert_indices, missing_table_ids, values)
+        if num_evicted != 0:
+            _insert_key_values(
+                self._host,
+                newly_evicted_keys,
+                newly_evicted_table_ids,
+                newly_evicted_values,
+                newly_evicted_scores,
+            )
+        (
+            _post_missing,
+            _post_missing_keys,
+            _post_missing_indices,
+            _post_missing_tids,
+            _post_missing_scores,
+            post_founds,
+            _post_scores,
+            _post_indices,
+        ) = _find_keys(self._hbm, missing_keys, missing_table_ids)
+        newly_admitted = missing_keys[post_founds]
+        if promoted.numel() == 0:
+            admitted = newly_admitted
+        elif newly_admitted.numel() == 0:
+            admitted = promoted
+        else:
+            admitted = torch.cat((promoted, newly_admitted), dim=0)
+        if newly_evicted_keys.numel() == 0:
+            all_displaced = displaced
+        elif displaced.numel() == 0:
+            all_displaced = newly_evicted_keys
+        else:
+            all_displaced = torch.cat((displaced, newly_evicted_keys), dim=0)
+        return admitted, all_displaced
 
     def incremental_dump(
         self,

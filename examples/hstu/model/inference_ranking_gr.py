@@ -86,18 +86,57 @@ class InferenceRankingGR(torch.nn.Module):
         user_ids: torch.Tensor,
         total_history_lengths: torch.Tensor,
     ):
-        with torch.inference_mode():
-            prepare_kvcache_result = (
-                self.dense_module.async_kvcache.prepare_kvcache_async(
-                    batch.batch_size,
-                    user_ids.tolist(),
-                    total_history_lengths.tolist(),
-                    self.dense_module.async_kvcache.static_page_ids_gpu_buffer,
-                    self.dense_module.async_kvcache.static_offload_page_ids_gpu_buffer,
-                    self.dense_module.async_kvcache.static_metadata_gpu_buffer,
-                    self.dense_module.async_kvcache.static_onload_handle,
-                )
+        """Run a request with transactional cleanup of staged KV buffers."""
+        try:
+            logits = self._forward_with_kvcache_impl(
+                batch, user_ids, total_history_lengths
             )
+        except Exception:
+            async_kvcache = self.dense_module.async_kvcache
+            abort = getattr(async_kvcache, "abort_active_prepare", None)
+            if callable(abort):
+                abort()
+            controller = getattr(self.dense_module, "hotstate", None)
+            generation_fn = getattr(async_kvcache, "active_prepare_generation", None)
+            generation = generation_fn() if callable(generation_fn) else getattr(
+                async_kvcache, "last_consumed_prepare_generation", None
+            )
+            cancel = getattr(controller, "abort_staged_kv_request", None)
+            if generation is not None and callable(cancel):
+                cancel(generation, "inference forward failed")
+            raise
+        complete = getattr(
+            self.dense_module.async_kvcache, "complete_active_prepare", None
+        )
+        if callable(complete):
+            complete()
+        return logits
+
+    def _forward_with_kvcache_impl(
+        self,
+        batch: HSTUBatch,
+        user_ids: torch.Tensor,
+        total_history_lengths: torch.Tensor,
+    ):
+        with torch.inference_mode():
+            async_kvcache = self.dense_module.async_kvcache
+            user_id_list = user_ids.tolist()
+            history_length_list = total_history_lengths.tolist()
+            staged = async_kvcache.consume_staged_prepare(
+                user_id_list, history_length_list
+            )
+            if staged is None:
+                prepare_kvcache_result = async_kvcache.prepare_kvcache_async(
+                    batch.batch_size,
+                    user_id_list,
+                    history_length_list,
+                    async_kvcache.static_page_ids_gpu_buffer,
+                    async_kvcache.static_offload_page_ids_gpu_buffer,
+                    async_kvcache.static_metadata_gpu_buffer,
+                    async_kvcache.static_onload_handle,
+                )
+            else:
+                _prepare_generation, prepare_kvcache_result = staged
 
             old_cached_lengths = torch.tensor(
                 prepare_kvcache_result[0], dtype=torch.int32
@@ -155,6 +194,7 @@ def get_inference_ranking_gr(
     sparse_shareables=None,
     hotstate_admit_strategy=None,
     hotstate_admission_counters=None,
+    dynamic_embedding_hbm_bytes: int = 0,
 ):
     for ebc_config in task_config.embedding_configs:
         assert (
@@ -166,6 +206,7 @@ def get_inference_ranking_gr(
         sparse_shareables=sparse_shareables,
         hotstate_admit_strategy=hotstate_admit_strategy,
         hotstate_admission_counters=hotstate_admission_counters,
+        dynamic_embedding_hbm_bytes=dynamic_embedding_hbm_bytes,
     )
     inference_dense = InferenceDenseModule(
         hstu_config,

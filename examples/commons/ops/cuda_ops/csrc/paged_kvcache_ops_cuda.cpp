@@ -279,6 +279,7 @@ PYBIND11_MODULE(paged_kvcache_ops, m) {
          py::arg("num_tokens_per_page"),
          py::arg("num_tokens_per_chunk"))
     .def("get_kvdata_tensor", &kvcache::HostKVStorageImpl::get_kvdata_tensor)
+    .def("get_kvdata_length", &kvcache::HostKVStorageImpl::get_kvdata_length)
     .def("init_random_kvdata", &kvcache::HostKVStorageImpl::init_random_kvdata)
   ;
 
@@ -310,11 +311,13 @@ PYBIND11_MODULE(paged_kvcache_ops, m) {
     .def("get_withheld_page_count", &kvcache::GPUKVCacheMangerImpl::get_withheld_page_count)
     .def("get_resident_page_count", &kvcache::GPUKVCacheMangerImpl::get_resident_page_count)
     .def("has_user", &kvcache::GPUKVCacheMangerImpl::has_user)
+    .def("is_user_offload_frozen", &kvcache::GPUKVCacheMangerImpl::is_user_offload_frozen)
     .def("evict_if_present", &kvcache::GPUKVCacheMangerImpl::evict_if_present)
     .def("set_active_page_limit", &kvcache::GPUKVCacheMangerImpl::set_active_page_limit, py::arg("new_limit"), "Dynamically adjust the number of usable cache pages")
     .def("onload_kvcache", &kvcache::GPUKVCacheMangerImpl::onload_kvcache, py::call_guard<py::gil_scoped_release>())
     .def("offload_kvcache", &kvcache::GPUKVCacheMangerImpl::offload_kvcache, py::call_guard<py::gil_scoped_release>())
     .def("is_busy_offloading", &kvcache::GPUKVCacheMangerImpl::is_busy_offloading)
+    .def("get_completed_offload_count", &kvcache::GPUKVCacheMangerImpl::get_completed_offload_count)
     .def("init_random_offload_status", &kvcache::GPUKVCacheMangerImpl::init_random_offload_status)
   ;
 

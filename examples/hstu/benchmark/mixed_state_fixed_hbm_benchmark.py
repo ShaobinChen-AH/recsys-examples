@@ -1,6 +1,7 @@
 import argparse
 import copy
 import gc
+import hashlib
 import json
 import math
 import os
@@ -32,6 +33,14 @@ from megatron.core import parallel_state, tensor_parallel
 from model import get_ranking_model
 from model.inference_ranking_gr import get_inference_ranking_gr
 from modules.inference_dense_module import copy_jagged_metadata
+from modules.hotstate.embedding_adapter import EmbeddingAdapter
+from modules.hotstate.kv_adapter import KVAdapter
+from modules.hotstate.physical_budget import (
+    DEFAULT_ELEMENT_BYTES,
+    kv_page_bytes,
+    plan_physical_budget,
+)
+from modules.hotstate.training_controller import TrainingHotStateController
 from training.trainer.utils import (
     create_dynamic_optitons_dict,
     create_embedding_configs,
@@ -329,6 +338,22 @@ def clone_request(uids, dates, seq_endptrs):
     return cloned_uids, cloned_dates, cloned_seq_endptrs
 
 
+def request_fingerprint(request) -> str:
+    """Return a stable identity for a replayed inference request."""
+    digest = hashlib.sha256()
+    for name, value in zip(("uids", "dates", "seq_endptrs"), request):
+        digest.update(name.encode("ascii"))
+        digest.update(b"\0")
+        if torch.is_tensor(value):
+            tensor = value.detach().cpu().contiguous()
+            digest.update(str(tensor.dtype).encode("ascii"))
+            digest.update(repr(tuple(tensor.shape)).encode("ascii"))
+            digest.update(tensor.numpy().tobytes())
+        else:
+            digest.update(repr(value).encode("utf-8"))
+    return digest.hexdigest()
+
+
 def to_python_scalar(value):
     if torch.is_tensor(value):
         return value.item()
@@ -415,17 +440,13 @@ def calculate_default_embedding_budget(train_spec: Dict[str, Any]) -> int:
 
 def get_bytes_per_kv_primary_page_all_layers(infer_spec: Dict[str, Any]) -> int:
     network_args: NetworkArgs = infer_spec["network_args"]
-    if network_args.dtype_str == "bfloat16" or network_args.dtype_str == "float16":
-        bytes_per_elem = 2
-    else:
-        bytes_per_elem = 4
-    return (
-        network_args.num_layers
-        * 2
-        * DEFAULT_KV_PAGE_SIZE
-        * network_args.num_attention_heads
-        * network_args.kv_channels
-        * bytes_per_elem
+    return kv_page_bytes(
+        num_layers=network_args.num_layers,
+        num_kv_heads=network_args.num_attention_heads,
+        head_dim=network_args.kv_channels,
+        num_tokens_per_page=DEFAULT_KV_PAGE_SIZE,
+        # AsyncHSTUKVCacheManager's cache_table is always bfloat16.
+        element_bytes=DEFAULT_ELEMENT_BYTES,
     )
 
 
@@ -452,15 +473,45 @@ def build_budget_plan(
     policies = []
 
     def make_policy(policy_name: str, b_emb: int, b_kv_requested: int) -> Dict[str, Any]:
-        blocks = max(1, b_kv_requested // kv_page_bytes)
-        actual_b_kv = blocks * kv_page_bytes
+        # This is the inference state split.  The training embedding budget is
+        # retained separately because this benchmark deliberately keeps both
+        # runtimes alive at once.
+        ratio = float(b_emb / max(1, b_emb + b_kv_requested))
+        if policy_name == "default_local_scaled":
+            ratio = float(default_embedding_ratio)
+        physical_plan = plan_physical_budget(
+            state_budget_bytes=max(1, b_emb + b_kv_requested),
+            embedding_hbm_ratio=ratio,
+            num_layers=infer_spec["network_args"].num_layers,
+            num_kv_heads=infer_spec["network_args"].num_attention_heads,
+            head_dim=infer_spec["network_args"].kv_channels,
+            num_tokens_per_page=DEFAULT_KV_PAGE_SIZE,
+            max_batch_size=1,
+            max_sequence_length=math.ceil(
+                infer_spec["total_max_seqlen"] / DEFAULT_KV_PAGE_SIZE
+            )
+            * DEFAULT_KV_PAGE_SIZE,
+            num_tokens_per_chunk=DEFAULT_KV_OFFLOAD_CHUNKSIZE,
+        )
+        blocks = physical_plan.blocks_in_primary_pool
+        actual_b_kv = physical_plan.kv_primary_page_bytes
         return {
             "policy": policy_name,
             "embedding_budget_bytes": int(max(1, b_emb)),
             "kv_budget_bytes": int(actual_b_kv),
             "requested_kv_budget_bytes": int(max(1, b_kv_requested)),
-            "state_budget_bytes": int(max(1, b_emb) + actual_b_kv),
+            "requested_state_budget_bytes": int(
+                max(1, b_emb) + max(1, b_kv_requested)
+            ),
+            "state_budget_bytes": int(physical_plan.state_budget_bytes),
             "blocks_in_primary_pool": int(blocks),
+            "inference_embedding_hbm_bytes": int(physical_plan.embedding_hbm_bytes),
+            "inference_kv_primary_page_bytes": int(physical_plan.kv_primary_page_bytes),
+            "inference_kv_onload_page_bytes": int(physical_plan.kv_onload_page_bytes),
+            "inference_kv_copy_buffer_bytes": int(physical_plan.kv_copy_buffer_bytes),
+            "inference_safety_margin_bytes": int(physical_plan.safety_margin_bytes),
+            "inference_state_budget_bytes": int(physical_plan.state_budget_bytes),
+            "physical_budget_plan": physical_plan.as_dict(),
         }
 
     b_emb_local = math.floor(default_embedding_ratio * b_state_target)
@@ -503,6 +554,7 @@ def build_inference_model(
     checkpoint_dir: str,
     blocks_in_primary_pool: int,
     max_batch_size: int,
+    dynamic_embedding_hbm_bytes: int = 0,
 ):
     network_args: NetworkArgs = infer_spec["network_args"]
     ranking_args: RankingArgs = infer_spec["ranking_args"]
@@ -561,6 +613,7 @@ def build_inference_model(
         task_config=task_config,
         use_cudagraph=False,
         cudagraph_configs=hstu_cudagraph_configs,
+        dynamic_embedding_hbm_bytes=dynamic_embedding_hbm_bytes,
     )
     if hstu_config.bf16:
         model.bfloat16()
@@ -616,6 +669,20 @@ def build_training_pipeline(
             f"[warning] training checkpoint '{checkpoint_dir}' does not exist; continuing without loading"
         )
 
+    hotstate_training_controller = None
+    if trainer_args.hotstate_training_enabled:
+        configured_budget = (
+            int(trainer_args.hotstate_training_state_budget_gib * 1024**3)
+            if trainer_args.hotstate_training_state_budget_gib is not None
+            else int(embedding_budget_bytes)
+        )
+        hotstate_training_controller = TrainingHotStateController(
+            model_train,
+            configured_state_budget_bytes=configured_budget,
+            trace_path=trainer_args.hotstate_training_trace_path,
+        )
+        hotstate_training_controller.validate_training_budget()
+
     if trainer_args.enable_balanced_shuffler:
         batch_shuffler = BatchShufflerFactory.create(
             "hstu",
@@ -644,6 +711,7 @@ def build_training_pipeline(
         "model": model,
         "sharded_model": model_train,
         "dense_optimizer": dense_optimizer,
+        "hotstate_training_controller": hotstate_training_controller,
     }
 
 
@@ -769,10 +837,19 @@ def forward_with_kv_metrics(
     }
 
 
-def run_training_step(pipeline, train_iter) -> float:
+def run_training_step(pipeline, train_iter, hotstate_training_controller=None, step=None) -> float:
     torch.cuda.synchronize()
     start = time.perf_counter()
-    pipeline.progress(train_iter)
+    if hotstate_training_controller is not None:
+        hotstate_training_controller.before_train_step(0 if step is None else int(step))
+    try:
+        pipeline.progress(train_iter)
+    except Exception:
+        if hotstate_training_controller is not None:
+            hotstate_training_controller.abort_train_step()
+        raise
+    if hotstate_training_controller is not None:
+        hotstate_training_controller.record_train_step(0 if step is None else int(step))
     torch.cuda.synchronize()
     return (time.perf_counter() - start) * 1000.0
 
@@ -861,6 +938,114 @@ def print_record_summary(record: Dict[str, Any]) -> None:
     )
 
 
+def build_mixed_evidence_summary(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Summarize what the mixed benchmark actually measured.
+
+    The benchmark constructs one training+inference runtime per policy.  It
+    therefore provides a physically checked static comparison, but it does not
+    demonstrate online cross-policy migration or a unified live controller.
+    """
+    successful = [record for record in records if record.get("status") == "ok"]
+    static = [
+        record
+        for record in successful
+        if str(record.get("policy", "")).startswith("static_")
+    ]
+    budgets = sorted(
+        {
+            int(record["inference_state_budget_bytes"])
+            for record in successful
+            if record.get("inference_state_budget_bytes") is not None
+        }
+    )
+    physical_envelope = bool(successful) and all(
+        int(record.get("managed_state_physical_hbm_bytes", 0))
+        <= int(record.get("inference_state_budget_bytes", 0))
+        for record in successful
+    )
+    training_observed = bool(successful) and all(
+        record.get("training_physical_hbm_bytes") is not None
+        for record in successful
+    )
+
+    paired_cycles = []
+    by_policy = {}
+    for record in static:
+        cycles = {}
+        for cycle in record.get("cycle_trace", []):
+            key = cycle.get("cycle_fingerprint")
+            if key is not None:
+                cycles[str(key)] = cycle
+        by_policy[record["policy"]] = cycles
+    if by_policy:
+        common_keys = set.intersection(
+            *(set(cycles) for cycles in by_policy.values())
+        )
+    else:
+        common_keys = set()
+    for policy, cycles in sorted(by_policy.items()):
+        common_cycles = [cycles[key] for key in sorted(common_keys)]
+        if not common_cycles:
+            continue
+        paired_cycles.append(
+            {
+                "policy": policy,
+                "common_cycles": len(common_cycles),
+                "combined_cycle_stats": summarize_metrics(
+                    [
+                        float(cycle["combined_cycle_latency_ms"])
+                        for cycle in common_cycles
+                    ]
+                ),
+            }
+        )
+
+    best_static = None
+    if static:
+        best_static = min(static, key=lambda record: record["combined_cycle_mean_ms"])
+    return {
+        "record_type": "mixed_evidence_summary",
+        "evidence_schema_version": 1,
+        "implementation_scope": "mixed_physical_static_envelope",
+        "claim_boundary": (
+            "training and inference are measured in one process per fixed policy; "
+            "each policy rebuilds its model and no online HBM reallocation is demonstrated"
+        ),
+        "successful_policy_count": len(successful),
+        "static_policy_count": len(static),
+        "inference_state_budgets_bytes": budgets,
+        "envelope_scope": "inference_dynamic_embedding_plus_kv",
+        "physical_envelope_validated": physical_envelope,
+        "training_physical_state_observed": training_observed,
+        "paired_cycle_comparison": {
+            "status": "measured" if len(paired_cycles) >= 2 else "insufficient_samples",
+            "policies": paired_cycles,
+        },
+        "best_static_policy": best_static["policy"] if best_static else None,
+        "best_static_combined_cycle_mean_ms": (
+            best_static["combined_cycle_mean_ms"] if best_static else None
+        ),
+        "claims": {
+            "fixed_shared_hbm_envelope": (
+                "measured" if physical_envelope else "not_measured"
+            ),
+            "training_physical_state_accounting": (
+                "measured" if training_observed else "not_measured"
+            ),
+            "combined_training_inference_envelope": "not_demonstrated",
+            "training_and_inference_same_process": (
+                "measured" if successful else "not_measured"
+            ),
+            "static_policy_latency_comparison": (
+                "measured" if len(paired_cycles) >= 2 else "not_measured"
+            ),
+            "unified_controller_beats_best_static": "not_demonstrated",
+            "online_cross_type_reallocation": "not_demonstrated",
+            "paper_scale_generalization": "not_demonstrated",
+        },
+    }
+
+
 def run_policy_benchmark(
     policy: Dict[str, Any],
     train_spec: Dict[str, Any],
@@ -881,13 +1066,29 @@ def run_policy_benchmark(
     infer_runtime: Dict[str, Any] = {}
     record: Dict[str, Any] = {
         "record_type": record_type,
+        "benchmark_variant": (
+            "best_static_replay" if record_type == "oracle_replay" else "physical_static_split"
+        ),
+        "implementation_scope": "mixed_physical_static_envelope",
+        "online_reallocation_observed": False,
+        "model_rebuild_count": 1,
+        "allocation_lifecycle": "one_model_construction_per_policy",
         "policy": policy["policy"],
         "status": "error",
         "embedding_budget_bytes": policy["embedding_budget_bytes"],
+        "training_embedding_budget_bytes": policy["embedding_budget_bytes"],
         "kv_budget_bytes": policy["kv_budget_bytes"],
         "requested_kv_budget_bytes": policy["requested_kv_budget_bytes"],
+        "requested_state_budget_bytes": policy["requested_state_budget_bytes"],
         "state_budget_bytes": policy["state_budget_bytes"],
         "blocks_in_primary_pool": policy["blocks_in_primary_pool"],
+        "inference_embedding_hbm_bytes": policy["inference_embedding_hbm_bytes"],
+        "inference_kv_primary_page_bytes": policy["inference_kv_primary_page_bytes"],
+        "inference_kv_onload_page_bytes": policy["inference_kv_onload_page_bytes"],
+        "inference_kv_copy_buffer_bytes": policy["inference_kv_copy_buffer_bytes"],
+        "inference_safety_margin_bytes": policy["inference_safety_margin_bytes"],
+        "inference_state_budget_bytes": policy["inference_state_budget_bytes"],
+        "physical_budget_plan": policy["physical_budget_plan"],
         "train_max_history_seqlen": int(
             train_spec["dataset_args"].max_history_seqlen
         ),
@@ -899,6 +1100,7 @@ def run_policy_benchmark(
         "warmup_last_completed_idx": -1,
         "warmup_last_started_max_seq_endptr": -1,
     }
+    cycle_trace: List[Dict[str, Any]] = []
     try:
         torch.cuda.reset_peak_memory_stats()
         record["memory_before_init"] = record_memory_snapshot("before_init")
@@ -907,11 +1109,63 @@ def run_policy_benchmark(
             policy["embedding_budget_bytes"],
             checkpoint_train,
         )
+        training_controller = train_runtime.get("hotstate_training_controller")
+        training_snapshot = (
+            training_controller.physical_hbm_snapshot()
+            if training_controller is not None
+            else None
+        )
         infer_runtime["model"] = build_inference_model(
             infer_spec,
             checkpoint_infer,
             policy["blocks_in_primary_pool"],
             max_batch_size=1,
+            dynamic_embedding_hbm_bytes=policy["inference_embedding_hbm_bytes"],
+        )
+        embedding_adapter = EmbeddingAdapter(infer_runtime["model"].sparse_module)
+        embedding_adapter.calibrate()
+        kv_adapter = KVAdapter(infer_runtime["model"].dense_module.async_kvcache)
+        torch.cuda.synchronize()
+        physical_embedding_bytes = embedding_adapter.physical_hbm_bytes()
+        physical_kv_bytes = kv_adapter.physical_hbm_bytes()
+        physical_state_bytes = physical_embedding_bytes + physical_kv_bytes
+        if physical_state_bytes > policy["inference_state_budget_bytes"]:
+            raise RuntimeError(
+                "inference physical state allocation exceeds the policy envelope: "
+                f"embedding={physical_embedding_bytes} kv={physical_kv_bytes} "
+                f"budget={policy['inference_state_budget_bytes']}"
+            )
+        record.update(
+            {
+                "training_physical_hbm_bytes": int(
+                    training_snapshot["physical_hbm_bytes"]
+                )
+                if training_snapshot is not None
+                else None,
+                "training_state_budget_bytes": (
+                    training_snapshot.get("configured_state_budget_bytes")
+                    if training_snapshot is not None
+                    else None
+                ),
+                "embedding_physical_hbm_bytes": int(physical_embedding_bytes),
+                "kv_physical_hbm_bytes": int(physical_kv_bytes),
+                "managed_state_physical_hbm_bytes": int(physical_state_bytes),
+                "mixed_process_physical_hbm_bytes": (
+                    int(training_snapshot["physical_hbm_bytes"])
+                    if training_snapshot is not None
+                    else 0
+                ) + int(physical_state_bytes),
+                "physical_state_scope": (
+                    "inference_dynamic_embedding_plus_kv;"
+                    "training_dynamicemb_observed_separately"
+                ),
+                "remaining_state_budget_bytes": int(
+                    policy["inference_state_budget_bytes"] - physical_state_bytes
+                ),
+                "kv_physical_hbm_breakdown": kv_adapter.physical_hbm_breakdown(),
+                "logical_active_page_bytes": int(kv_adapter.logical_kv_budget_bytes()),
+                "resident_page_bytes": int(kv_adapter.actual_resident_kv_bytes()),
+            }
         )
         record["memory_after_init"] = record_memory_snapshot("after_init")
 
@@ -923,8 +1177,19 @@ def run_policy_benchmark(
             )
 
         torch.cuda.reset_peak_memory_stats()
+        training_step = 0
         for _ in range(warmup_train_steps):
-            run_training_step(train_runtime["pipeline"], train_iter)
+            run_training_step(
+                train_runtime["pipeline"],
+                train_iter,
+                train_runtime.get("hotstate_training_controller"),
+                step=training_step,
+            )
+            training_step += 1
+        if train_runtime.get("hotstate_training_controller") is not None:
+            record["training_hotstate_after_warmup"] = train_runtime[
+                "hotstate_training_controller"
+            ].snapshot()
         warmup_kv_metrics = []
         for idx in range(warmup_infer_batches):
             seq_endptrs = inference_requests[idx][2]
@@ -996,20 +1261,30 @@ def run_policy_benchmark(
         }
 
         infer_index = warmup_infer_batches
-        for _ in range(measure_cycles):
-            train_latencies_ms.append(
-                run_training_step(train_runtime["pipeline"], train_iter)
+        for cycle_idx in range(measure_cycles):
+            train_latency_ms = run_training_step(
+                train_runtime["pipeline"],
+                train_iter,
+                train_runtime.get("hotstate_training_controller"),
+                step=training_step,
             )
+            train_latencies_ms.append(train_latency_ms)
+            training_step += 1
+            cycle_requests = []
+            cycle_infer_latencies = []
             for _ in range(infer_batches_per_cycle):
+                request = inference_requests[infer_index]
                 infer_latency_ms, metrics = run_inference_step(
                     infer_runtime["model"],
                     inference_dataset,
-                    inference_requests[infer_index],
+                    request,
                     infer_spec["num_contextual_features"],
                     debug_label=f"measure[{infer_index}]",
                 )
                 infer_index += 1
                 infer_latencies_ms.append(infer_latency_ms)
+                cycle_infer_latencies.append(float(infer_latency_ms))
+                cycle_requests.append(request_fingerprint(request))
                 infer_metric_agg["new_tokens_total"] += metrics["new_tokens"]
                 infer_metric_agg["num_offload_pages_total"] += metrics["num_offload_pages"]
                 if metrics["origin_cached_lengths"]:
@@ -1017,6 +1292,33 @@ def run_policy_benchmark(
                         infer_metric_agg["max_origin_cached_length"],
                         max(metrics["origin_cached_lengths"]),
                     )
+
+            cycle_trace.append(
+                {
+                    "cycle": int(cycle_idx),
+                    "policy": policy["policy"],
+                    "training_latency_ms": float(train_latency_ms),
+                    "inference_latency_ms": [
+                        float(value) for value in cycle_infer_latencies
+                    ],
+                    "inference_mean_ms": float(
+                        statistics.fmean(cycle_infer_latencies)
+                        if cycle_infer_latencies else 0.0
+                    ),
+                    "combined_cycle_latency_ms": float(
+                        train_latency_ms + sum(cycle_infer_latencies)
+                    ),
+                    "request_fingerprints": cycle_requests,
+                    "cycle_fingerprint": hashlib.sha256(
+                        "".join(cycle_requests).encode("ascii")
+                    ).hexdigest(),
+                    "physical_state_bytes": int(physical_state_bytes),
+                    "inference_state_budget_bytes": int(
+                        policy["inference_state_budget_bytes"]
+                    ),
+                    "memory": record_memory_snapshot(f"cycle_{cycle_idx}"),
+                }
+            )
 
         record["memory_end"] = record_memory_snapshot("end")
         train_summary = summarize_metrics(train_latencies_ms)
@@ -1033,8 +1335,14 @@ def run_policy_benchmark(
                 "measured_cycles": int(measure_cycles),
                 "measured_infer_batches": int(len(infer_latencies_ms)),
                 "kv_metrics": infer_metric_agg,
+                "cycle_trace": cycle_trace,
+                "evidence_scope": "measured_training_and_inference_under_fixed_policy",
             }
         )
+        if train_runtime.get("hotstate_training_controller") is not None:
+            record["training_hotstate_end"] = train_runtime[
+                "hotstate_training_controller"
+            ].snapshot()
     except RuntimeError as exc:
         if "out of memory" in str(exc).lower():
             record["status"] = "oom"
@@ -1047,6 +1355,20 @@ def run_policy_benchmark(
     finally:
         print_record_summary(record)
         append_jsonl(out_jsonl, record)
+        for cycle in cycle_trace:
+            append_jsonl(
+                out_jsonl,
+                {
+                    "record_type": "cycle",
+                    "benchmark_variant": record["benchmark_variant"],
+                    "implementation_scope": record["implementation_scope"],
+                    "state_budget_bytes": record["state_budget_bytes"],
+                    "inference_state_budget_bytes": record[
+                        "inference_state_budget_bytes"
+                    ],
+                    **cycle,
+                },
+            )
         teardown_runtime(train_runtime)
         teardown_runtime(infer_runtime)
     return record
@@ -1130,6 +1452,11 @@ def run_mixed_mode(
     infer_spec: Dict[str, Any],
     budget_plan: Dict[str, Any],
 ) -> None:
+    out_jsonl = Path(args.out_jsonl)
+    out_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    # One invocation owns one evidence trace; stale policy rows would invalidate
+    # paired comparisons while remaining syntactically valid JSONL.
+    out_jsonl.write_text("", encoding="utf-8")
     train_loader, _ = build_training_loaders(train_spec)
     total_infer_batches_needed = args.warmup_infer_batches + (
         args.measure_cycles * args.infer_batches_per_cycle
@@ -1248,6 +1575,7 @@ def run_mixed_mode(
     summary_records = policy_records + oracle_records
     for record in summary_records:
         print_record_summary(record)
+    append_jsonl(out_jsonl, build_mixed_evidence_summary(summary_records))
 
 
 def parse_args():
@@ -1312,4 +1640,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

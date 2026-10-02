@@ -19,6 +19,7 @@
 ******************************************************************************/
 
 #include "kvcache_manager_impl.h"
+#include <algorithm>
 #include <nvtx3/nvtx3.hpp>
 #ifdef USE_NVCOMP
 #include "nvcomp/ans.h"
@@ -363,6 +364,7 @@ HostKVStorageImpl::~HostKVStorageImpl()
 {}
 
 int64_t HostKVStorageImpl::get_kvdata_length(int64_t user_id) {
+    std::unique_lock<std::mutex> lock(host_kvcache_mutex_);
     auto it = _uid_to_length.find(user_id);
     if (it ==  _uid_to_length.end()) return 0;
     return it->second;
@@ -619,10 +621,12 @@ GPUKVCacheMangerImpl::~GPUKVCacheMangerImpl()
 }
 
 int64_t GPUKVCacheMangerImpl::get_empty_page_count() {
+    std::lock_guard<std::recursive_mutex> lock(allocation_mutex_);
     return static_cast<int64_t>(_empty_pages.size());
 }
 
 int64_t GPUKVCacheMangerImpl::get_user_page_count(int64_t uid) {
+    std::lock_guard<std::recursive_mutex> lock(allocation_mutex_);
     auto it = _uid_to_page_id.find(uid);
     return (it != _uid_to_page_id.end())
         ? static_cast<int64_t>(it->second.size())
@@ -630,14 +634,17 @@ int64_t GPUKVCacheMangerImpl::get_user_page_count(int64_t uid) {
 }
 
 int64_t GPUKVCacheMangerImpl::get_active_page_limit() {
+    std::lock_guard<std::recursive_mutex> lock(allocation_mutex_);
     return static_cast<int64_t>(_active_page_limit);
 }
 
 int64_t GPUKVCacheMangerImpl::get_withheld_page_count() {
+    std::lock_guard<std::recursive_mutex> lock(allocation_mutex_);
     return static_cast<int64_t>(_withheld_pages.size());
 }
 
 int64_t GPUKVCacheMangerImpl::get_resident_page_count() {
+    std::lock_guard<std::recursive_mutex> lock(allocation_mutex_);
     int64_t resident = 0;
     for (const auto& kv : _uid_to_page_id) {
         resident += static_cast<int64_t>(kv.second.size());
@@ -646,16 +653,28 @@ int64_t GPUKVCacheMangerImpl::get_resident_page_count() {
 }
 
 bool GPUKVCacheMangerImpl::has_user(int64_t uid) {
+    std::lock_guard<std::recursive_mutex> lock(allocation_mutex_);
     return _lru_lookup_table.find(uid) != _lru_lookup_table.end();
 }
 
+bool GPUKVCacheMangerImpl::is_user_offload_frozen(int64_t uid) {
+    std::unique_lock<std::mutex> lock(offload_freezed_uids_mtx_);
+    auto it = offload_freezed_uids_.find(uid);
+    return it != offload_freezed_uids_.end() && it->second > 0;
+}
+
 bool GPUKVCacheMangerImpl::evict_if_present(int64_t uid) {
+    std::lock_guard<std::recursive_mutex> lock(allocation_mutex_);
+    // The offload worker may still be reading these pages.  Releasing the
+    // mapping here would let allocation recycle a page before D2H completes.
+    if (is_user_offload_frozen(uid)) return false;
     if (!has_user(uid)) return false;
     evict(uid);
     return true;
 }
 
 void GPUKVCacheMangerImpl::set_active_page_limit(int new_limit) {
+    std::lock_guard<std::recursive_mutex> lock(allocation_mutex_);
     int current_active = num_primary_cache_pages - (int)_withheld_pages.size();
     if (new_limit > num_primary_cache_pages)
         new_limit = num_primary_cache_pages;
@@ -683,6 +702,7 @@ void GPUKVCacheMangerImpl::set_active_page_limit(int new_limit) {
 }
 
 int64_t GPUKVCacheMangerImpl::getUIdToEvict(std::unordered_set<int64_t> extra_freezed_uids) {
+    std::lock_guard<std::recursive_mutex> lock(allocation_mutex_);
     while (true) {
         int num_offloading_uids = 0;
         {
@@ -706,6 +726,7 @@ int64_t GPUKVCacheMangerImpl::getUIdToEvict(std::unordered_set<int64_t> extra_fr
 };
 
 std::vector<int32_t>& GPUKVCacheMangerImpl::alloc(int64_t uid, int new_total_length, std::unordered_set<int64_t> freezed_uids) {
+    std::lock_guard<std::recursive_mutex> lock(allocation_mutex_);
     int cur_cached_start = 0;
     int cur_cached_len = 0;
     // int padding_last_page = 0;
@@ -716,9 +737,11 @@ std::vector<int32_t>& GPUKVCacheMangerImpl::alloc(int64_t uid, int new_total_len
         cur_cached_len = _uid_to_paged_cache_length[uid];
     } else {
         _uid_to_page_id[uid] = std::vector<int32_t>();
-        if (_uid_to_offloaded_length.find(uid) != _uid_to_offloaded_length.end()) {
-            _uid_to_paged_cache_startpos[uid] = _uid_to_offloaded_length[uid];
-            cur_cached_start = _uid_to_offloaded_length[uid];
+        std::unique_lock<std::mutex> lock(queued_offload_lastpos_mutex_);
+        auto offloaded_it = _uid_to_offloaded_length.find(uid);
+        if (offloaded_it != _uid_to_offloaded_length.end()) {
+            _uid_to_paged_cache_startpos[uid] = offloaded_it->second;
+            cur_cached_start = offloaded_it->second;
         }
         else {
             _uid_to_paged_cache_startpos[uid] = 0;
@@ -747,16 +770,20 @@ std::vector<int32_t>& GPUKVCacheMangerImpl::alloc(int64_t uid, int new_total_len
 };
 
 std::vector<int32_t> GPUKVCacheMangerImpl::get_total_cache_length(std::vector<int64_t>& uids) {
+    std::lock_guard<std::recursive_mutex> lock(allocation_mutex_);
     int batch_size = uids.size();
     std::vector<int32_t> total_cached_lengths(batch_size);
     for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
         int64_t uid = uids[seq_idx];
         if (_uid_to_paged_cache_startpos.find(uid) != _uid_to_paged_cache_startpos.end()) {
             total_cached_lengths[seq_idx] = _uid_to_paged_cache_startpos[uid] + _uid_to_paged_cache_length[uid];
-        } else if (_uid_to_offloaded_length.find(uid) != _uid_to_offloaded_length.end())
-            total_cached_lengths[seq_idx] = _uid_to_offloaded_length[uid];
-        else {
-            total_cached_lengths[seq_idx] = 0;
+        } else {
+            std::unique_lock<std::mutex> lock(queued_offload_lastpos_mutex_);
+            auto offloaded_it = _uid_to_offloaded_length.find(uid);
+            total_cached_lengths[seq_idx] =
+                offloaded_it == _uid_to_offloaded_length.end()
+                ? 0
+                : offloaded_it->second;
         }
     }
     return total_cached_lengths;
@@ -764,6 +791,7 @@ std::vector<int32_t> GPUKVCacheMangerImpl::get_total_cache_length(std::vector<in
     
 void GPUKVCacheMangerImpl::evict(int64_t uid)
 {
+    std::lock_guard<std::recursive_mutex> lock(allocation_mutex_);
     auto const tableIt = _lru_lookup_table.find(uid);
     assert(_lru_lookup_table.end() != tableIt);
     // if (_lru_lookup_table.end() != tableIt) {
@@ -783,6 +811,7 @@ void GPUKVCacheMangerImpl::evict(int64_t uid)
 
 void GPUKVCacheMangerImpl::evict_all()
 {
+    std::lock_guard<std::recursive_mutex> lock(allocation_mutex_);
     std::queue<int64_t> empty_pages;
     std::swap(_empty_pages, empty_pages);
     _lru_list.clear();
@@ -805,6 +834,7 @@ void GPUKVCacheMangerImpl::evict_all()
 };
 
 void GPUKVCacheMangerImpl::invalid(int64_t uid) {
+    std::lock_guard<std::recursive_mutex> lock(allocation_mutex_);
     auto const tableIt = _lru_lookup_table.find(uid);
     if (_lru_lookup_table.end() != tableIt) {
         _lru_list.erase(tableIt->second);
@@ -817,12 +847,17 @@ void GPUKVCacheMangerImpl::invalid(int64_t uid) {
         _uid_to_page_id.erase(uid);
         _uid_to_paged_cache_startpos.erase(uid);
         _uid_to_paged_cache_length.erase(uid);
-        _uid_to_offloaded_length.erase(uid);
+        {
+            std::unique_lock<std::mutex> lock(queued_offload_lastpos_mutex_);
+            _uid_to_offloaded_length.erase(uid);
+            queued_offload_lastpos.erase(uid);
+        }
     }
 };
 
 bool GPUKVCacheMangerImpl::retain(int64_t uid)
 {
+    std::lock_guard<std::recursive_mutex> lock(allocation_mutex_);
     auto const tableIt = _lru_lookup_table.find(uid);
     bool found = (_lru_lookup_table.end() != tableIt);
     if (found) {
@@ -844,6 +879,7 @@ uint16_t *GPUKVCacheMangerImpl::get_cache_table_by_layer(int layer_idx) {
 void GPUKVCacheMangerImpl::onload_kvcache(
     std::vector<int64_t>& user_ids, 
     KVOnloadHandle& onloadhandle) {
+    std::lock_guard<std::recursive_mutex> allocation_lock(allocation_mutex_);
     const c10::cuda::OptionalCUDAGuard device_guard(this->device);
 
     const int batch_size = user_ids.size();
@@ -855,10 +891,14 @@ void GPUKVCacheMangerImpl::onload_kvcache(
         auto uid = user_ids[seq_idx];
         if (this->_uid_to_paged_cache_startpos.find(uid) != this->_uid_to_paged_cache_startpos.end())
             onload_length[seq_idx] = this->_uid_to_paged_cache_startpos[uid];
-        else if (this->_uid_to_offloaded_length.find(uid) != this->_uid_to_offloaded_length.end())
-            onload_length[seq_idx] = this->_uid_to_offloaded_length[uid];
-        else
-            onload_length[seq_idx] = 0;
+        else {
+            std::unique_lock<std::mutex> lock(queued_offload_lastpos_mutex_);
+            auto offloaded_it = this->_uid_to_offloaded_length.find(uid);
+            onload_length[seq_idx] =
+                offloaded_it == this->_uid_to_offloaded_length.end()
+                ? 0
+                : offloaded_it->second;
+        }
 
         onload_offsets[seq_idx + 1] = onload_offsets[seq_idx] + onload_length[seq_idx];
     }
@@ -911,7 +951,7 @@ void GPUKVCacheMangerImpl::onload_kvcache(
     }
 };
 
-void GPUKVCacheMangerImpl::offload_kvcache(
+bool GPUKVCacheMangerImpl::offload_kvcache(
     KVOffloadHandle& offload_handle,
     at::Tensor offload_user_ids,      // host
     at::Tensor offload_page_ids,      // gpu
@@ -922,12 +962,39 @@ void GPUKVCacheMangerImpl::offload_kvcache(
     const size_t num_offload_uids = offload_user_ids.numel();
     {
         std::unique_lock<std::mutex> lock(queued_offload_lastpos_mutex_);
-        if (queued_offload_tokens >= queued_offload_limits) {
-            return;
-        }
+        size_t requested_tokens = 0;
+        auto* lengths = static_cast<int*>(new_offload_lengths.data_ptr());
         for (size_t seq_idx = 0; seq_idx < num_offload_uids; seq_idx++) {
-            queued_offload_tokens += ((int*)new_offload_lengths.data_ptr())[seq_idx];
+            requested_tokens += static_cast<size_t>(std::max(0, lengths[seq_idx]));
         }
+        const bool exceeds_limit =
+            requested_tokens > queued_offload_limits ||
+            queued_offload_tokens > queued_offload_limits - requested_tokens;
+        if (exceeds_limit) {
+            // prepare_kvcache reserves the next logical offload position before
+            // this queue admission decision.  Revert only our reservation so a
+            // rejected task is never mistaken for queued or durable host state.
+            auto* uids = static_cast<int64_t*>(offload_user_ids.data_ptr());
+            auto* starts = static_cast<int*>(new_offload_startpos.data_ptr());
+            for (size_t seq_idx = 0; seq_idx < num_offload_uids; seq_idx++) {
+                auto it = queued_offload_lastpos.find(uids[seq_idx]);
+                const int reserved_end = starts[seq_idx] + lengths[seq_idx];
+                if (it != queued_offload_lastpos.end() && it->second == reserved_end) {
+                    auto durable_it = _uid_to_offloaded_length.find(uids[seq_idx]);
+                    const int durable_end =
+                        durable_it == _uid_to_offloaded_length.end()
+                        ? 0
+                        : durable_it->second;
+                    if (starts[seq_idx] > durable_end) {
+                        it->second = starts[seq_idx];
+                    } else {
+                        queued_offload_lastpos.erase(it);
+                    }
+                }
+            }
+            return false;
+        }
+        queued_offload_tokens += requested_tokens;
     }
 
     std::vector<int> offload_host_metadata(4*num_offload_uids);
@@ -964,13 +1031,24 @@ void GPUKVCacheMangerImpl::offload_kvcache(
     }
 
     offload_task_cv_.notify_one();
+    return true;
 };
 
 bool GPUKVCacheMangerImpl::is_busy_offloading() {
-    return !offload_task_queue.empty() || this->offload_busy_.load();
+    bool queued = false;
+    {
+        std::unique_lock<std::mutex> lock(offload_task_mutex_);
+        queued = !offload_task_queue.empty();
+    }
+    return queued || this->offload_busy_.load();
+}
+
+uint64_t GPUKVCacheMangerImpl::get_completed_offload_count() const {
+    return completed_offload_count_.load();
 }
 
 void GPUKVCacheMangerImpl::init_random_offload_status(int64_t user_id, size_t length) {
+    std::unique_lock<std::mutex> lock(queued_offload_lastpos_mutex_);
     _uid_to_offloaded_length[user_id] = length;
 }
 
@@ -1067,19 +1145,6 @@ void GPUKVCacheMangerImpl::offload_loop()
                         num_d2d_pages,
                         k_num_sms,
                         this->offload_stream);
-                    // release on gpu kvcache
-                    if (last_layer && chunk_idx + this->num_offload_device_chunks >= num_chunks_per_layer) {
-                        cudaCheck(cudaStreamSynchronize(this->offload_stream));
-                        std::unique_lock<std::mutex> lock(offload_freezed_uids_mtx_);
-                        for (int idx = 0; idx < num_offload_uids; idx++) {
-                            int cur_freezed_times = offload_freezed_uids_[offload_uids[idx]];
-                            if (cur_freezed_times == 1) {
-                                offload_freezed_uids_.erase(offload_uids[idx]);
-                            } else {
-                                offload_freezed_uids_[offload_uids[idx]] = cur_freezed_times - 1;
-                            }
-                        }
-                    }
                     if (this->enable_nvcomp) {
                         compressor.compress(
                             comp_bytes_per_chunk.data() + layer_idx * num_chunks_per_layer + chunk_idx,
@@ -1156,11 +1221,12 @@ void GPUKVCacheMangerImpl::offload_loop()
                         host_kv_mgr->append_kvdata(uid, offload_startpos[seq_idx], offload_lengths[seq_idx], 
                                                         input_ptr, gather_layer_stride,
                                                         comp_bytes_per_chunk.data() + page_offset / num_pages_per_chunk, num_chunks_per_layer);
-                    this->_uid_to_offloaded_length[uid] = offload_startpos[seq_idx] + offload_lengths[seq_idx];
                     page_offset += offload_lengths[seq_idx] / this->num_tokens_per_page;
 
                     {
                         std::unique_lock<std::mutex> lock(queued_offload_lastpos_mutex_);
+                        this->_uid_to_offloaded_length[uid] =
+                            offload_startpos[seq_idx] + offload_lengths[seq_idx];
                         if (offload_startpos[seq_idx] + offload_lengths[seq_idx] == queued_offload_lastpos[uid]) {
                             queued_offload_lastpos.erase(uid);
                         }
@@ -1169,6 +1235,22 @@ void GPUKVCacheMangerImpl::offload_loop()
                 }
             }
 
+            // Pages remain protected until the host append above has made the
+            // copied suffix durable.  Releasing the freeze earlier permits a
+            // concurrent eviction to recycle pages while D2H is still using
+            // them.
+            {
+                std::unique_lock<std::mutex> lock(offload_freezed_uids_mtx_);
+                for (int idx = 0; idx < num_offload_uids; idx++) {
+                    int64_t uid = offload_uids[idx];
+                    auto it = offload_freezed_uids_.find(uid);
+                    if (it == offload_freezed_uids_.end()) continue;
+                    if (it->second <= 1) offload_freezed_uids_.erase(it);
+                    else --it->second;
+                }
+            }
+
+            this->completed_offload_count_.fetch_add(1);
             this->offload_busy_.store(false);
         }
 
@@ -1188,6 +1270,7 @@ void prepare_kvcache(
     at::Tensor metadata_gpu_buffer) {
 
     const c10::cuda::OptionalCUDAGuard device_guard(gpu_mgr.device);
+    std::lock_guard<std::recursive_mutex> allocation_lock(gpu_mgr.allocation_mutex_);
 
     int batch_size = user_ids.size();
 
@@ -1249,10 +1332,10 @@ void prepare_kvcache(
 
         auto offloaded_length = 0;
         auto chunked_length = total_history_length - total_history_length % gpu_mgr.num_tokens_per_chunk;
-        if (gpu_mgr._uid_to_offloaded_length.find(uid) != gpu_mgr._uid_to_offloaded_length.end())
-            offloaded_length = gpu_mgr._uid_to_offloaded_length[uid];
         {
             std::unique_lock<std::mutex> lock(gpu_mgr.queued_offload_lastpos_mutex_);
+            if (gpu_mgr._uid_to_offloaded_length.find(uid) != gpu_mgr._uid_to_offloaded_length.end())
+                offloaded_length = gpu_mgr._uid_to_offloaded_length[uid];
             if (gpu_mgr.queued_offload_lastpos.find(uid) != gpu_mgr.queued_offload_lastpos.end()) {
                 offloaded_length = gpu_mgr.queued_offload_lastpos[uid];
             }

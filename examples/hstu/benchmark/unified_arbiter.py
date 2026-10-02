@@ -12,7 +12,7 @@ Example:
     torchrun --nproc_per_node 1 --master_addr localhost --master_port 6064 \
       --module benchmark.unified_arbiter \
       --max-history-seqlen 4096 --max-num-candidates 100 --max-incremental-seqlen 64 \
-      --num-users 8 --total-hbm-budget-gib 1.0 --warmup-ratio 0.1 \
+      --num-users 8 --state-hbm-budget-gib 1.0 --warmup-ratio 0.1 \
       --thresholds "3072:50:50" --default-split "70:30" \
       --out-jsonl ./logs/arbiter_trace.jsonl
 """
@@ -48,7 +48,15 @@ from configs import (
 )
 from inference_ranking_gr import get_inference_ranking_gr
 import math
+from benchmark.evidence import (
+    EvidenceValidationError,
+    compare_static_baseline,
+    evidence_summary,
+    load_jsonl,
+    validate_hotstate_trace,
+)
 from modules.hotstate.admission_adapter import HotStateAdmissionStrategy
+from modules.hotstate.physical_budget import plan_physical_budget
 
 # ── Constants ────────────────────────────────────────────────────────────────
 DEFAULT_KV_PAGE_SIZE = 32
@@ -63,7 +71,10 @@ def count_dataset_batches(max_history_length, max_incremental_seqlen, num_users)
 
 
 def build_inference_model(hidden_dim, num_layers, num_heads, head_dim, dtype,
-                          max_seqlen, blocks_in_primary_pool, max_batch_size=1, hotstate_admit_strategy=None, hotstate_admission_counters=None):
+                          max_seqlen, blocks_in_primary_pool, max_batch_size=1,
+                          hotstate_admit_strategy=None,
+                          hotstate_admission_counters=None,
+                          dynamic_embedding_hbm_bytes=0):
     hstu_config = get_inference_hstu_config(
         hidden_size=hidden_dim,
         num_layers=num_layers,
@@ -100,6 +111,7 @@ def build_inference_model(hidden_dim, num_layers, num_heads, head_dim, dtype,
         use_cudagraph=False,
         hotstate_admit_strategy=hotstate_admit_strategy,
         hotstate_admission_counters=hotstate_admission_counters,
+        dynamic_embedding_hbm_bytes=dynamic_embedding_hbm_bytes,
     )
     if dtype == torch.bfloat16:
         model.bfloat16()
@@ -164,6 +176,13 @@ def teardown_model(model, wait_for_workers=True):
     del model
     gc.collect()
     torch.cuda.empty_cache()
+
+
+def cuda_memory_info_record():
+    if not torch.cuda.is_available():
+        return {"free_bytes": None, "total_bytes": None}
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    return {"free_bytes": int(free_bytes), "total_bytes": int(total_bytes)}
 
 # ── Threshold Policy ─────────────────────────────────────────────────────────
 
@@ -418,32 +437,65 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
                          measure_batches, num_users, out_jsonl,
                          hidden_dim, num_layers, num_heads, head_dim,
                          dtype, max_seqlen, total_hbm_bytes, hotstate_trace_detail="scalar",
+                         state_hbm_budget_bytes=None,
+                         embedding_hbm_ratio=0.50,
                          skip_hotstate_kv_handles_for_admission_smoke=False,
                          hotstate_admission_smoke_max_keys=None,
                          hotstate_admission_admit_all_control=False,
                          hotstate_admission_batch_order_control=False,
                          hotstate_value_kv_ms_per_1k_tokens=3.5,
-                         hotstate_value_emb_ms_per_key=1.5):
+                         hotstate_value_emb_ms_per_key=1.5,
+                         hotstate_transfer_scheduler=True,
+                         static_baseline_jsonl=None,
+                         require_static_baseline=False):
     """Run with full HotState controller — zero rebuilds, self-discovering."""
 
-    # Build ONE model with max KV pages
-    max_pages = compute_split_params(total_hbm_bytes, 20, 80,
-        num_layers, num_heads, head_dim, DEFAULT_KV_PAGE_SIZE, dtype)[2]
-    
-    hotstate_admit_strategy = HotStateAdmissionStrategy(admit_all_when_empty=True)
+    state_budget = int(
+        total_hbm_bytes if state_hbm_budget_bytes is None else state_hbm_budget_bytes
+    )
+    budget_plan = plan_physical_budget(
+        state_budget_bytes=state_budget,
+        embedding_hbm_ratio=embedding_hbm_ratio,
+        num_layers=num_layers,
+        num_kv_heads=num_heads,
+        head_dim=head_dim,
+        num_tokens_per_page=DEFAULT_KV_PAGE_SIZE,
+        max_batch_size=1,
+        max_sequence_length=max_seqlen * 2,
+        num_tokens_per_chunk=DEFAULT_OFFLOAD_CHUNKSIZE,
+    )
+    max_pages = budget_plan.blocks_in_primary_pool
 
+    smoke_mode = bool(
+        skip_hotstate_kv_handles_for_admission_smoke
+        or hotstate_admission_smoke_max_keys is not None
+        or hotstate_admission_admit_all_control
+        or hotstate_admission_batch_order_control
+    )
+    hotstate_admit_strategy = (
+        HotStateAdmissionStrategy(admit_all_when_empty=True) if smoke_mode else None
+    )
+
+    cuda_before_model = cuda_memory_info_record()
     model = build_inference_model(hidden_dim, num_layers, num_heads,
-                                  head_dim, dtype, max_seqlen, max_pages, hotstate_admit_strategy=hotstate_admit_strategy,)
+                                  head_dim, dtype, max_seqlen, max_pages,
+                                  hotstate_admit_strategy=hotstate_admit_strategy,
+                                  dynamic_embedding_hbm_bytes=budget_plan.embedding_hbm_bytes)
+    cuda_after_model = cuda_memory_info_record()
 
     emb_module = model.sparse_module
 
     model.dense_module.enable_hotstate(
-        total_hbm_bytes=total_hbm_bytes,
+        total_hbm_bytes=state_budget,
+        configured_state_budget_bytes=state_budget,
         skip_kv_handles_for_admission_smoke=skip_hotstate_kv_handles_for_admission_smoke,
         admission_smoke_max_admitted_keys=hotstate_admission_smoke_max_keys,
+        cuda_memory_before_construction=cuda_before_model,
+        cuda_memory_after_construction=cuda_after_model,
     )
     model.dense_module.set_hotstate_embedding_module(emb_module)
     controller = model.dense_module.hotstate
+    physical_initial = controller.validate_physical_budget()
 
     controller.num_users = num_users
     controller.admission_batch_order_control = hotstate_admission_batch_order_control
@@ -453,15 +505,17 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
     )
 
     controller.admission_admit_all_control = hotstate_admission_admit_all_control
+    controller.enable_transfer_scheduler = bool(hotstate_transfer_scheduler)
 
     controller.set_trace_detail(hotstate_trace_detail)
 
     print(f"Trace detail: {hotstate_trace_detail}")
 
     print(f"=== HotState: Unified HBM Control Plane ===")
-    print(f"Total HBM: {total_hbm_bytes / 1024**3:.2f} GiB")
-    print(f"KV pages: {max_pages} (max), dynamically managed")
-    print(f"Embedding: hot/cold row-group granularity")
+    print(f"State HBM budget: {state_budget / 1024**3:.2f} GiB")
+    print(f"Embedding HBM plan: {budget_plan.embedding_hbm_bytes / 1024**3:.3f} GiB")
+    print(f"KV primary pages: {max_pages} (fixed physical pool)")
+    print(f"Measured state HBM: {physical_initial['managed_state_physical_hbm_bytes']} bytes")
     print(f"")
 
     dataset._iloc = 0
@@ -473,9 +527,14 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
     for _ in range(warmup_batches):
         batch, uids, thl = next(it)
         controller.before_batch(batch, uids, thl)
+        torch.cuda.synchronize()
+        warmup_start = time.perf_counter()
         with torch.inference_mode():
             model.forward_with_kvcache(batch, uids, thl)
         torch.cuda.synchronize()
+        controller.after_batch(
+            batch, (time.perf_counter() - warmup_start) * 1000.0
+        )
 
     # Measure
     trace_records = []
@@ -495,8 +554,8 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
         offload_pages = None
         max_seqlen = None
 
-        accepts_before = int(hotstate_admit_strategy.num_accepted)
-        rejects_before = int(hotstate_admit_strategy.num_rejected)
+        accepts_before = int(hotstate_admit_strategy.num_accepted) if hotstate_admit_strategy else 0
+        rejects_before = int(hotstate_admit_strategy.num_rejected) if hotstate_admit_strategy else 0
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -507,8 +566,8 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
         torch.cuda.synchronize()
         latency_ms = (time.perf_counter() - t0) * 1000.0
 
-        accepts_after = int(hotstate_admit_strategy.num_accepted)
-        rejects_after = int(hotstate_admit_strategy.num_rejected)
+        accepts_after = int(hotstate_admit_strategy.num_accepted) if hotstate_admit_strategy else 0
+        rejects_after = int(hotstate_admit_strategy.num_rejected) if hotstate_admit_strategy else 0
         accept_delta = accepts_after - accepts_before
         reject_delta = rejects_after - rejects_before
 
@@ -535,6 +594,7 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
         post_control_start = time.perf_counter()
         post_control = controller.after_batch(batch, latency_ms)
         hotstate_post_control_ms = (time.perf_counter() - post_control_start) * 1000.0
+        physical_after = controller.physical_hbm_snapshot()
 
         hist_len = thl[0].item() // 2
         user_id = int(uids[0].item())
@@ -546,7 +606,7 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
             empty_kv_pages = None
             withheld_kv_pages = None
             logical_kv_budget_bytes = None
-            physical_kv_cache_bytes = None
+            kv_primary_pool_capacity_bytes = None
             actual_resident_kv_bytes = None
         else:
             active_kv_page_limit = controller.kv_adapter.get_current_page_limit()
@@ -554,16 +614,19 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
             empty_kv_pages = controller.kv_adapter.get_empty_page_count()
             withheld_kv_pages = controller.kv_adapter.get_withheld_page_count()
             logical_kv_budget_bytes = controller.kv_adapter.logical_kv_budget_bytes()
-            physical_kv_cache_bytes = controller.kv_adapter.physical_kv_cache_bytes()
+            kv_primary_pool_capacity_bytes = controller.kv_adapter.physical_kv_cache_bytes()
             actual_resident_kv_bytes = controller.kv_adapter.actual_resident_kv_bytes()
 
         trace_records.append({
+            "record_type": "hotstate",
             "split": "hotstate",
             "split_lhs": 0, "split_rhs": 0,
-            "kv_page_budget": control["kv_page_budget"],
-            "hbm_bytes_used": control["hbm_bytes_used"],
-            "evicted": control["evicted"],
-            "admitted": control["admitted"],
+            "policy_planned_kv_page_budget": control["kv_page_budget"],
+            "policy_planned_hbm_bytes": control.get(
+                "policy_planned_hbm_bytes", control.get("planned_hbm_bytes", 0)
+            ),
+            "policy_planned_evicted": control.get("evicted", []),
+            "policy_planned_admitted": control.get("admitted", []),
             "batch_idx": i,
             "latency_ms": latency_ms,
             "latency_semantics": "inference_only",
@@ -573,12 +636,12 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
             "seq_history_len": hist_len,
             "user_id": user_id,
             "epoch": control["epoch"],
-            "active_kv_page_limit": active_kv_page_limit,
+            "logical_kv_page_limit": active_kv_page_limit,
             "resident_kv_pages": resident_kv_pages,
             "empty_kv_pages": empty_kv_pages,
             "withheld_kv_pages": withheld_kv_pages,
             "logical_kv_budget_bytes": logical_kv_budget_bytes,
-            "physical_kv_cache_bytes": physical_kv_cache_bytes,
+            "kv_primary_pool_capacity_bytes": kv_primary_pool_capacity_bytes,
             "actual_resident_kv_bytes": actual_resident_kv_bytes,
             "origin_cached_length": origin_cached_length,
             "max_origin_cached_length": max_origin_cached_length,
@@ -591,29 +654,68 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
             "state_trace": control.get("state_trace", []),
             "post_num_state_handles": post_control.get("post_num_state_handles", 0),
             "post_state_trace": post_control.get("post_state_trace", []),
-            "selected_hbm_bytes": control.get("selected_hbm_bytes", 0),
-            "selected_kv_bytes": control.get("selected_kv_bytes", 0),
-            "selected_embedding_bytes": control.get("selected_embedding_bytes", 0),
-            "embedding_admission_policy_size": hotstate_admit_strategy.last_policy_size,
-            "embedding_admission_accepts": hotstate_admit_strategy.num_accepted,
-            "embedding_admission_rejects": hotstate_admit_strategy.num_rejected,
-            "embedding_admission_calls": hotstate_admit_strategy.num_admit_calls,
+            "online_cost_model": post_control.get(
+                "online_cost_model", control.get("online_cost_model", {})
+            ),
+            "transfer_execution": control.get("transfer_execution", {}),
+            "staged_kv_request": control.get("staged_kv_request", {}),
+            "transfer_scheduler_before_forward": control.get(
+                "transfer_scheduler", {}
+            ),
+            "transfer_scheduler_after_forward": post_control.get(
+                "transfer_scheduler", {}
+            ),
+            "policy_planned_hbm_bytes": control.get("planned_hbm_bytes", 0),
+            "policy_planned_kv_bytes": control.get("planned_kv_bytes", 0),
+            "policy_planned_embedding_bytes": control.get("planned_embedding_bytes", 0),
+            "embedding_admission_policy_size": hotstate_admit_strategy.last_policy_size if hotstate_admit_strategy else 0,
+            "embedding_admission_accepts": hotstate_admit_strategy.num_accepted if hotstate_admit_strategy else 0,
+            "embedding_admission_rejects": hotstate_admit_strategy.num_rejected if hotstate_admit_strategy else 0,
+            "embedding_admission_calls": hotstate_admit_strategy.num_admit_calls if hotstate_admit_strategy else 0,
             "hotstate_admission_smoke_max_keys": hotstate_admission_smoke_max_keys,
             "embedding_admission_budget_bytes": control.get("embedding_admission_budget_bytes", 0),
             "embedding_admission_budget_keys": control.get("embedding_admission_budget_keys", 0),
             "embedding_admission_max_keys": control.get("embedding_admission_max_keys", None),
-            "embedding_selected_budget_bytes": control.get("embedding_selected_budget_bytes", 0),
+            "embedding_planned_budget_bytes": control.get("embedding_planned_budget_bytes", 0),
             "embedding_kv_reserved_bytes": control.get("embedding_kv_reserved_bytes", 0),
             "embedding_residual_budget_bytes": control.get("embedding_residual_budget_bytes", 0),
             "embedding_requested_unique_keys": control.get("embedding_requested_unique_keys", 0),
             "embedding_admission_cap_source": control.get("embedding_admission_cap_source", ""),
             "embedding_admission_order": control.get("embedding_admission_order", ""),
             "embedding_requested_keys": control.get("embedding_requested_keys", []),
-            "embedding_selected_policy_keys": control.get("embedding_selected_policy_keys", []),
+            "embedding_planned_policy_keys": control.get("embedding_planned_policy_keys", []),
             "embedding_rejected_policy_keys": control.get("embedding_rejected_policy_keys", []),
             "embedding_admission_accept_delta": accept_delta,
             "embedding_admission_reject_delta": reject_delta,
             "embedding_admission_trace": control.get("embedding_admission_trace", []),
+            "planned_embedding_action_keys": control.get("planned_embedding_action_keys", []),
+            "planned_kv_eviction_keys": control.get("planned_kv_eviction_keys", []),
+            "physical_admitted_keys": control.get("physical_admitted_keys", []),
+            "physical_evicted_keys": control.get("physical_evicted_keys", []),
+            "directory_pending_transfers": control.get("directory_pending_transfers", 0),
+            "directory_state": control.get("directory_state", []),
+            "directory_history_tail": control.get("directory_history_tail", []),
+            "post_directory_state": post_control.get("post_directory_state", []),
+            "configured_state_budget_bytes": state_budget,
+            "embedding_hbm_plan_bytes": budget_plan.embedding_hbm_bytes,
+            "kv_primary_pool_plan_bytes": budget_plan.kv_primary_page_bytes,
+            "kv_onload_page_plan_bytes": budget_plan.kv_onload_page_bytes,
+            "kv_copy_buffer_plan_bytes": budget_plan.kv_copy_buffer_bytes,
+            "safety_margin_plan_bytes": budget_plan.safety_margin_bytes,
+            "embedding_physical_hbm_bytes": physical_after["embedding_physical_hbm_bytes"],
+            "kv_physical_hbm_bytes": physical_after["kv_physical_hbm_bytes"],
+            "managed_state_physical_hbm_bytes": physical_after["managed_state_physical_hbm_bytes"],
+            "remaining_state_budget_bytes": physical_after["remaining_state_budget_bytes"],
+            "logical_active_page_bytes": physical_after["logical_active_page_bytes"],
+            "resident_page_bytes": physical_after["resident_page_bytes"],
+            "cuda_memory_current": physical_after["cuda_memory_current"],
+            "cuda_memory_before_construction": control["physical_hbm"]["cuda_memory_before_construction"],
+            "cuda_memory_after_construction": control["physical_hbm"]["cuda_memory_after_construction"],
+            "admission_strategy_enabled": hotstate_admit_strategy is not None,
+            "implementation_scope": "fixed_shared_hbm_inference",
+            "benchmark_variant": "admission_smoke" if smoke_mode else "physical_envelope",
+            "online_reallocation_observed": False,
+            "model_rebuild_count": 0,
         })
         if i < 5 or latency_ms > 10:
             print(
@@ -633,16 +735,51 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
     def pct(v, r):
         return v[min(len(v)-1, int(len(v)*r))] if v else float("nan")
 
+    try:
+        trace_report = validate_hotstate_trace(
+            trace_records,
+            require_physical=not smoke_mode,
+        )
+    except EvidenceValidationError:
+        # Keep the original runtime trace available for debugging, but fail the
+        # benchmark rather than emitting evidence that cannot support its label.
+        raise
+
+    comparison = None
+    if static_baseline_jsonl:
+        if smoke_mode:
+            raise EvidenceValidationError(
+                "admission smoke traces cannot be paired with a physical static baseline"
+            )
+        comparison = compare_static_baseline(
+            trace_records,
+            load_jsonl(static_baseline_jsonl),
+        )
+    elif require_static_baseline:
+        raise EvidenceValidationError(
+            "--require-static-baseline was set but no baseline JSONL was provided"
+        )
+
+    if comparison is not None:
+        trace_report = dict(trace_report)
+        trace_report["claims"] = dict(trace_report["claims"])
+        trace_report["claims"]["paired_static_baseline_comparison"] = "measured"
+    evidence_record = evidence_summary(trace_report, comparison)
     results = {
         "mean": sum(lats)/n, "p50": pct(lats,0.5), "p95": pct(lats,0.95),
         "p99": pct(lats,0.99), "p99_9": pct(lats,0.999),
         "max": max(lats), "num_records": n,
         "switch_count": 0,
-        "kv_budget_range": f"{min(kv_budget_history)}-{max(kv_budget_history)}",
+        "planned_kv_page_budget_range": (
+            f"{min(kv_budget_history)}-{max(kv_budget_history)}"
+        ),
+        "evidence_report": trace_report,
+        "static_comparison": comparison,
     }
     with open(out_jsonl, "w") as f:
         for r in trace_records:
             f.write(json.dumps(r) + "\n")
+        f.write(json.dumps(evidence_record) + "\n")
     return results
 
 def main():
@@ -667,7 +804,24 @@ def main():
                         help="For exploit mode: e.g. '3072:50:50'")
     parser.add_argument("--default-split", type=str, default=None,
                         help="For exploit mode: default emb:kv split, e.g. '70:30'")
-    parser.add_argument("--total-hbm-budget-gib", type=float, default=1.0)
+    parser.add_argument(
+        "--total-hbm-budget-gib",
+        type=float,
+        default=1.0,
+        help="Deprecated alias for the controllable state HBM budget.",
+    )
+    parser.add_argument(
+        "--state-hbm-budget-gib",
+        type=float,
+        default=None,
+        help="Controllable shared DynamicEmb+KV state HBM budget.",
+    )
+    parser.add_argument(
+        "--embedding-hbm-ratio",
+        type=float,
+        default=0.50,
+        help="Fraction of usable state HBM assigned to DynamicEmb (default: 0.50).",
+    )
     # Run config
     parser.add_argument("--warmup-ratio", type=float, default=0.1)
     parser.add_argument("--out-jsonl", type=str, required=True,
@@ -691,6 +845,21 @@ def main():
     parser.add_argument("--hotstate-admission-batch-order-control", action="store_true")
     parser.add_argument("--hotstate-value-kv-ms-per-1k-tokens", type=float, default=3.5)
     parser.add_argument("--hotstate-value-emb-ms-per-key", type=float, default=1.5)
+    parser.add_argument(
+        "--disable-hotstate-transfer-scheduler",
+        action="store_true",
+        help="Ablation: bypass request-scoped KV staging; residency actions still use the scheduler lifecycle.",
+    )
+    parser.add_argument(
+        "--static-baseline-jsonl",
+        default=None,
+        help="Physically measured static-split JSONL with matching batch fingerprints.",
+    )
+    parser.add_argument(
+        "--require-static-baseline",
+        action="store_true",
+        help="Fail unless a paired static baseline comparison is present.",
+    )
     args = parser.parse_args()
 
     # ── Build config dicts ──────────────────────────────────────────────
@@ -699,6 +868,11 @@ def main():
              else torch.float32)
     max_seqlen = args.max_history_seqlen * 2 + args.max_num_candidates
     total_hbm_bytes = int(args.total_hbm_budget_gib * 1024**3)
+    state_hbm_budget_bytes = int(
+        (args.total_hbm_budget_gib if args.state_hbm_budget_gib is None
+         else args.state_hbm_budget_gib)
+        * 1024**3
+    )
 
     # ── Create dataset ───────────────────────────────────────────────────
     torch.manual_seed(42)
@@ -741,6 +915,11 @@ def main():
             hotstate_admission_batch_order_control=args.hotstate_admission_batch_order_control,
             hotstate_value_kv_ms_per_1k_tokens=args.hotstate_value_kv_ms_per_1k_tokens,
             hotstate_value_emb_ms_per_key=args.hotstate_value_emb_ms_per_key,
+            hotstate_transfer_scheduler=not args.disable_hotstate_transfer_scheduler,
+            state_hbm_budget_bytes=state_hbm_budget_bytes,
+            embedding_hbm_ratio=args.embedding_hbm_ratio,
+            static_baseline_jsonl=args.static_baseline_jsonl,
+            require_static_baseline=args.require_static_baseline,
             **common)
 
     # ── Print summary ───────────────────────────────────────────────────
@@ -759,6 +938,19 @@ def main():
         print(f"  Discovered:    {results['discovered_policy']}")
     if "calibration_cost_batches" in results:
         print(f"  Calib cost:    {results['calibration_cost_batches']} batches")
+    if "evidence_report" in results:
+        report = results["evidence_report"]
+        print(f"  Evidence scope: {report['implementation_scope']}")
+        print(f"  Physical rows validated: {report['physical_rows_validated']}")
+        print(
+            "  Online reallocation demonstrated: "
+            f"{report['claims']['online_cross_type_reallocation']}"
+        )
+        if results.get("static_comparison") is not None:
+            print(
+                "  Gain vs best static: "
+                f"{results['static_comparison']['gain_vs_best_static_pct']:.2f}%"
+            )
 
 if __name__ == "__main__":
     main()

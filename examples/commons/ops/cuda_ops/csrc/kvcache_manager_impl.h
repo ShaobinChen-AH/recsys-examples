@@ -28,10 +28,14 @@
 #include <torch/serialize/tensor.h>
 
 #include <barrier>
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
 #include <iomanip>
 #include <iostream>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <queue>
 #include <thread>
 #include <unordered_set>
@@ -293,7 +297,7 @@ public:
         std::vector<int64_t>& user_ids, 
         KVOnloadHandle& onloadhandle);
 
-    void offload_kvcache(
+    bool offload_kvcache(
         KVOffloadHandle& offload_handle,
         at::Tensor offload_user_ids,      // host -> make static
         at::Tensor offload_page_ids,      // gpu -> make static
@@ -301,6 +305,7 @@ public:
         at::Tensor new_offload_lengths);  // host
 
     bool is_busy_offloading();
+    uint64_t get_completed_offload_count() const;
 
 public:
     void init_random_offload_status(int64_t user_id, size_t length);
@@ -340,6 +345,7 @@ public:
     std::thread offload_worker;
     bool terminate_;
     std::atomic<bool> offload_busy_;
+    std::atomic<uint64_t> completed_offload_count_{0};
 
     // offloading shared objects
     std::queue<std::tuple<std::vector<int>, at::Tensor, std::vector<cudaEvent_t>, int*>> offload_task_queue;
@@ -365,6 +371,9 @@ public:
     // allocation-vs-offloading synchronization
     std::unordered_map<int64_t, int> offload_freezed_uids_;
     std::mutex offload_freezed_uids_mtx_;
+    // Protects the GPU mapping/LRU/page queues.  Request preparation and the
+    // HotState control thread can inspect or release mappings concurrently.
+    std::recursive_mutex allocation_mutex_;
 
     bool enable_nvcomp;
     KVCompressor compressor;
@@ -389,6 +398,9 @@ public:
     int64_t get_withheld_page_count();
     int64_t get_resident_page_count();
     bool has_user(int64_t uid);
+    // True while the offload worker owns pages for this user.  HotState must
+    // not release the mapping until the worker has copied it to host memory.
+    bool is_user_offload_frozen(int64_t uid);
     bool evict_if_present(int64_t uid);
     void set_active_page_limit(int new_limit);
 private:

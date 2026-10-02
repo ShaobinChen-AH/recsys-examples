@@ -171,6 +171,28 @@ def main():
         torch.cuda.synchronize()
         torch.distributed.barrier()
 
+    hotstate_controller = None
+    if trainer_args.hotstate_training_enabled:
+        from modules.hotstate.training_controller import TrainingHotStateController
+
+        budget_bytes = (
+            None
+            if trainer_args.hotstate_training_state_budget_gib is None
+            else int(trainer_args.hotstate_training_state_budget_gib * 1024**3)
+        )
+        hotstate_controller = TrainingHotStateController(
+            model_train,
+            configured_state_budget_bytes=budget_bytes,
+            trace_path=trainer_args.hotstate_training_trace_path,
+        )
+        hotstate_snapshot = hotstate_controller.validate_training_budget()
+        print_rank_0(
+            "[hotstate-train] initialized "
+            f"modules={len(hotstate_snapshot['dynamic_emb_modules'])} "
+            f"physical_hbm={hotstate_snapshot['physical_hbm_bytes']} "
+            f"budget={hotstate_snapshot['configured_state_budget_bytes']}"
+        )
+
     # Map pipeline type string to factory registered name
     pipeline_type_map = {
         "prefetch": "jagged_prefetch_sparse_dist",
@@ -195,6 +217,7 @@ def main():
         train_dataloader,
         test_dataloader,
         dense_optimizer,
+        hotstate_controller=hotstate_controller,
     )
     init.destroy_global_state()
 

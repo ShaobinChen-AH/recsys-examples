@@ -141,6 +141,7 @@ def train_with_pipeline(
     train_loader: torch.utils.data.DataLoader,
     eval_loader: torch.utils.data.DataLoader,
     dense_optimizer: torch.optim.Optimizer,
+    hotstate_controller=None,
 ):
     gpu_timer = GPUTimer()
     max_train_iters = trainer_args.max_train_iters or len(train_loader)
@@ -181,6 +182,8 @@ def train_with_pipeline(
                 )
                 save_ckpts(save_path, pipeline._model, dense_optimizer)
             try:
+                if hotstate_controller is not None:
+                    hotstate_controller.before_train_step(train_iter)
                 torch.cuda.nvtx.range_push(f"step {train_iter}")
                 (
                     local_loss_sum,
@@ -198,10 +201,25 @@ def train_with_pipeline(
                 tokens_logged += global_tokens_step
                 loss_logged += local_loss_sum
                 torch.cuda.nvtx.range_pop()
+                if hotstate_controller is not None:
+                    hotstate_snapshot = hotstate_controller.record_train_step(train_iter)
+                    if (train_iter + 1) % trainer_args.log_interval == 0:
+                        print_rank_0(
+                            "[hotstate-train] "
+                            f"[iter {train_iter}] physical_hbm={hotstate_snapshot['physical_hbm_bytes']} "
+                            f"logical_storage={hotstate_snapshot['logical_storage_bytes']} "
+                            f"optimizer_state={hotstate_snapshot['optimizer_state_bytes']}"
+                        )
             except StopIteration:
+                if hotstate_controller is not None:
+                    hotstate_controller.abort_train_step()
                 start_iter = train_iter
                 torch.cuda.nvtx.range_pop()
                 break
+            except Exception:
+                if hotstate_controller is not None:
+                    hotstate_controller.abort_train_step()
+                raise
             # log
             is_log_step = (
                 train_iter > 0 and (train_iter + 1) % trainer_args.log_interval == 0

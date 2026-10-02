@@ -1,7 +1,20 @@
-"""Compute oracle latency from static sweep JSONL traces."""
+"""Compute a post-hoc upper bound from physically measured static traces.
+
+The result is an analysis baseline, not evidence of an online HotState
+controller: it chooses the fastest already-built static split after seeing the
+batch outcome.
+"""
 import json
 import argparse
 from collections import defaultdict
+import sys
+from pathlib import Path
+
+_HSTU_DIR = Path(__file__).resolve().parents[1]
+if str(_HSTU_DIR) not in sys.path:
+    sys.path.insert(0, str(_HSTU_DIR))
+
+from benchmark.evidence import EvidenceValidationError, validate_static_baseline_trace
 
 def load_traces(jsonl_path):
     records = []
@@ -13,11 +26,20 @@ def load_traces(jsonl_path):
             r = json.loads(line)
             if "latency_ms" in r:
                 records.append(r)
+    try:
+        validate_static_baseline_trace(records)
+    except EvidenceValidationError as exc:
+        raise SystemExit(f"Trace is not physically measured static evidence: {exc}") from exc
     return records
 
 def compute_oracle(records):
-    # Group by (user_id, seq_history_len) — each batch is uniquely identified
-    batch_key = lambda r: (r["user_id"], r["seq_history_len"])
+    # Prefer the exact input fingerprint.  Coordinate fallback keeps older
+    # traces readable but is explicitly less strong than the fingerprint path.
+    batch_key = lambda r: (
+        ("fingerprint", r["batch_fingerprint"])
+        if r.get("batch_fingerprint")
+        else ("coordinates", r["user_id"], r["seq_history_len"], r["batch_idx"])
+    )
     grouped = defaultdict(list)
     for r in records:
         grouped[batch_key(r)].append(r)
@@ -119,10 +141,12 @@ def main():
 
     # Oracle analysis
     oracle_mean, oracle_recs = compute_oracle(records)
-    print(f"\n=== Oracle ===")
+    print(f"\n=== Post-hoc Oracle Upper Bound (not an online controller) ===")
     print(f"  Mean latency: {oracle_mean:.2f}ms")
     print(f"  Improvement:  {(static[best_split] - oracle_mean):.2f}ms over best static")
     print(f"  Gain:         {(static[best_split] - oracle_mean)/static[best_split]*100:.1f}%")
+    print("  Claim boundary: this selects the best static split after observing each batch;")
+    print("                  it does not demonstrate runtime HBM migration or arbitration.")
 
     # Per-bucket breakdown
     print(f"\n=== Per-History-Bucket Winners ===")

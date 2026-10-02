@@ -41,6 +41,10 @@ from configs import (
     get_kvcache_config,
 )
 from inference_ranking_gr import get_inference_ranking_gr
+from modules.hotstate.embedding_adapter import EmbeddingAdapter
+from modules.hotstate.kv_adapter import KVAdapter
+from modules.hotstate.physical_budget import plan_physical_budget
+from benchmark.evidence import validate_static_baseline_trace
 
 
 DEFAULT_KV_PAGE_SIZE = 32
@@ -50,6 +54,7 @@ DEFAULT_OFFLOAD_CHUNKSIZE = 8192
 def build_inference_model(
     hidden_dim, num_layers, num_heads, head_dim, dtype,
     max_seqlen, blocks_in_primary_pool, max_batch_size=1,
+    dynamic_embedding_hbm_bytes=0,
 ):
     hstu_config = get_inference_hstu_config(
         hidden_size=hidden_dim,
@@ -91,6 +96,7 @@ def build_inference_model(
         kvcache_config=kv_cache_config,
         task_config=task_config,
         use_cudagraph=False,
+        dynamic_embedding_hbm_bytes=dynamic_embedding_hbm_bytes,
     )
     if dtype == torch.bfloat16:
         model.bfloat16()
@@ -169,26 +175,37 @@ def run_static_sweep(
     dataset, total_available = build_dataset(
         max_history_length, max_num_candidates, max_incremental_seqlen, num_users,
     )
+    output_path = Path(out_jsonl)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # A trace is one complete sweep.  Truncating at the start prevents stale
+    # rows from a prior run from being silently included in a paired comparison.
+    output_path.write_text("", encoding="utf-8")
     warmup_batches = max(1, int(total_available * warmup_ratio))
     measure_batches = total_available - warmup_batches
-
-    # KV cost per page (all layers)
-    bytes_per_elem = 2 if dtype_str in ("bfloat16", "float16") else 4
-    kv_page_bytes = num_layers * 2 * DEFAULT_KV_PAGE_SIZE * num_heads * head_dim * bytes_per_elem
-    kv_page_mib = kv_page_bytes / (1024 * 1024)
 
     print(f"Dataset: {total_available} batches (warmup={warmup_batches}, measure={measure_batches})")
     print(f"  seqlen: {max_incremental_seqlen} → {max_history_length - max_incremental_seqlen}")
     print(f"  users={num_users}, candidates={max_num_candidates}")
-    print(f"  KV page cost: {kv_page_mib:.3f} MiB/page ({kv_page_bytes} bytes)")
     print(f"  Total HBM budget: {total_hbm_budget_bytes / 1024**3:.2f} GiB")
 
     max_required_kv_tokens = 2 * (
         max_history_length - max_incremental_seqlen
     )
     for lhs, rhs in splits:
-        kv_budget = total_hbm_budget_bytes - math.floor(lhs / (lhs + rhs) * total_hbm_budget_bytes)
-        blocks = max(1, kv_budget // kv_page_bytes)
+        plan = plan_physical_budget(
+            state_budget_bytes=total_hbm_budget_bytes,
+            embedding_hbm_ratio=lhs / (lhs + rhs),
+            num_layers=num_layers,
+            num_kv_heads=num_heads,
+            head_dim=head_dim,
+            num_tokens_per_page=DEFAULT_KV_PAGE_SIZE,
+            max_batch_size=1,
+            max_sequence_length=max_seqlen * 2,
+            num_tokens_per_chunk=DEFAULT_OFFLOAD_CHUNKSIZE,
+            element_bytes=2 if dtype_str in ("bfloat16", "float16") else 4,
+        )
+        kv_budget = plan.kv_primary_page_bytes
+        blocks = plan.blocks_in_primary_pool
         max_kv_tokens = blocks * DEFAULT_KV_PAGE_SIZE
         if (
             max_kv_tokens < max_required_kv_tokens
@@ -204,13 +221,26 @@ def run_static_sweep(
         print(f"  {lhs}:{rhs} → {blocks} pages → {max_kv_tokens} KV tokens max")
 
     results = []
+    all_trace_records = []
 
     for lhs, rhs in splits:
         dataset._iloc = 0
         split_name = f"static_{lhs}_{rhs}"
-        emb_budget = math.floor(lhs / (lhs + rhs) * total_hbm_budget_bytes)
-        kv_budget = total_hbm_budget_bytes - emb_budget
-        blocks = max(1, kv_budget // kv_page_bytes)
+        plan = plan_physical_budget(
+            state_budget_bytes=total_hbm_budget_bytes,
+            embedding_hbm_ratio=lhs / (lhs + rhs),
+            num_layers=num_layers,
+            num_kv_heads=num_heads,
+            head_dim=head_dim,
+            num_tokens_per_page=DEFAULT_KV_PAGE_SIZE,
+            max_batch_size=1,
+            max_sequence_length=max_seqlen * 2,
+            num_tokens_per_chunk=DEFAULT_OFFLOAD_CHUNKSIZE,
+            element_bytes=2 if dtype_str in ("bfloat16", "float16") else 4,
+        )
+        emb_budget = plan.embedding_hbm_bytes
+        kv_budget = plan.kv_primary_page_bytes
+        blocks = plan.blocks_in_primary_pool
 
         print(f"{'='*60}")
         print(f"Running: {split_name} (emb={emb_budget/1024**3:.2f}GiB, kv={kv_budget/1024**3:.2f}GiB, blocks={blocks})")
@@ -218,8 +248,21 @@ def run_static_sweep(
 
         model = build_inference_model(
             hidden_dim, num_layers, num_heads, head_dim, dtype,
-            max_seqlen, blocks,
+            max_seqlen, blocks, dynamic_embedding_hbm_bytes=emb_budget,
         )
+
+        embedding_adapter = EmbeddingAdapter(model.sparse_module)
+        embedding_adapter.calibrate()
+        kv_adapter = KVAdapter(model.dense_module.async_kvcache)
+        physical_embedding_bytes = embedding_adapter.physical_hbm_bytes()
+        physical_kv_bytes = kv_adapter.physical_hbm_bytes()
+        physical_state_bytes = physical_embedding_bytes + physical_kv_bytes
+        if physical_state_bytes > total_hbm_budget_bytes:
+            raise RuntimeError(
+                f"{split_name} physical state allocation exceeds budget: "
+                f"embedding={physical_embedding_bytes} kv={physical_kv_bytes} "
+                f"budget={total_hbm_budget_bytes}"
+            )
 
         dataloader = get_data_loader(dataset)
         dataloader_iter = iter(dataloader)
@@ -247,6 +290,22 @@ def run_static_sweep(
                     model.forward_with_kvcache(batch, user_ids, total_history_lengths)
                 torch.cuda.synchronize()
                 latency_ms = (time.perf_counter() - t0) * 1000.0
+
+                # Re-measure after every request.  DynamicEmb and the KV
+                # manager are expected to keep fixed capacities, but the trace
+                # must prove that assumption rather than copy the construction
+                # snapshot into every row.
+                measured_embedding_bytes = embedding_adapter.physical_hbm_bytes()
+                measured_kv_bytes = kv_adapter.physical_hbm_bytes()
+                measured_state_bytes = (
+                    measured_embedding_bytes + measured_kv_bytes
+                )
+                if measured_state_bytes > total_hbm_budget_bytes:
+                    raise RuntimeError(
+                        f"{split_name} physical state allocation exceeded budget "
+                        f"during batch {i}: state={measured_state_bytes} "
+                        f"budget={total_hbm_budget_bytes}"
+                    )
 
                 origin_cached_length = None
                 max_origin_cached_length = None
@@ -290,11 +349,26 @@ def run_static_sweep(
                 hist_len = thl[0] // 2
 
                 record = {
+                    "record_type": "static",
                     "split": split_name,
                     "split_lhs": lhs,
                     "split_rhs": rhs,
                     "emb_budget_bytes": emb_budget,
                     "kv_budget_bytes": kv_budget,
+                    "state_budget_bytes": total_hbm_budget_bytes,
+                    "configured_state_budget_bytes": total_hbm_budget_bytes,
+                    "embedding_hbm_plan_bytes": plan.embedding_hbm_bytes,
+                    "kv_primary_pool_plan_bytes": plan.kv_primary_page_bytes,
+                    "kv_onload_page_plan_bytes": plan.kv_onload_page_bytes,
+                    "kv_copy_buffer_plan_bytes": plan.kv_copy_buffer_bytes,
+                    "safety_margin_plan_bytes": plan.safety_margin_bytes,
+                    "embedding_physical_hbm_bytes": measured_embedding_bytes,
+                    "kv_physical_hbm_bytes": measured_kv_bytes,
+                    "managed_state_physical_hbm_bytes": measured_state_bytes,
+                    "remaining_state_budget_bytes": total_hbm_budget_bytes - measured_state_bytes,
+                    "implementation_scope": "physical_static_shared_hbm_baseline",
+                    "online_reallocation_observed": False,
+                    "model_rebuild_count": 0,
                     "blocks_in_primary_pool": blocks,
                     "batch_idx": i,
                     "latency_ms": latency_ms,
@@ -319,13 +393,15 @@ def run_static_sweep(
             trace_records.append({"split": split_name, "status": "error", "error_message": str(exc)})
 
         # Cleanup
+        kvcache = None
         try:
             kvcache = model.dense_module.async_kvcache
             kvcache.executor.shutdown(wait=True, cancel_futures=True)
             kvcache.onload_worker.shutdown(wait=True, cancel_futures=True)
         except Exception:
             pass
-        del kvcache
+        if kvcache is not None:
+            del kvcache
         del model
         gc.collect()
         torch.cuda.empty_cache()
@@ -333,11 +409,55 @@ def run_static_sweep(
         for r in trace_records:
             with open(out_jsonl, "a") as f:
                 f.write(json.dumps(r) + "\n")
+        all_trace_records.extend(trace_records)
 
         valid = [r for r in trace_records if "latency_ms" in r]
         mean_lat = sum(r["latency_ms"] for r in valid) / max(1, len(valid)) if valid else float("nan")
         results.append({"split": split_name, "num_records": len(valid), "mean_latency_ms": mean_lat})
 
+    baseline_report = validate_static_baseline_trace(all_trace_records)
+    valid_record_count = int(baseline_report["record_count"])
+    complete_sweep = len(results) == len(splits) and all(
+        int(result["num_records"]) > 0 for result in results
+    )
+    with output_path.open("a", encoding="utf-8") as output:
+        output.write(
+            json.dumps(
+                {
+                    "record_type": "evidence_summary",
+                    "evidence_schema_version": 1,
+                    "implementation_scope": "physical_static_shared_hbm_baseline",
+                    "claim_boundary": (
+                        "fixed static embedding/KV splits with measured physical state; "
+                        "no online reallocation or unified controller"
+                    ),
+                    "record_count": valid_record_count,
+                    "configured_state_budget_bytes": baseline_report[
+                        "configured_state_budget_bytes"
+                    ],
+                    "physical_rows_validated": baseline_report[
+                        "physical_rows_validated"
+                    ],
+                    "latency_stats": baseline_report["latency_stats"],
+                    "static_splits": baseline_report["static_splits"],
+                    "claims": {
+                        "fixed_shared_hbm_envelope": (
+                            "measured" if complete_sweep else "not_measured"
+                        ),
+                        "physical_embedding_and_kv_accounting": (
+                            "measured" if complete_sweep else "not_measured"
+                        ),
+                        "static_latency_measurement": (
+                            "measured" if complete_sweep else "not_measured"
+                        ),
+                        "paired_hotstate_comparison": "requires_hotstate_trace",
+                        "online_cross_type_reallocation": "not_demonstrated",
+                        "paper_scale_generalization": "not_demonstrated",
+                    },
+                }
+            )
+            + "\n"
+        )
     return results
 
 
@@ -389,4 +509,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

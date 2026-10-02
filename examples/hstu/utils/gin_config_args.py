@@ -47,6 +47,11 @@ class TrainerArgs:
         pipeline_type (str): Pipeline overlap type: 'none' (no overlap), 'native'
             (overlap h2d, input dist, fwd+bwd), 'prefetch' (includes prefetch overlap).
             Default: "native".
+        hotstate_training_enabled (bool): Enable training-side DynamicEmb
+            observation and physical-budget validation. Default: False.
+        hotstate_training_state_budget_gib (Optional[float]): Per-rank
+            DynamicEmb state-HBM envelope in GiB. Default: None.
+        hotstate_training_trace_path (str): Optional JSONL trace path. Default: "".
     """
 
     # below batchsize is batchsize_per_gpu
@@ -80,9 +85,21 @@ class TrainerArgs:
     # - False -> use IdentityBalancedBatchShuffler (no load balancing)
     enable_balanced_shuffler: bool = False
 
+    # Optional training-side HotState observation.  DynamicEmb remains the
+    # owner of mutable row/optimizer-state admission and eviction.
+    hotstate_training_enabled: bool = False
+    hotstate_training_state_budget_gib: Optional[float] = None
+    hotstate_training_trace_path: str = ""
+
     def __post_init__(self):
         if isinstance(self.max_train_iters, str):
             self.max_train_iters = int(self.max_train_iters)
+        if self.hotstate_training_state_budget_gib is not None:
+            self.hotstate_training_state_budget_gib = float(
+                self.hotstate_training_state_budget_gib
+            )
+            if self.hotstate_training_state_budget_gib <= 0:
+                raise ValueError("hotstate_training_state_budget_gib must be positive")
 
 
 @dataclass

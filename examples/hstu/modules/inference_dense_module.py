@@ -190,15 +190,6 @@ class InferenceDenseModule(torch.nn.Module):
         self._max_kv_pages = kvcache_config.blocks_in_primary_pool
         self.hotstate = None
 
-    def enable_hotstate(self, total_hbm_bytes: int,
-                    embedding_module, kv_module, skip_kv_handles_for_admission_smoke: bool = False,):
-        self.hotstate = HotStateController(
-            total_hbm_bytes=total_hbm_bytes,
-            embedding_module=embedding_module,
-            kv_module=kv_module,
-            skip_kv_handles_for_admission_smoke=skip_kv_handles_for_admission_smoke,
-        )
-
     def setup_for_kvcache(self, hstu_config, kvcache_config):
         max_batch_size = hstu_config.max_batch_size
         max_seq_len = hstu_config.max_seq_len
@@ -285,7 +276,15 @@ class InferenceDenseModule(torch.nn.Module):
         self._mlp.bfloat16()
         return self
 
-    def enable_hotstate(self, total_hbm_bytes: int, skip_kv_handles_for_admission_smoke: bool = False, admission_smoke_max_admitted_keys=None,):
+    def enable_hotstate(
+        self,
+        total_hbm_bytes: int,
+        skip_kv_handles_for_admission_smoke: bool = False,
+        admission_smoke_max_admitted_keys=None,
+        configured_state_budget_bytes=None,
+        cuda_memory_before_construction=None,
+        cuda_memory_after_construction=None,
+    ):
         """Enable the HotState unified HBM control plane.
 
         Must be called after model construction and after the sparse
@@ -300,6 +299,9 @@ class InferenceDenseModule(torch.nn.Module):
             kv_module=self.async_kvcache,
             skip_kv_handles_for_admission_smoke=skip_kv_handles_for_admission_smoke,
             admission_smoke_max_admitted_keys=admission_smoke_max_admitted_keys,
+            configured_state_budget_bytes=configured_state_budget_bytes,
+            cuda_memory_before_construction=cuda_memory_before_construction,
+            cuda_memory_after_construction=cuda_memory_after_construction,
         )
 
 

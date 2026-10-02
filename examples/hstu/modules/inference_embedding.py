@@ -66,9 +66,24 @@ def create_dynamic_embedding_tables(
     sparse_shareables=None,
     admit_strategy: Optional[Any] = None,
     admission_counters: Optional[Sequence[Any]] = None,
+    dynamic_embedding_hbm_bytes: int = 0,
 ):
     admission_enabled = admit_strategy is not None
     table_options = []
+
+    # ``dynamic_embedding_hbm_bytes`` is the aggregate device-tier budget for
+    # this collection.  DynamicEmb receives a per-table value budget, so split
+    # it by the logical value footprint rather than multiplying the requested
+    # envelope once per table.
+    total_logical_value_bytes = sum(
+        int(config.vocab_size) * int(config.dim) * torch.tensor([], dtype=torch.float32).element_size()
+        for config in embedding_configs
+    )
+
+    if int(dynamic_embedding_hbm_bytes) < 0:
+        raise ValueError("dynamic_embedding_hbm_bytes must be non-negative")
+    remaining_hbm_bytes = int(dynamic_embedding_hbm_bytes)
+    remaining_logical_bytes = total_logical_value_bytes
 
     for table_index, config in enumerate(embedding_configs):
         admission_counter = None
@@ -83,18 +98,37 @@ def create_dynamic_embedding_tables(
                 )
             )
 
+        table_logical_bytes = (
+            int(config.vocab_size)
+            * int(config.dim)
+            * torch.tensor([], dtype=torch.float32).element_size()
+        )
+        if remaining_hbm_bytes > 0 and remaining_logical_bytes > 0:
+            if table_index == len(embedding_configs) - 1:
+                table_hbm_bytes = remaining_hbm_bytes
+            else:
+                table_hbm_bytes = int(
+                    remaining_hbm_bytes * table_logical_bytes / remaining_logical_bytes
+                )
+                table_hbm_bytes = max(1, table_hbm_bytes)
+            remaining_hbm_bytes -= table_hbm_bytes
+            remaining_logical_bytes -= table_logical_bytes
+        else:
+            table_hbm_bytes = 0
+
         table_options.append(
             DynamicEmbTableOptions(
                 index_type=torch.int64,
                 embedding_dtype=torch.float32,
                 dim=config.dim,
                 max_capacity=config.vocab_size,
-                local_hbm_for_values=0,
+                local_hbm_for_values=table_hbm_bytes,
                 bucket_capacity=128,
                 initializer_args=DynamicEmbInitializerArgs(
                     mode=DynamicEmbInitializerMode.NORMAL,
                 ),
                 training=admission_enabled,
+                caching=False,
                 admit_strategy=admit_strategy,
                 admission_counter=admission_counter,
             )
@@ -124,6 +158,7 @@ class InferenceDynamicEmbeddingCollection(torch.nn.Module):
         sparse_shareables=None,
         admit_strategy: Optional[Any] = None,
         admission_counters: Optional[Sequence[Any]] = None,
+        dynamic_embedding_hbm_bytes: int = 0,
     ):
         super().__init__()
 
@@ -135,6 +170,7 @@ class InferenceDynamicEmbeddingCollection(torch.nn.Module):
             sparse_shareables=sparse_shareables,
             admit_strategy=admit_strategy,
             admission_counters=admission_counters,
+            dynamic_embedding_hbm_bytes=dynamic_embedding_hbm_bytes,
         )
 
     def _force_admission_training_path(self) -> None:
@@ -238,6 +274,7 @@ def create_embedding_collection(configs, backend, use_static: bool = False, **kw
             sparse_shareables,
             admit_strategy=kwargs.get("admit_strategy", None),
             admission_counters=kwargs.get("admission_counters", None),
+            dynamic_embedding_hbm_bytes=kwargs.get("dynamic_embedding_hbm_bytes", 0),
         )
     elif backend == EmbeddingBackend.NVEMB:
         from modules.nve_embeddingcollection import InferenceNVEEmbeddingCollection
@@ -283,8 +320,13 @@ class InferenceEmbedding(torch.nn.Module):
         sparse_shareables=None,
         hotstate_admit_strategy: Optional[Any] = None,
         hotstate_admission_counters: Optional[Sequence[Any]] = None,
+        dynamic_embedding_hbm_bytes: int = 0,
     ):
         super(InferenceEmbedding, self).__init__()
+        # A freshly constructed inference model has an explicit DynamicEmb
+        # initializer as its authoritative source.  Loading a checkpoint
+        # flips this marker off so a missing checkpoint row is a hard error.
+        self._hotstate_initializer_authoritative = True
 
         self.dynamic_embedding_configs = []
         self.static_embedding_configs = []
@@ -314,6 +356,7 @@ class InferenceEmbedding(torch.nn.Module):
             sparse_shareables=sparse_shareables,
             admit_strategy=hotstate_admit_strategy,
             admission_counters=hotstate_admission_counters,
+            dynamic_embedding_hbm_bytes=dynamic_embedding_hbm_bytes,
         )
 
         self._static_embedding_collection = create_embedding_collection(
@@ -354,6 +397,8 @@ class InferenceEmbedding(torch.nn.Module):
     def load_checkpoint(self, checkpoint_dir, model_state_dict=None):
         if checkpoint_dir is None:
             return
+
+        self._hotstate_initializer_authoritative = False
 
         self._dynamic_embedding_collection.load_checkpoint(checkpoint_dir)
 
@@ -495,6 +540,7 @@ def get_inference_sparse_model(
     sparse_shareables=None,
     hotstate_admit_strategy=None,
     hotstate_admission_counters=None,
+    dynamic_embedding_hbm_bytes: int = 0,
 ):
     return InferenceEmbedding(
         embedding_configs,
@@ -502,4 +548,5 @@ def get_inference_sparse_model(
         sparse_shareables,
         hotstate_admit_strategy=hotstate_admit_strategy,
         hotstate_admission_counters=hotstate_admission_counters,
+        dynamic_embedding_hbm_bytes=dynamic_embedding_hbm_bytes,
     )

@@ -1,4 +1,6 @@
 import math
+import threading
+import time
 from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 
@@ -39,6 +41,9 @@ class AsyncHSTUKVCacheManager:
         self.num_onload_buffer_pages = num_onload_buffer_pages
         self.num_reserved_buffer_pages = num_reserved_buffer_pages
         self.chunk_size = num_tokens_per_chunk
+        self.num_onload_buffer_chunks = int(num_onload_buffer_chunks)
+        self.num_offload_buffer_chunks = int(num_offload_buffer_chunks)
+        self.enable_nvcomp = bool(enable_nvcomp)
         self.max_num_sequences = max_num_sequences
         self.max_sequence_length = max_sequence_length
         self.max_batch_size = max_batch_size
@@ -81,10 +86,10 @@ class AsyncHSTUKVCacheManager:
             self.cache_table,
             self.host_kv_mgr,
             max_queued_offload_tokens,
-            num_onload_buffer_chunks,
-            num_offload_buffer_chunks,
+            self.num_onload_buffer_chunks,
+            self.num_offload_buffer_chunks,
             num_memcpy_workers,
-            enable_nvcomp,
+            self.enable_nvcomp,
         )
 
         self.static_page_ids_gpu_buffer = torch.empty(
@@ -118,6 +123,69 @@ class AsyncHSTUKVCacheManager:
         self.last_new_tokens = None
         self.last_num_offload_pages = None
         self.last_max_seqlen = None
+        self.last_offload_submission = {
+            "generation": 0,
+            "accepted": False,
+            "tokens_by_user": {},
+            "submitted_at": None,
+            "completion_target": None,
+        }
+        self._prepare_generation = 0
+        self._staged_prepare = None
+        self._staged_prepare_lock = threading.Lock()
+        self.last_consumed_prepare_generation = None
+        self._last_offload_completion_target = 0
+        self._active_prepare = None
+
+    def physical_hbm_breakdown(self) -> dict:
+        """Return bytes allocated by the KV state manager on the GPU.
+
+        ``cache_table`` owns both primary and onload pages.  The C++ manager
+        also owns one CUDA copy buffer per configured onload/offload chunk;
+        those buffers are raw pointers rather than PyTorch tensors, so their
+        sizes are reconstructed from the same chunk geometry used by C++.
+        The three static metadata tensors are persistent device allocations
+        and are included explicitly.
+        """
+        if self.enable_nvcomp:
+            raise RuntimeError(
+                "physical KV HBM accounting is not supported with NVCOMP enabled; "
+                "disable NVCOMP for the fixed physical-HBM envelope"
+            )
+        element_bytes = int(self.cache_table.element_size())
+        cache_table_bytes = int(self.cache_table.numel() * element_bytes)
+        chunk_bytes = (
+            int(self.chunk_size)
+            * 2
+            * int(self.num_heads)
+            * int(self.head_dim)
+            * element_bytes
+        )
+        onload_buffer_bytes = self.num_onload_buffer_chunks * chunk_bytes
+        offload_buffer_bytes = self.num_offload_buffer_chunks * chunk_bytes
+        metadata_bytes = sum(
+            int(t.numel() * t.element_size())
+            for t in (
+                self.static_page_ids_gpu_buffer,
+                self.static_offload_page_ids_gpu_buffer,
+                self.static_metadata_gpu_buffer,
+            )
+        )
+        return {
+            "cache_table_bytes": cache_table_bytes,
+            "onload_device_buffer_bytes": int(onload_buffer_bytes),
+            "offload_device_buffer_bytes": int(offload_buffer_bytes),
+            "static_cuda_metadata_bytes": int(metadata_bytes),
+            "physical_hbm_bytes": int(
+                cache_table_bytes
+                + onload_buffer_bytes
+                + offload_buffer_bytes
+                + metadata_bytes
+            ),
+        }
+
+    def physical_hbm_bytes(self) -> int:
+        return int(self.physical_hbm_breakdown()["physical_hbm_bytes"])
 
     def prepare_kvcache_async(
         self,
@@ -183,6 +251,105 @@ class AsyncHSTUKVCacheManager:
             onload_fut,
         ]
 
+    def stage_prepare_kvcache(self, user_ids, total_history_lengths):
+        """Start the exact KV prepare/onload operation consumed by forward.
+
+        Only one request may use the manager's static metadata buffers and
+        static onload handle at a time.  Staging therefore owns those buffers
+        until :meth:`consume_staged_prepare` is called.
+        """
+        normalized_users = tuple(int(uid) for uid in user_ids)
+        normalized_lengths = tuple(int(length) for length in total_history_lengths)
+        with self._staged_prepare_lock:
+            if self._staged_prepare is not None:
+                if (
+                    self._staged_prepare["user_ids"] == normalized_users
+                    and self._staged_prepare["total_history_lengths"]
+                    == normalized_lengths
+                ):
+                    return int(self._staged_prepare["generation"])
+                raise RuntimeError(
+                    "a different KV request is already staged and unconsumed"
+                )
+            result = self.prepare_kvcache_async(
+                len(normalized_users),
+                list(normalized_users),
+                list(normalized_lengths),
+                self.static_page_ids_gpu_buffer,
+                self.static_offload_page_ids_gpu_buffer,
+                self.static_metadata_gpu_buffer,
+                self.static_onload_handle,
+            )
+            self._prepare_generation += 1
+            self._staged_prepare = {
+                "generation": int(self._prepare_generation),
+                "user_ids": normalized_users,
+                "total_history_lengths": normalized_lengths,
+                "result": result,
+            }
+            return int(self._prepare_generation)
+
+    def consume_staged_prepare(self, user_ids, total_history_lengths):
+        """Return and clear a matching staged request, or ``None``."""
+        normalized_users = tuple(int(uid) for uid in user_ids)
+        normalized_lengths = tuple(int(length) for length in total_history_lengths)
+        with self._staged_prepare_lock:
+            staged = self._staged_prepare
+            if staged is None:
+                return None
+            if (
+                staged["user_ids"] != normalized_users
+                or staged["total_history_lengths"] != normalized_lengths
+            ):
+                raise RuntimeError(
+                    "staged KV request does not match the request being executed"
+                )
+            self._staged_prepare = None
+            self.last_consumed_prepare_generation = int(staged["generation"])
+            self._active_prepare = {
+                "generation": int(staged["generation"]),
+                "result": staged["result"],
+            }
+            return int(staged["generation"]), staged["result"]
+
+    def complete_active_prepare(self) -> None:
+        """Release bookkeeping after a forward consumed the prepared buffers."""
+        with self._staged_prepare_lock:
+            self._active_prepare = None
+
+    def active_prepare_generation(self):
+        with self._staged_prepare_lock:
+            if self._active_prepare is None:
+                return None
+            return int(self._active_prepare["generation"])
+
+    def abort_active_prepare(self) -> None:
+        """Drain a consumed prepare after a forward failure.
+
+        The static onload handle and metadata buffers are shared by all
+        requests.  Waiting for their worker futures before reuse prevents a
+        failed request from publishing a partial onload to the next request.
+        """
+        with self._staged_prepare_lock:
+            active = self._active_prepare
+            self._active_prepare = None
+            staged = self._staged_prepare
+            self._staged_prepare = None
+        candidate = active or staged
+        if candidate is None:
+            return
+        result = candidate.get("result", candidate)
+        for index in (5, 6):
+            try:
+                result[index].result()
+            except Exception:
+                pass
+        self.static_onload_handle.reset()
+
+    def cancel_staged_prepare(self) -> None:
+        """Cancel an unconsumed staged request and drain its workers."""
+        self.abort_active_prepare()
+
     def prepare_kvcache_wait(
         self,
         onload_fut,
@@ -212,15 +379,50 @@ class AsyncHSTUKVCacheManager:
         num_offload_pages = len(kvcache_metadata.offload_page_ids)
         if num_offload_pages == 0:
             kvcache_metadata.kv_offload_handle.set_no_offload()
+            self.last_offload_submission = {
+                "generation": int(self.last_offload_submission["generation"]),
+                "accepted": False,
+                "tokens_by_user": {},
+                "submitted_at": None,
+                "completion_target": None,
+            }
             return None
 
-        self.gpu_kvcache_mgr.offload_kvcache(
+        accepted = self.gpu_kvcache_mgr.offload_kvcache(
             kvcache_metadata.kv_offload_handle,
             kvcache_metadata.offload_user_ids,
             kvcache_metadata.offload_page_ids,
             kvcache_metadata.new_offload_startpos,
             kvcache_metadata.new_offload_lengths,
         )
+        if not accepted:
+            # The native manager rejects before it creates per-layer CUDA
+            # events.  Prevent later attention layers from marking an
+            # uninitialized handle ready.
+            kvcache_metadata.kv_offload_handle.set_no_offload()
+        tokens_by_user = {
+            int(uid): int(length)
+            for uid, length in zip(
+                kvcache_metadata.offload_user_ids.tolist(),
+                kvcache_metadata.new_offload_lengths.tolist(),
+            )
+            if int(length) > 0
+        }
+        completed_count = int(self.gpu_kvcache_mgr.get_completed_offload_count())
+        if accepted:
+            self._last_offload_completion_target = max(
+                int(self._last_offload_completion_target), completed_count
+            ) + 1
+        self.last_offload_submission = {
+            "generation": int(self.last_offload_submission["generation"]) + 1,
+            "accepted": bool(accepted),
+            "tokens_by_user": tokens_by_user if accepted else {},
+            "submitted_at": time.perf_counter() if accepted else None,
+            "completion_target": (
+                int(self._last_offload_completion_target) if accepted else None
+            ),
+        }
+        return bool(accepted)
 
     def get_kvcache_metadata_from_buffer(
         self,
