@@ -265,6 +265,44 @@ def test_cuda_physical_hbm_envelope_smoke():
         torch.manual_seed(23)
         host_model = _build_cuda_smoke_model(0, plan.blocks_in_primary_pool)
 
+        host_model.dense_module.load_state_dict(
+            hbm_model.dense_module.state_dict(),
+            strict=True,
+        )
+        with torch.no_grad():
+            hbm_layers = hbm_model.dense_module._hstu_block._attention_layers
+            host_layers = host_model.dense_module._hstu_block._attention_layers
+
+            for hbm_layer, host_layer in zip(hbm_layers, host_layers):
+                host_layer._linear_uvqk_weight.copy_(
+                    hbm_layer._linear_uvqk_weight
+                )
+                host_layer._linear_proj_weight.copy_(
+                    hbm_layer._linear_proj_weight
+                )
+
+        torch.cuda.synchronize()
+        host_model.sparse_module._static_embedding_collection.load_state_dict(
+            hbm_model.sparse_module._static_embedding_collection.state_dict(),
+            strict=True,
+        )
+        with torch.no_grad():
+            hbm_layers = hbm_model.dense_module._hstu_block._attention_layers
+            host_layers = host_model.dense_module._hstu_block._attention_layers
+
+            for hbm_layer, host_layer in zip(hbm_layers, host_layers):
+                host_layer._linear_uvqk_weight.copy_(
+                    hbm_layer._linear_uvqk_weight
+                )
+                host_layer._linear_proj_weight.copy_(
+                    hbm_layer._linear_proj_weight
+                )
+
+        torch.cuda.synchronize()
+
+        def max_diff(a, b):
+            return float((a.float() - b.float()).abs().max().item())
+
         for index in range(20):
             batch, user_ids, history_lengths = requests[index % len(requests)]
             hbm_model.dense_module.hotstate.before_batch(
@@ -277,7 +315,11 @@ def test_cuda_physical_hbm_envelope_smoke():
                 host_output = host_model.forward_with_kvcache(
                     batch, user_ids, history_lengths
                 )
-            assert torch.allclose(hbm_output, host_output, rtol=2e-2, atol=2e-2)
+            hbm_model.dense_module.hotstate.after_batch(batch, latency_ms=0.0)
+            difference = max_diff(hbm_output, host_output)
+            assert torch.allclose(
+                hbm_output, host_output, rtol=2e-2, atol=2e-2
+            ), f"batch={index}, max_diff={difference}"
             measured_embedding = embedding_adapter.physical_hbm_bytes()
             measured_kv = kv_adapter.physical_hbm_bytes()
             assert measured_embedding + measured_kv <= state_budget
