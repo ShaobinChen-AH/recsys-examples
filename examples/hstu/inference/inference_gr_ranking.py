@@ -15,6 +15,7 @@
 import argparse
 import enum
 import math
+import os
 import sys
 import time
 
@@ -33,6 +34,7 @@ from configs import (
     get_kvcache_config,
 )
 from modules.metrics import get_multi_event_metric_module
+from modules.hotstate.physical_budget import get_hbm_budget_bytes, get_hotstate_enabled, GIB
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from utils import DatasetArgs, NetworkArgs, RankingArgs
 
@@ -161,8 +163,44 @@ def get_inference_hstu_model(
         contextual_max_seqlen=num_contextual_features,
     )
 
+    # Compute HBM budget allocation
+    total_hbm_bytes = get_hbm_budget_bytes()
+    hotstate_enabled = get_hotstate_enabled()
+
+    if total_hbm_bytes > 0:
+        # Reserve safety margin for activations and fragmentation
+        DEFAULT_SAFETY_MARGIN_BYTES = 64 * 1024 * 1024  # 64 MiB
+        available_hbm_bytes = total_hbm_bytes - DEFAULT_SAFETY_MARGIN_BYTES
+
+        if hotstate_enabled:
+            # HotState: dynamic split (equal split as default starting point)
+            embedding_hbm_bytes = available_hbm_bytes // 2
+            kv_hbm_bytes = available_hbm_bytes // 2
+        else:
+            # Fixed split: 60% embedding, 40% KV
+            embedding_hbm_bytes = int(available_hbm_bytes * 0.6)
+            kv_hbm_bytes = int(available_hbm_bytes * 0.4)
+    else:
+        # No budget constraint
+        embedding_hbm_bytes = 0
+        kv_hbm_bytes = 0
+
+    # Compute KV cache blocks from budget
+    if kv_hbm_bytes > 0:
+        # KV page size: num_layers * 2 * page_size * num_kv_heads * head_dim * element_bytes
+        num_layers = network_args.num_layers
+        num_kv_heads = network_args.num_attention_heads  # Assuming num_kv_heads == num_attention_heads
+        head_dim = network_args.kv_channels
+        page_size = 32
+        element_bytes = 2  # bfloat16/fp16
+
+        kv_page_bytes = num_layers * 2 * page_size * num_kv_heads * head_dim * element_bytes
+        blocks_in_primary_pool = max(256, kv_hbm_bytes // kv_page_bytes)
+    else:
+        blocks_in_primary_pool = 10240  # Default
+
     kvcache_args = {
-        "blocks_in_primary_pool": 10240,
+        "blocks_in_primary_pool": blocks_in_primary_pool,
         "page_size": 32,
         "offload_chunksize": 1024,
     }
@@ -189,6 +227,7 @@ def get_inference_hstu_model(
         task_config=task_config,
         use_cudagraph=False,
         cudagraph_configs=hstu_cudagraph_configs,
+        dynamic_embedding_hbm_bytes=embedding_hbm_bytes,
     )
     if hstu_config.bf16:
         model.bfloat16()

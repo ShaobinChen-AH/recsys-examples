@@ -499,3 +499,23 @@ class RetrievalArgs:
     temperature = 0.05
     l2_norm_eps = 1e-6
     eval_metrics: Tuple[str, ...] = ("HR@10", "NDCG@10")
+
+
+@gin.configurable
+@dataclass
+class HBMBudgetArgs:
+    """HBM Budget Configuration for Fair Comparison.
+
+    Controls HBM allocation and HotState enable/disable for fair comparison experiments.
+
+    Attributes:
+        hbm_budget_gib (float): Total HBM budget in GiB. Default: 1.0.
+        hotstate_enabled (bool): Enable unified HotState management (True) or fixed split (False).
+            Default: False.
+        embedding_split_ratio (float): For fixed split mode: embedding gets this fraction,
+            KV cache gets (1 - ratio). Default: 0.6.
+    """
+
+    hbm_budget_gib: float = 1.0
+    hotstate_enabled: bool = False
+    embedding_split_ratio: float = 0.6

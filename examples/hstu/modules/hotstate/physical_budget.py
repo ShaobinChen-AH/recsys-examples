@@ -6,6 +6,7 @@ allocator fragmentation are intentionally outside this envelope; callers must
 leave the returned safety margin available for those costs.
 """
 
+import os
 from dataclasses import dataclass
 from math import ceil
 
@@ -14,6 +15,27 @@ MIB = 1024 * 1024
 GIB = 1024 * MIB
 DEFAULT_SAFETY_MARGIN_BYTES = 64 * MIB
 DEFAULT_ELEMENT_BYTES = 2  # inference KV values are bfloat16/fp16
+
+
+def get_hbm_budget_bytes() -> int:
+    """Get total HBM budget in bytes from environment or return 0 for no limit.
+
+    Environment variable: HBM_BUDGET_GIB
+    Default: 0 (no limit)
+    """
+    budget_gib = float(os.getenv("HBM_BUDGET_GIB", "0"))
+    if budget_gib <= 0:
+        return 0
+    return int(budget_gib * GIB)
+
+
+def get_hotstate_enabled() -> bool:
+    """Check if HotState unified management is enabled.
+
+    Environment variable: HOTSTATE_ENABLED (set to "1" to enable)
+    Default: False (fixed split mode)
+    """
+    return os.getenv("HOTSTATE_ENABLED", "0") == "1"
 
 
 def ceil_div(numerator: int, denominator: int) -> int:
