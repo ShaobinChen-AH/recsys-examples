@@ -38,7 +38,7 @@ def run_inference_with_latency_tracking(
     num_contextual_features = len(dataproc._contextual_feature_names)
 
     max_batch_size = max_bs
-    total_max_seqlen = dataset_args.seq_len * 2 + num_contextual_features
+    total_max_seqlen = dataset_args.max_history_seqlen * 2 + num_contextual_features
 
     with torch.inference_mode():
         model = get_inference_hstu_model(
