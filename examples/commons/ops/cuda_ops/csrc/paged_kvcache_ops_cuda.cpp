@@ -337,14 +337,5 @@ PYBIND11_MODULE(paged_kvcache_ops, m) {
     .def("set_no_offload", &kvcache::KVOffloadHandle::set_no_offload)
   ;
 
-  py::class_<kvcache::HostKVStorageImpl>(m, "HostKVStorageImpl")
-    .def(py::init<int, int, int, int, int64_t>(),
-         py::arg("num_layers"),
-         py::arg("num_kv_heads"),
-         py::arg("kv_headdim"),
-         py::arg("num_tokens_per_page"),
-         py::arg("num_tokens_per_chunk"))
-  ;
-
   m.def("prepare_kvcache", &kvcache::prepare_kvcache, "prepare_kvcache", py::call_guard<py::gil_scoped_release>());
 }
