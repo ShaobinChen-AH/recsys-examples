@@ -29,7 +29,8 @@ for budget in "${BUDGETS[@]}"; do
         # Original system with fixed split
         export HOTSTATE_ENABLED=0
         export HBM_BUDGET_GIB=${budget}
-        python3 "${HSTU_DIR}/inference/inference_latency_benchmark.py" \
+        cd "${HSTU_DIR}"
+        python3 "./inference/inference_latency_benchmark.py" \
             --gin_config_file "${GIN_CONFIG}" \
             --checkpoint_dir "${CHECKPOINT_DIR}" \
             --max_bs ${MAX_BS} \
@@ -37,7 +38,8 @@ for budget in "${BUDGETS[@]}"; do
 
         # HotState system with dynamic split
         export HOTSTATE_ENABLED=1
-        python3 "${HSTU_DIR}/inference/inference_latency_benchmark.py" \
+        cd "${HSTU_DIR}"
+        python3 "./inference/inference_latency_benchmark.py" \
             --gin_config_file "${GIN_CONFIG}" \
             --checkpoint_dir "${CHECKPOINT_DIR}" \
             --max_bs ${MAX_BS} \
@@ -46,6 +48,7 @@ for budget in "${BUDGETS[@]}"; do
 done
 
 echo "=== All experiments complete ==="
-python3 "${HSTU_DIR}/analysis/aggregate_results.py" \
+cd "${HSTU_DIR}"
+python3 "./analysis/aggregate_results.py" \
     --results_dir "${RESULTS_DIR}" \
     --output_csv "${RESULTS_DIR}/comparison_summary.csv"
