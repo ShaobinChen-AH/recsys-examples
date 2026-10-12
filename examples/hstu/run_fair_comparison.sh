@@ -8,7 +8,7 @@ set -e
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HSTU_DIR="${REPO_ROOT}"
-CHECKPOINT_DIR="${HSTU_DIR}/checkpoints/kuairand_1k_native/iter550"
+CHECKPOINT_DIR="/workspace/data/iter500"
 GIN_CONFIG="${HSTU_DIR}/inference/configs/kuairand_1k_inference_ranking.gin"
 RESULTS_DIR="${HSTU_DIR}/results/fair_comparison"
 
