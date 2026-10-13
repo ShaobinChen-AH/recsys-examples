@@ -62,8 +62,8 @@ def check_enforcement_support(model_path, config_path):
     try:
         # This is a simplified check - adjust based on actual model loading
         # The key is to get access to the embedding and KV modules
-        from inference_gr_ranking import get_inference_hstu_model
-        from inference_gr_ranking import get_inference_dataset_and_embedding_configs
+        from inference.inference_gr_ranking import get_inference_hstu_model
+        from inference.inference_gr_ranking import get_inference_dataset_and_embedding_configs
 
         dataset_args, emb_configs = get_inference_dataset_and_embedding_configs()
 
