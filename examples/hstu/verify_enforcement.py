@@ -59,6 +59,11 @@ def check_enforcement_support(model_path, config_path):
     print(f"\n[Model Loading]")
     print(f"  Checkpoint: {model_path}")
 
+    # Debug: verify environment variables are visible
+    import os
+    print(f"  DEBUG: HOTSTATE_ENABLED={os.getenv('HOTSTATE_ENABLED')}")
+    print(f"  DEBUG: HBM_BUDGET_GIB={os.getenv('HBM_BUDGET_GIB')}")
+
     try:
         # This is a simplified check - adjust based on actual model loading
         # The key is to get access to the embedding and KV modules
