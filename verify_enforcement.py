@@ -26,6 +26,7 @@ def check_enforcement_support(model_path, config_path):
         import gin
         from modules.hotstate.hotstate_controller import HotStateController
         from modules.hotstate.physical_budget import get_hbm_budget_bytes, get_hotstate_enabled
+        from utils import DatasetArgs, NetworkArgs, RankingArgs  # Import gin-configurable classes
         print("[OK] Successfully imported HotState modules")
     except ImportError as e:
         print(f"[FAIL] Failed to import HotState modules: {e}")
