@@ -306,10 +306,12 @@ def get_inference_hstu_model(
 
     # Optionally create HotStateController for dynamic allocation
     hotstate_controller = None
+    print(f"[DEBUG] Controller check: return_controller={return_controller}, hotstate_enabled={hotstate_enabled}, total_hbm_bytes={total_hbm_bytes}")
     if return_controller and hotstate_enabled and total_hbm_bytes > 0:
         try:
             kv_module = getattr(model, '_kv_cache_manager', None)
             embedding_module = getattr(model, 'dense_module', None)
+            print(f"[DEBUG] Modules: kv_module={kv_module is not None}, embedding_module={embedding_module is not None}")
             if kv_module is not None:
                 hotstate_controller = HotStateController(
                     total_hbm_bytes=total_hbm_bytes,
