@@ -309,6 +309,7 @@ def get_inference_hstu_model(
     print(f"[DEBUG] Controller check: return_controller={return_controller}, hotstate_enabled={hotstate_enabled}, total_hbm_bytes={total_hbm_bytes}")
     if return_controller and hotstate_enabled and total_hbm_bytes > 0:
         try:
+            print(f"[DEBUG] Model attributes: {[attr for attr in dir(model) if 'kv' in attr.lower() or 'cache' in attr.lower()]}")
             kv_module = getattr(model, '_kv_cache_manager', None)
             embedding_module = getattr(model, 'dense_module', None)
             print(f"[DEBUG] Modules: kv_module={kv_module is not None}, embedding_module={embedding_module is not None}")
