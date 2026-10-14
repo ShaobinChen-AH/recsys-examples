@@ -36,6 +36,9 @@ for budget in "${BUDGETS[@]}"; do
             --max_bs ${MAX_BS} \
             --output_json "${RESULTS_DIR}/original_${budget}gib_run${run}.json"
 
+        # Cleanup GPU memory
+        python3 -c "import torch; torch.cuda.empty_cache()" 2>/dev/null || true
+
         # HotState system with dynamic split
         export HOTSTATE_ENABLED=1
         cd "${HSTU_DIR}"
@@ -44,6 +47,9 @@ for budget in "${BUDGETS[@]}"; do
             --checkpoint_dir "${CHECKPOINT_DIR}" \
             --max_bs ${MAX_BS} \
             --output_json "${RESULTS_DIR}/hotstate_${budget}gib_run${run}.json"
+
+        # Cleanup GPU memory
+        python3 -c "import torch; torch.cuda.empty_cache()" 2>/dev/null || true
     done
 done
 
