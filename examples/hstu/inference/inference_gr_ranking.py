@@ -310,6 +310,12 @@ def get_inference_hstu_model(
     if return_controller and hotstate_enabled and total_hbm_bytes > 0:
         try:
             print(f"[DEBUG] Model attributes: {[attr for attr in dir(model) if 'kv' in attr.lower() or 'cache' in attr.lower()]}")
+            # Check if it's in a nested module
+            print(f"[DEBUG] Checking nested modules for KV cache manager...")
+            for name, module in model.named_modules():
+                if 'kv' in name.lower() or 'cache' in name.lower():
+                    print(f"[DEBUG] Found submodule: {name} -> {type(module).__name__}")
+
             kv_module = getattr(model, '_kv_cache_manager', None)
             embedding_module = getattr(model, 'dense_module', None)
             print(f"[DEBUG] Modules: kv_module={kv_module is not None}, embedding_module={embedding_module is not None}")
