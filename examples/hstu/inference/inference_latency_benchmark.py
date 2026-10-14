@@ -71,12 +71,76 @@ def run_inference_with_latency_tracking(
         dataloader = get_data_loader(dataset=dataset)
         dataloader_iter = iter(dataloader)
 
-        result = run_inference_with_latency_tracking(
-            checkpoint_dir=checkpoint_dir,
-            max_bs=max_bs,
-            disable_kvcache=disable_kvcache,
-            hotstate_controller=hotstate_controller,
-        )
+        batch_latencies = []
+        num_batches = 0
+        start_time = time.time()
+        cur_date = None
+
+        while True:
+            try:
+                uids, dates, seq_endptrs = next(dataloader_iter)
+                if dates[0] != cur_date:
+                    if cur_date is not None:
+                        break
+                    cur_date = dates[0]
+
+                batch = dataset.get_input_batch(
+                    uids,
+                    dates,
+                    seq_endptrs,
+                    torch.zeros_like(seq_endptrs),
+                    with_contextual_features=True,
+                    with_ranking_labels=False,
+                )
+                total_history_lengths = seq_endptrs * 2 + num_contextual_features
+
+                if batch is not None:
+                    if hotstate_controller is not None:
+                        hotstate_controller.before_batch(
+                            batch=batch,
+                            user_ids=uids,
+                            total_history_lengths=total_history_lengths,
+                            batch_idx=num_batches,
+                        )
+
+                    torch.cuda.synchronize()
+                    batch_start = time.perf_counter()
+
+                    if not disable_kvcache:
+                        _ = model.forward_with_kvcache(batch, uids, total_history_lengths)
+                    else:
+                        _ = model.forward_nokvcache(batch)
+
+                    torch.cuda.synchronize()
+                    batch_end = time.perf_counter()
+                    batch_latencies.append((batch_end - batch_start) * 1000)  # ms
+
+                    if hotstate_controller is not None:
+                        hotstate_controller.after_batch(batch, latency_ms=(batch_end - batch_start) * 1000)
+
+                num_batches += 1
+            except StopIteration:
+                break
+
+        end_time = time.time()
+        total_time = end_time - start_time
+
+        # Cleanup
+        del model
+        del hotstate_controller
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return {
+            "num_batches": num_batches,
+            "total_time_sec": total_time,
+            "mean_latency_ms": statistics.mean(batch_latencies) if batch_latencies else 0.0,
+            "stdev_latency_ms": statistics.stdev(batch_latencies) if len(batch_latencies) > 1 else 0.0,
+            "p95_latency_ms": percentile(batch_latencies, 0.95),
+            "p99_latency_ms": percentile(batch_latencies, 0.99),
+            "min_latency_ms": min(batch_latencies) if batch_latencies else 0.0,
+            "max_latency_ms": max(batch_latencies) if batch_latencies else 0.0,
+        }
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
