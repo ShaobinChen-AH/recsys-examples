@@ -625,6 +625,8 @@ def run_ranking_gr_simulate(
                             import traceback
                             traceback.print_exc()
 
+                    # PROFILING: Measure forward time
+                    forward_start = time.time()
                     if not disable_kvcache:
                         logits = model.forward_with_kvcache(
                             batch,
@@ -633,7 +635,13 @@ def run_ranking_gr_simulate(
                         )
                     else:
                         model.forward_nokvcache(batch)
+                    forward_elapsed_ms = 1000 * (time.time() - forward_start)
                     # eval_module(logits, batch.labels)
+
+                    # PROFILING: Log overhead vs benefit
+                    if hotstate_controller is not None and hotstate_result is not None:
+                        before_batch_total_ms = hotstate_result.get("profile_ms", {}).get("total", 0)
+                        print(f"[PROFILE BATCH {num_batches_ctr}] before_batch={before_batch_total_ms:.2f}ms forward={forward_elapsed_ms:.2f}ms net={forward_elapsed_ms - before_batch_total_ms:.2f}ms")
 
                 num_batches_ctr += 1
                 # if num_batches_ctr == 1000:
