@@ -355,7 +355,7 @@ def run_ranking_gr_simulate(
     )
 
     max_batch_size = max_bs
-    total_max_seqlen = dataset_args.max_sequence_length * 2 + num_contextual_features
+    total_max_seqlen = dataset_args.max_history_seqlen * 2 + num_contextual_features
     print("total_max_seqlen", total_max_seqlen)
 
     with torch.inference_mode():
