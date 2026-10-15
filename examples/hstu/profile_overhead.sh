@@ -3,7 +3,7 @@
 # Profiling script for HotState control plane overhead
 # Usage: bash profile_overhead.sh <checkpoint_dir> <gin_config>
 
-CHECKPOINT_DIR=${1:-./checkpoints/kuairand_1k_native/iter550}
+CHECKPOINT_DIR=${1:-/workspace/data/iter500}
 GIN_CONFIG=${2:-./inference/configs/kuairand_1k_inference_ranking.gin}
 OUTPUT_DIR=./profiles/overhead_analysis
 BATCH_COUNT=100
@@ -83,3 +83,4 @@ echo "Detailed logs:"
 echo "  $OUTPUT_DIR/baseline_no_hotstate.log"
 echo "  $OUTPUT_DIR/hotstate_enabled.log"
 echo "  $OUTPUT_DIR/hotstate_frozen.log"
+
