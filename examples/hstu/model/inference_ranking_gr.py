@@ -38,6 +38,10 @@ class InferenceRankingGR(torch.nn.Module):
         super().__init__()
         self.sparse_module = sparse_module
         self.dense_module = dense_module
+        # HotState integration
+        self._hotstate_controller = None
+        self._pending_embedding_prefetch = None
+        self._pending_kv_staged_handles = None
 
     def bfloat16(self):
         """
@@ -67,6 +71,30 @@ class InferenceRankingGR(torch.nn.Module):
 
     def get_metric_types(self):
         return self.dense_module.get_metric_types()
+
+    def prefetch_embedding_keys(self, keys):
+        """Apply HotState embedding prefetch hints.
+
+        This method is called by the control plane to signal which embedding
+        keys should be prefetched for the upcoming batch.
+        """
+        self._pending_embedding_prefetch = keys
+        # If sparse_module supports prefetch, delegate to it
+        if hasattr(self.sparse_module, 'hotstate_prefetch'):
+            self.sparse_module.hotstate_prefetch(keys)
+
+    def apply_kv_staged_handles(self, staged_handles):
+        """Apply HotState KV cache staged handles.
+
+        This method is called by the control plane to provide staged KV cache
+        handles that should be consumed during the next forward pass.
+        """
+        self._pending_kv_staged_handles = staged_handles
+        # If dense_module.async_kvcache supports it, inject staged handles
+        if hasattr(self.dense_module, 'async_kvcache'):
+            kvcache = self.dense_module.async_kvcache
+            if hasattr(kvcache, 'inject_staged_handles'):
+                kvcache.inject_staged_handles(staged_handles)
 
     def load_checkpoint(self, checkpoint_dir):
         if checkpoint_dir is None:

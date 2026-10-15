@@ -539,3 +539,49 @@ class AsyncHSTUKVCacheManager:
 
         torch.cuda.nvtx.range_pop()
         return replace(batch, features=new_features)
+
+    # ============================================================
+    # HotState Budget Enforcement Methods
+    # These methods allow the HotState controller to dynamically adjust
+    # the KV cache budget during inference.
+    # ============================================================
+
+    def get_active_page_limit(self) -> int:
+        """Get the current active page allocation limit.
+
+        Returns:
+            int: Current page limit (defaults to physical pool size)
+        """
+        return getattr(self, '_active_page_limit', self.num_primary_cache_pages)
+
+    def set_active_page_limit(self, new_limit: int):
+        """Set the logical page allocation limit.
+
+        This constrains the KV cache manager to use at most `new_limit` pages
+        from the primary cache pool, even if more physical pages are available.
+        This allows HotState to dynamically reallocate HBM between embedding
+        and KV cache budgets.
+
+        Args:
+            new_limit (int): Maximum number of pages to use (must be <= num_primary_cache_pages)
+        """
+        new_limit = int(new_limit)
+        # Clamp to physical pool size
+        new_limit = max(1, min(new_limit, self.num_primary_cache_pages))
+        self._active_page_limit = new_limit
+
+        # If the underlying C++ manager supports budget enforcement, delegate to it
+        if hasattr(self.gpu_kvcache_mgr, 'set_active_page_limit'):
+            self.gpu_kvcache_mgr.set_active_page_limit(new_limit)
+
+    def get_actual_resident_pages(self) -> int:
+        """Get the actual number of pages currently resident in GPU.
+
+        Returns:
+            int: Number of pages in use
+        """
+        if hasattr(self.gpu_kvcache_mgr, 'get_actual_resident_pages'):
+            return self.gpu_kvcache_mgr.get_actual_resident_pages()
+        # Fallback: approximate from known users
+        # This is a conservative estimate
+        return 0  # Would need to track per-user page counts

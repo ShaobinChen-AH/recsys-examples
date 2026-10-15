@@ -644,6 +644,14 @@ class HotStateController:
             "directory_history_tail": (
                 self.directory.history()[-32:] if trace_detail == "full" else []
             ),
+            # ============================================================
+            # CRITICAL: Forward path injection points
+            # These are the actual decisions that must be consumed by model.forward
+            # ============================================================
+            "embedding_prefetch_keys": policy_keys,  # Keys to prefetch
+            "kv_staged_handles": kv_stage,  # Staged KV prepare handles
+            "admitted_keys": result.admitted_keys,  # For logging
+            "evicted_keys": result.evicted_keys,  # For logging
         }
 
     def after_batch(self, batch, latency_ms: float):

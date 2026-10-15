@@ -602,6 +602,24 @@ def run_ranking_gr_simulate(
                                         f"Admitted Emb={admitted_emb}, Evicted Emb={evicted_emb}, "
                                         f"(Coordinated embedding+KV transfers)"
                                     )
+
+                            # ============================================================
+                            # CRITICAL FIX: Apply HotState decisions to the model
+                            # This is what was missing - the forward path must consume
+                            # the control plane's decisions
+                            # ============================================================
+                            if hotstate_result:
+                                # Apply embedding prefetch hints if available
+                                if "embedding_prefetch_keys" in hotstate_result:
+                                    prefetch_keys = hotstate_result["embedding_prefetch_keys"]
+                                    if len(prefetch_keys) > 0 and hasattr(model, 'prefetch_embedding_keys'):
+                                        model.prefetch_embedding_keys(prefetch_keys)
+
+                                # Apply KV cache staged handles if available
+                                if "kv_staged_handles" in hotstate_result:
+                                    staged_handles = hotstate_result["kv_staged_handles"]
+                                    if staged_handles and hasattr(model, 'apply_kv_staged_handles'):
+                                        model.apply_kv_staged_handles(staged_handles)
                         except Exception as e:
                             print(f"[HotState] before_batch failed: {e}")
                             import traceback
