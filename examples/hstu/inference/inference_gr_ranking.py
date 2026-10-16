@@ -267,6 +267,15 @@ def get_inference_hstu_model(
     else:
         blocks_in_primary_pool = 10240  # Default
 
+    # Log budget allocation for constraint binding analysis
+    import sys
+    print(f"[BUDGET_ALLOCATION] total_hbm_budget_bytes={total_hbm_bytes}", file=sys.stderr)
+    print(f"[BUDGET_ALLOCATION] hotstate_enabled={hotstate_enabled}", file=sys.stderr)
+    print(f"[BUDGET_ALLOCATION] embedding_hbm_bytes={embedding_hbm_bytes}", file=sys.stderr)
+    print(f"[BUDGET_ALLOCATION] kv_hbm_bytes={kv_hbm_bytes}", file=sys.stderr)
+    print(f"[BUDGET_ALLOCATION] kv_page_bytes={kv_page_bytes if kv_hbm_bytes > 0 else 0}", file=sys.stderr)
+    print(f"[BUDGET_ALLOCATION] blocks_in_primary_pool={blocks_in_primary_pool}", file=sys.stderr)
+
     kvcache_args = {
         "blocks_in_primary_pool": blocks_in_primary_pool,
         "page_size": 32,

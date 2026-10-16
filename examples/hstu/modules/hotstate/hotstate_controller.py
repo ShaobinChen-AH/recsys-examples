@@ -9,6 +9,7 @@ from modules.hotstate.hot_set_manager import HotSetManager
 from modules.hotstate.transfer_scheduler import TransferScheduler
 import time
 import os
+import sys
 from typing import Optional
 
 import torch
@@ -516,6 +517,15 @@ class HotStateController:
                   f"admission={admission_ms:.1f}ms "
                   f"ranking={ranking_ms:.1f}ms "
                   f"policy={policy_ms:.1f}ms ")
+
+            # Log KV page pressure for constraint binding analysis
+            kv_pressure = self.kv_adapter.get_page_pressure()
+            print(f"  [KV_PRESSURE epoch {self.epoch}] "
+                  f"resident_pages={kv_pressure['resident_pages']} "
+                  f"page_limit={kv_pressure['page_limit']} "
+                  f"physical_pages={kv_pressure['physical_pages']} "
+                  f"pressure_percent={kv_pressure['pressure_percent']:.1f}% "
+                  f"is_constrained={kv_pressure['is_constrained']}", file=sys.stderr)
                   
 
 

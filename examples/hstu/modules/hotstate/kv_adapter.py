@@ -214,6 +214,20 @@ class KVAdapter:
             return int(self._gpu_mgr.get_active_page_limit())
         return int(self._active_page_limit)
 
+    def get_page_pressure(self) -> dict:
+        """Return actual vs allocated KV page metrics for constraint binding analysis."""
+        resident = self.get_resident_page_count()
+        limit = self.get_current_page_limit()
+        physical = self.get_physical_page_count()
+        pressure = (resident / limit * 100) if limit > 0 else 0
+        return {
+            "resident_pages": resident,
+            "page_limit": limit,
+            "physical_pages": physical,
+            "pressure_percent": pressure,
+            "is_constrained": resident >= (limit * 0.95),  # 95% threshold
+        }
+
     def set_page_limit(self, new_limit: int) -> bool:
         """Adjust logical KV budget; physical KV tensor size is unchanged."""
         new_limit = int(new_limit)
