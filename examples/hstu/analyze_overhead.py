@@ -62,15 +62,32 @@ def analyze(baseline_log, hotstate_log, frozen_log=None):
     hotstate_total = parse_total_time(hotstate_log)
     frozen_total = parse_total_time(frozen_log) if frozen_log and Path(frozen_log).exists() else None
 
+    # Parse batch counts
+    baseline_batches = 0
+    hotstate_batches = 0
+    with open(baseline_log, 'r') as f:
+        for line in f:
+            if 'Total #batch:' in line:
+                match = re.search(r'Total #batch:\s+(\d+)', line)
+                if match:
+                    baseline_batches = int(match.group(1))
+    with open(hotstate_log, 'r') as f:
+        for line in f:
+            if 'Total #batch:' in line:
+                match = re.search(r'Total #batch:\s+(\d+)', line)
+                if match:
+                    hotstate_batches = int(match.group(1))
+
     print(f"Baseline (no HotState):")
     print(f"  Total time: {baseline_total:.2f}s")
-    print(f"  Batches: {len(baseline_timings)}")
-    print(f"  Avg batch time: {(baseline_total / len(baseline_timings) * 1000):.2f}ms (if available)")
+    print(f"  Batches: {baseline_batches}")
+    if baseline_batches > 0:
+        print(f"  Avg batch time: {(baseline_total / baseline_batches * 1000):.2f}ms")
     print()
 
     print(f"HotState Enabled:")
     print(f"  Total time: {hotstate_total:.2f}s")
-    print(f"  Batches: {len(hotstate_timings)}")
+    print(f"  Batches: {hotstate_batches}")
     if hotstate_timings:
         avg_before_batch = sum(t.get('before_batch', 0) for t in hotstate_timings) / len(hotstate_timings)
         avg_forward = sum(t.get('forward', 0) for t in hotstate_timings) / len(hotstate_timings)
@@ -82,31 +99,37 @@ def analyze(baseline_log, hotstate_log, frozen_log=None):
 
     if frozen_timings:
         print(f"HotState Frozen (overhead only):")
+        frozen_batches = 0
+        with open(frozen_log, 'r') as f:
+            for line in f:
+                if 'Total #batch:' in line:
+                    match = re.search(r'Total #batch:\s+(\d+)', line)
+                    if match:
+                        frozen_batches = int(match.group(1))
         print(f"  Total time: {frozen_total:.2f}s")
-        print(f"  Batches: {len(frozen_timings)}")
+        print(f"  Batches: {frozen_batches}")
         if frozen_timings:
             avg_before_batch_frozen = sum(t.get('before_batch', 0) for t in frozen_timings) / len(frozen_timings)
             print(f"  Avg before_batch: {avg_before_batch_frozen:.2f}ms")
         print()
 
     # Comparison
-    if baseline_total and hotstate_total:
-        overhead_ms = (hotstate_total - baseline_total) * 1000
-        overhead_pct = (overhead_ms / (baseline_total * 1000)) * 100 if baseline_total > 0 else 0
-        print(f"Overhead Impact:")
-        print(f"  Absolute: {overhead_ms:.1f}ms total")
-        print(f"  Relative: {overhead_pct:+.2f}%")
+    if baseline_total and hotstate_total and baseline_batches > 0:
+        total_overhead_ms = (hotstate_total - baseline_total) * 1000
+        overhead_pct = (total_overhead_ms / (baseline_total * 1000)) * 100 if baseline_total > 0 else 0
+        avg_overhead_per_batch = total_overhead_ms / baseline_batches if baseline_batches > 0 else 0
 
-        if len(hotstate_timings) > 0 and hotstate_timings[0].get('before_batch'):
-            avg_overhead_per_batch = sum(t.get('before_batch', 0) for t in hotstate_timings) / len(hotstate_timings)
-            print(f"  Per batch: {avg_overhead_per_batch:.2f}ms avg")
-            print(f"  Recommendation:")
-            if avg_overhead_per_batch > 5.0:
-                print(f"    ⚠ OVERHEAD > 5ms: control plane is expensive")
-            elif avg_overhead_per_batch > 2.0:
-                print(f"    ⚠ OVERHEAD > 2ms: non-negligible")
-            else:
-                print(f"    ✓ OVERHEAD < 2ms: acceptable if benefit exists")
+        print(f"Overhead Impact:")
+        print(f"  Absolute: {total_overhead_ms:.1f}ms total")
+        print(f"  Relative: {overhead_pct:+.2f}%")
+        print(f"  Per batch: {avg_overhead_per_batch:.2f}ms avg")
+        print(f"  Recommendation:")
+        if avg_overhead_per_batch > 5.0:
+            print(f"    ⚠ OVERHEAD > 5ms: control plane is expensive")
+        elif avg_overhead_per_batch > 2.0:
+            print(f"    ⚠ OVERHEAD > 2ms: non-negligible")
+        else:
+            print(f"    ✓ OVERHEAD < 2ms: acceptable if benefit exists")
         print()
 
     # Component breakdown
@@ -128,7 +151,9 @@ def analyze(baseline_log, hotstate_log, frozen_log=None):
 
     return {
         'baseline_total_s': baseline_total,
+        'baseline_batches': baseline_batches,
         'hotstate_total_s': hotstate_total,
+        'hotstate_batches': hotstate_batches,
         'overhead_pct': overhead_pct if baseline_total and hotstate_total else 0,
     }
 
