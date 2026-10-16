@@ -32,10 +32,10 @@ echo "Target: Expose HotState reallocation when KV budget is actually constraine
 echo ""
 
 for budget in "${BUDGETS[@]}"; do
-    budget_mb=$(printf "%.0f" $(echo "$budget * 1024" | bc))
+    budget_mb=$(python3 -c "print(int($budget * 1024))")
     echo "=== Testing budget: ${budget} GiB (${budget_mb} MB) ==="
     echo "    Expected: KV working set ≈ 32.8 MB"
-    utilization=$(echo "scale=1; 32.8 * 100 / ($budget * 1024)" | bc)
+    utilization=$(python3 -c "print(f'{32.8 * 100 / ($budget * 1024):.1f}')")
     echo "    Utilization: ${utilization}%"
     echo ""
 
