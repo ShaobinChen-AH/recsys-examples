@@ -126,11 +126,14 @@ def get_inference_dataset_and_embedding_configs(
     raise ValueError(f"dataset {dataset_args.dataset_name} is not supported")
 
 
-def _estimate_embedding_value_density(emb_configs):
+def _estimate_embedding_value_density(emb_configs, max_batch_size=1, max_num_candidates=100):
     """Estimate expected value density (bytes per state) for embedding states.
 
-    Returns a value in range [0.1, 1.0] representing relative embedding pressure.
+    Returns a value in range [0.1, 0.5] representing relative embedding pressure.
     Higher = more value in embedding states.
+
+    Uses access-pattern-based estimation instead of vocab-based to avoid
+    over-allocating for large sparse vocabularies with small working sets.
     """
     # Count total logical embedding bytes and unique keys
     total_emb_bytes = 0
@@ -142,12 +145,24 @@ def _estimate_embedding_value_density(emb_configs):
             unique_keys += config.vocab_size
 
     if unique_keys == 0:
-        return 0.5  # Default if no dynamic embeddings
+        return 0.3  # Default if no dynamic embeddings
 
-    # Embeddings are valuable when vocab size is large (sparse access patterns)
-    # Normalize by typical sequence length (assume ~4096 tokens)
-    sparsity_ratio = min(1.0, unique_keys / 4096.0)
-    return 0.3 + 0.5 * sparsity_ratio  # Range [0.3, 0.8]
+    # Estimate actual working set based on access patterns, not full vocab
+    # In recommendation inference: working set ≈ max_num_candidates per batch
+    # With some recency/popularity concentration
+    estimated_working_set = max_num_candidates * max_batch_size * 10  # 10x for recency window
+
+    # Access intensity: how concentrated is the working set vs vocab
+    # Higher concentration (small working set vs large vocab) = lower embedding value
+    # because most vocab is cold
+    access_concentration = min(1.0, estimated_working_set / max(1, unique_keys))
+
+    # Embedding value is proportional to working set size relative to typical batch
+    # Normalize by typical candidate set size (assume ~1000 items)
+    working_set_pressure = min(1.0, estimated_working_set / 1000.0)
+
+    # Lower value than KV by default since embedding can be regenerated more cheaply
+    return 0.1 + 0.3 * working_set_pressure + 0.1 * access_concentration  # Range [0.1, 0.5]
 
 
 def _estimate_kv_value_density(max_batch_size, total_max_seqlen, num_layers):
@@ -167,13 +182,13 @@ def _estimate_kv_value_density(max_batch_size, total_max_seqlen, num_layers):
 
 
 def _compute_adaptive_hbm_split(
-    emb_configs, max_batch_size, total_max_seqlen, num_layers, available_hbm_bytes
+    emb_configs, max_batch_size, total_max_seqlen, num_layers, available_hbm_bytes, max_num_candidates=100
 ):
     """Compute adaptive HBM split based on workload characteristics.
 
     Returns (embedding_hbm_bytes, kv_hbm_bytes) based on estimated value density.
     """
-    emb_density = _estimate_embedding_value_density(emb_configs)
+    emb_density = _estimate_embedding_value_density(emb_configs, max_batch_size, max_num_candidates)
     kv_density = _estimate_kv_value_density(max_batch_size, total_max_seqlen, num_layers)
 
     # Normalize densities to probabilities
@@ -195,6 +210,7 @@ def get_inference_hstu_model(
     checkpoint_dir,
     use_kvcache,
     return_controller=False,
+    max_num_candidates=100,
 ):
     network_args = NetworkArgs()
     if network_args.dtype_str == "bfloat16":
@@ -243,6 +259,7 @@ def get_inference_hstu_model(
                 total_max_seqlen=total_max_seqlen,
                 num_layers=network_args.num_layers,
                 available_hbm_bytes=available_hbm_bytes,
+                max_num_candidates=max_num_candidates,
             )
         else:
             # Fixed split: 60% embedding, 40% KV
@@ -364,6 +381,7 @@ def run_ranking_gr_simulate(
     )
 
     max_batch_size = max_bs
+    max_num_candidates = dataset_args.max_num_candidates if dataset_args.max_num_candidates > 0 else 100
     total_max_seqlen = dataset_args.max_history_seqlen * 2 + num_contextual_features
     print("total_max_seqlen", total_max_seqlen)
 
@@ -382,6 +400,7 @@ def run_ranking_gr_simulate(
                 checkpoint_dir,
                 True,
                 return_controller=True,
+                max_num_candidates=max_num_candidates,
             )
         else:
             model = get_inference_hstu_model(
@@ -392,6 +411,7 @@ def run_ranking_gr_simulate(
                 checkpoint_dir,
                 True,
                 return_controller=False,
+                max_num_candidates=max_num_candidates,
             )
             hotstate_controller = None
 
