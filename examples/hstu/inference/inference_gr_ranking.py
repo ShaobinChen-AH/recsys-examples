@@ -263,7 +263,7 @@ def get_inference_hstu_model(
         element_bytes = 2  # bfloat16/fp16
 
         kv_page_bytes = num_layers * 2 * page_size * num_kv_heads * head_dim * element_bytes
-        blocks_in_primary_pool = max(256, kv_hbm_bytes // kv_page_bytes)
+        blocks_in_primary_pool = max(64, kv_hbm_bytes // kv_page_bytes)
     else:
         blocks_in_primary_pool = 10240  # Default
 
