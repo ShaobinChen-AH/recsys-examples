@@ -251,6 +251,31 @@ def get_inference_hstu_model(
         DEFAULT_SAFETY_MARGIN_BYTES = 64 * 1024 * 1024  # 64 MiB
         available_hbm_bytes = total_hbm_bytes - DEFAULT_SAFETY_MARGIN_BYTES
 
+        # Auto-disable HotState when budget is very loose (>= 2× estimated working set)
+        # to avoid control plane overhead when constraint doesn't bind
+        if hotstate_enabled:
+            # Estimate KV working set: pages needed for max sequence
+            num_layers = network_args.num_layers
+            num_kv_heads = network_args.num_attention_heads
+            head_dim = network_args.kv_channels
+            page_size = 32
+            element_bytes = 2
+            kv_page_bytes = num_layers * 2 * page_size * num_kv_heads * head_dim * element_bytes
+            pages_needed = math.ceil(total_max_seqlen / page_size) * max_batch_size
+            kv_working_set_bytes = pages_needed * kv_page_bytes
+
+            # Estimate embedding working set: candidates × recency window
+            embedding_working_set_bytes = max_num_candidates * max_batch_size * 10 * network_args.hidden_size * 4
+
+            total_working_set = kv_working_set_bytes + embedding_working_set_bytes
+
+            # If budget >= 2× working set, constraint won't bind meaningfully
+            if available_hbm_bytes >= (2.0 * total_working_set):
+                import sys
+                print(f"[HOTSTATE_AUTO_DISABLE] Budget ({available_hbm_bytes:,} bytes) >= 2× working set ({total_working_set:,} bytes)", file=sys.stderr)
+                print(f"[HOTSTATE_AUTO_DISABLE] Disabling HotState to avoid control overhead in unconstrained scenario", file=sys.stderr)
+                hotstate_enabled = False
+
         if hotstate_enabled:
             # HotState: adaptive split based on workload characteristics
             embedding_hbm_bytes, kv_hbm_bytes = _compute_adaptive_hbm_split(
