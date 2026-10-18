@@ -125,12 +125,15 @@ class HotStateController:
         self._semantic_decisions = 0
 
         # Calibrate adapter (read actual table sizes)
+        print(f"[DEBUG HotStateController] About to calibrate embedding adapter...", flush=True)
         self.emb_adapter.calibrate()
+        print(f"[DEBUG HotStateController] Calibration complete, about to sync directory...", flush=True)
 
         # Initialize the directory from adapter observations.  This preserves
         # host/offloaded placements and all handle consistency metadata instead
         # of assuming every exported object is an HBM resident.
         self._sync_directory(epoch=0, include_registry=True)
+        print(f"[DEBUG HotStateController] Directory sync complete!", flush=True)
 
         self._cuda_mem_after = (
             dict(cuda_memory_after_construction)
@@ -141,15 +144,31 @@ class HotStateController:
 
     def _sync_directory(self, *, epoch: Optional[int] = None, include_registry: bool = False):
         """Merge current adapter observations into registry and directory."""
+        print(f"[DEBUG _sync_directory] Starting sync (epoch={epoch}, include_registry={include_registry})...", flush=True)
+
         handles = []
+        print(f"[DEBUG _sync_directory] Exporting embedding handles...", flush=True)
         handles.extend(self.emb_adapter.export_handles())
+        print(f"[DEBUG _sync_directory] Got {len(handles)} embedding handles", flush=True)
+
         if not self.hot_set.skip_kv_handles_for_admission_smoke:
+            print(f"[DEBUG _sync_directory] Exporting KV handles...", flush=True)
             handles.extend(self.kv_adapter.export_handles())
+            print(f"[DEBUG _sync_directory] Total handles: {len(handles)}", flush=True)
+
         if include_registry:
+            print(f"[DEBUG _sync_directory] Beginning registry epoch...", flush=True)
             self.registry.begin_epoch(0 if epoch is None else int(epoch), clear=True)
-        for handle in handles:
+            print(f"[DEBUG _sync_directory] Registry epoch begun", flush=True)
+
+        print(f"[DEBUG _sync_directory] Upserting {len(handles)} handles...", flush=True)
+        for i, handle in enumerate(handles):
+            if i % 100 == 0:
+                print(f"[DEBUG _sync_directory] Processing handle {i}/{len(handles)}...", flush=True)
             self.registry.upsert(handle)
             self.directory.observe_handle(handle, epoch=epoch)
+
+        print(f"[DEBUG _sync_directory] Sync complete!", flush=True)
         return handles
 
     @staticmethod

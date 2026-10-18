@@ -251,34 +251,38 @@ def get_inference_hstu_model(
         DEFAULT_SAFETY_MARGIN_BYTES = 64 * 1024 * 1024  # 64 MiB
         available_hbm_bytes = total_hbm_bytes - DEFAULT_SAFETY_MARGIN_BYTES
 
-        # Auto-disable HotState when budget is very loose (>= 3× estimated working set)
-        # to avoid control plane overhead when constraint doesn't bind
-        if hotstate_enabled:
-            # Estimate KV working set conservatively: just the active batch
-            num_layers = network_args.num_layers
-            num_kv_heads = network_args.num_attention_heads
-            head_dim = network_args.kv_channels
-            page_size = 32
-            element_bytes = 2
-            kv_page_bytes = num_layers * 2 * page_size * num_kv_heads * head_dim * element_bytes
-
-            # Only count pages for one batch's actual history, not max_seqlen
-            # Typical history per request in KuaiRand-1K ≈ 4096 tokens
-            typical_history_tokens = min(4096, total_max_seqlen // 2)
-            pages_per_batch = math.ceil(typical_history_tokens / page_size)
-            kv_working_set_bytes = pages_per_batch * kv_page_bytes
-
-            # Estimate embedding working set: only accessed candidates
-            embedding_working_set_bytes = max_num_candidates * network_args.hidden_size * 4
-
-            total_working_set = kv_working_set_bytes + embedding_working_set_bytes
-
-            # If budget >= 3× working set, constraint won't bind meaningfully
-            # Use 3× instead of 2× to be more conservative
-            if available_hbm_bytes >= (3.0 * total_working_set):
-                import sys
-                print(f"[HOTSTATE_AUTO_DISABLE] Budget ({available_hbm_bytes:,}) >= 3× working set ({total_working_set:,})", file=sys.stderr)
-                hotstate_enabled = False
+        # TEMPORARILY DISABLED: Auto-disable logic to focus on resource leak investigation
+        # The program hangs after DynamicEmb capacity warnings, before memory table printout
+        # Suspected GPU memory leak - need to isolate the issue without auto-disable interference
+        #
+        # # Auto-disable HotState when budget is very loose (>= 3× estimated working set)
+        # # to avoid control plane overhead when constraint doesn't bind
+        # if hotstate_enabled:
+        #     # Estimate KV working set conservatively: just the active batch
+        #     num_layers = network_args.num_layers
+        #     num_kv_heads = network_args.num_attention_heads
+        #     head_dim = network_args.kv_channels
+        #     page_size = 32
+        #     element_bytes = 2
+        #     kv_page_bytes = num_layers * 2 * page_size * num_kv_heads * head_dim * element_bytes
+        #
+        #     # Only count pages for one batch's actual history, not max_seqlen
+        #     # Typical history per request in KuaiRand-1K ≈ 4096 tokens
+        #     typical_history_tokens = min(4096, total_max_seqlen // 2)
+        #     pages_per_batch = math.ceil(typical_history_tokens / page_size)
+        #     kv_working_set_bytes = pages_per_batch * kv_page_bytes
+        #
+        #     # Estimate embedding working set: only accessed candidates
+        #     embedding_working_set_bytes = max_num_candidates * network_args.hidden_size * 4
+        #
+        #     total_working_set = kv_working_set_bytes + embedding_working_set_bytes
+        #
+        #     # If budget >= 3× working set, constraint won't bind meaningfully
+        #     # Use 3× instead of 2× to be more conservative
+        #     if available_hbm_bytes >= (3.0 * total_working_set):
+        #         import sys
+        #         print(f"[HOTSTATE_AUTO_DISABLE] Budget ({available_hbm_bytes:,}) >= 3× working set ({total_working_set:,})", file=sys.stderr)
+        #         hotstate_enabled = False
 
         if hotstate_enabled:
             # HotState: adaptive split based on workload characteristics
