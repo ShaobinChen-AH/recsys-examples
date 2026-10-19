@@ -348,6 +348,7 @@ def get_inference_hstu_model(
         "length_per_sequence": [128] + [i * 256 for i in range(1, 34)],
     }
 
+    print(f"[ORIGINAL_SYSTEM_DEBUG] About to call get_inference_ranking_gr...", flush=True)
     model = get_inference_ranking_gr(
         hstu_config=hstu_config,
         kvcache_config=kv_cache_config if use_kvcache else None,
@@ -356,12 +357,19 @@ def get_inference_hstu_model(
         cudagraph_configs=hstu_cudagraph_configs,
         dynamic_embedding_hbm_bytes=embedding_hbm_bytes,
     )
+    print(f"[ORIGINAL_SYSTEM_DEBUG] Model created, converting dtype...", flush=True)
+
     if hstu_config.bf16:
         model.bfloat16()
     elif hstu_config.fp16:
         model.half()
+
+    print(f"[ORIGINAL_SYSTEM_DEBUG] Loading checkpoint from {checkpoint_dir}...", flush=True)
     model.load_checkpoint(checkpoint_dir)
+    print(f"[ORIGINAL_SYSTEM_DEBUG] Checkpoint loaded, setting to eval mode...", flush=True)
+
     model.eval()
+    print(f"[ORIGINAL_SYSTEM_DEBUG] Model in eval mode!", flush=True)
 
     # Optionally create HotStateController for dynamic allocation
     hotstate_controller = None
@@ -420,11 +428,19 @@ def run_ranking_gr_simulate(
 
     with torch.inference_mode():
         # Get model and optionally the controller for dynamic allocation
+        print(f"[ORIGINAL_SYSTEM_DEBUG] Getting HotState enabled status...", flush=True)
         hotstate_enabled = get_hotstate_enabled()
+        print(f"[ORIGINAL_SYSTEM_DEBUG] hotstate_enabled={hotstate_enabled}", flush=True)
+
+        print(f"[ORIGINAL_SYSTEM_DEBUG] Getting HBM budget...", flush=True)
         total_hbm_bytes = get_hbm_budget_bytes()
+        print(f"[ORIGINAL_SYSTEM_DEBUG] total_hbm_bytes={total_hbm_bytes}", flush=True)
+
         return_controller = hotstate_enabled and total_hbm_bytes > 0
+        print(f"[ORIGINAL_SYSTEM_DEBUG] return_controller={return_controller}", flush=True)
 
         if return_controller:
+            print(f"[ORIGINAL_SYSTEM_DEBUG] Calling get_inference_hstu_model WITH controller...", flush=True)
             model, hotstate_controller = get_inference_hstu_model(
                 emb_configs,
                 max_batch_size,
@@ -435,7 +451,9 @@ def run_ranking_gr_simulate(
                 return_controller=True,
                 max_num_candidates=max_num_candidates,
             )
+            print(f"[ORIGINAL_SYSTEM_DEBUG] Model loading WITH controller complete!", flush=True)
         else:
+            print(f"[ORIGINAL_SYSTEM_DEBUG] Calling get_inference_hstu_model WITHOUT controller...", flush=True)
             model = get_inference_hstu_model(
                 emb_configs,
                 max_batch_size,
@@ -446,6 +464,7 @@ def run_ranking_gr_simulate(
                 return_controller=False,
                 max_num_candidates=max_num_candidates,
             )
+            print(f"[ORIGINAL_SYSTEM_DEBUG] Model loading WITHOUT controller complete!", flush=True)
             hotstate_controller = None
 
         if check_auc:

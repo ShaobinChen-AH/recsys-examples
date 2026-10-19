@@ -157,40 +157,23 @@ class EmbeddingAdapter:
         if self._module is None:
             return
         try:
-            print(f"[DEBUG calibrate] Starting calibration...", flush=True)
             storage = self._storage()
-            print(f"[DEBUG calibrate] Got storage: {type(storage)}", flush=True)
-
             states = []
             if hasattr(storage, "_hbm"):
-                print(f"[DEBUG calibrate] Found _hbm", flush=True)
                 states.append(storage._hbm)
             if hasattr(storage, "_host"):
-                print(f"[DEBUG calibrate] Found _host", flush=True)
                 states.append(storage._host)
             if hasattr(storage, "_state"):
-                print(f"[DEBUG calibrate] Found _state", flush=True)
                 states.append(storage._state)
             if not states:
                 raise RuntimeError(f"unsupported DynamicEmb storage {type(storage)!r}")
 
-            print(f"[DEBUG calibrate] Walking {len(states)} states...", flush=True)
-            # Add CUDA synchronization before walking device tensors to prevent hang
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-
             self._total_size_bytes = sum(
                 self._state_values_bytes(state) for state in states
             )
-            print(f"[DEBUG calibrate] Got total size: {self._total_size_bytes} bytes", flush=True)
-
             self._row_size_bytes = self.row_size_bytes()
-            print(f"[DEBUG calibrate] Got row size: {self._row_size_bytes} bytes", flush=True)
-
             self._introspection_error = None
-            print(f"[DEBUG calibrate] Calibration complete!", flush=True)
         except Exception as exc:
-            print(f"[DEBUG calibrate] Calibration failed: {exc}", flush=True)
             self._total_size_bytes = 0
             self._introspection_error = exc
 
@@ -429,34 +412,20 @@ class EmbeddingAdapter:
         # In a HybridStorage configuration, expose row-level observations so
         # the directory can represent real HBM/host placement.  The aggregate
         # fallback is retained for host-only and admission-smoke callers.
-        print(f"[DEBUG export_handles] Starting export_handles...", flush=True)
         recent_keys = list(dict.fromkeys(int(key) for key in self._recent_keys))
-        print(f"[DEBUG export_handles] Processing {len(recent_keys)} recent keys", flush=True)
-
         try:
-            print(f"[DEBUG export_handles] Observing residency for {len(recent_keys)} keys...", flush=True)
             observed = self._observed_residency(recent_keys)
-            print(f"[DEBUG export_handles] Residency observation complete", flush=True)
-        except (RuntimeError, TypeError, ValueError, AttributeError) as e:
-            print(f"[DEBUG export_handles] Residency observation failed: {e}", flush=True)
+        except (RuntimeError, TypeError, ValueError, AttributeError):
             observed = None
-
         if observed is not None:
             row_bytes = max(1, int(self.row_size_bytes()))
-            print(f"[DEBUG export_handles] Row bytes: {row_bytes}", flush=True)
             try:
                 hbm_state = getattr(self._storage(), "_hbm", None)
                 owner_device = str(getattr(hbm_state, "device", "cuda"))
             except Exception:
                 owner_device = None
-            print(f"[DEBUG export_handles] Owner device: {owner_device}", flush=True)
-
             handles = []
-            print(f"[DEBUG export_handles] Creating {len(recent_keys)} StateHandles...", flush=True)
-            for i, (key, location) in enumerate(zip(recent_keys, observed)):
-                if i % 1000 == 0:
-                    print(f"[DEBUG export_handles] Created {i}/{len(recent_keys)} handles...", flush=True)
-
+            for key, location in zip(recent_keys, observed):
                 if location == 1:
                     placements = {Placement.HBM}
                     tier = "hbm"
@@ -497,13 +466,11 @@ class EmbeddingAdapter:
                         },
                     )
                 )
-            print(f"[DEBUG export_handles] All {len(handles)} handles created!", flush=True)
             return handles
 
         # These aggregate handles are policy estimates only.  They are never
         # used as the physical HBM byte measurement.
-        print(f"[DEBUG export_handles] Using aggregate fallback handles", flush=True)
-        return [
+return [
             StateHandle(
                 state_type=StateType.EMBEDDING_HOT_ROWS,
                 logical_key="emb:item:hot_rows",
