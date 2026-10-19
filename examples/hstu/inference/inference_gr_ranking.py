@@ -424,26 +424,34 @@ class EmbeddingAccessTracer:
 
         Args:
             features: KeyedJaggedTensor from batch.features
-            emb_configs: List of embedding configs with feature names
+            emb_configs: List of InferenceEmbeddingConfig with feature_names
         """
         # Build map of feature_name -> config for dynamicemb tables
-        dynamicemb_features = {cfg.feature_name: cfg for cfg in emb_configs if cfg.use_dynamicemb}
+        # Note: each config can have multiple feature_names
+        dynamicemb_map = {}
+        for cfg in emb_configs:
+            if cfg.use_dynamicemb:
+                for fname in cfg.feature_names:
+                    dynamicemb_map[fname] = cfg
 
         # Extract IDs per feature
         if hasattr(features, 'keys') and callable(features.keys):
             feature_keys = features.keys()
 
             for feature_name in feature_keys:
-                # Only track dynamicemb tables
-                if feature_name not in dynamicemb_features:
+                # Only track dynamicemb features
+                if feature_name not in dynamicemb_map:
                     continue
 
-                # Initialize tracking for this table if first time
+                config = dynamicemb_map[feature_name]
+
+                # Initialize tracking for this feature if first time
                 if feature_name not in self.table_stats:
                     self.table_stats[feature_name] = {
                         'unique_per_batch': [],
                         'cumulative': set(),
                         'counts': {},  # item_id -> access count
+                        'config': config,  # Store config reference
                     }
 
                 stats = self.table_stats[feature_name]
@@ -487,18 +495,16 @@ class EmbeddingAccessTracer:
         print("EMBEDDING ACCESS PATTERN ANALYSIS (Per-Table, Data-Driven)")
         print("="*80)
 
-        # Build map of feature_name -> config for vocab and dim lookup
-        dynamicemb_configs = {cfg.feature_name: cfg for cfg in emb_configs if cfg.use_dynamicemb}
-
-        # Aggregate stats across all tables
+        # Aggregate stats across all features
         total_capacity_bytes = 0
         table_analyses = []
 
         for feature_name, stats in self.table_stats.items():
-            if feature_name not in dynamicemb_configs:
+            # Get config from stored reference
+            config = stats.get('config')
+            if config is None:
                 continue
 
-            config = dynamicemb_configs[feature_name]
             vocab_size = config.vocab_size
             dim = config.dim
 
@@ -526,7 +532,7 @@ class EmbeddingAccessTracer:
             top_10_pct_accesses = sum(sorted_counts[:top_10_pct]) if top_10_pct > 0 else 0
             access_concentration = top_10_pct_accesses / total_accesses if total_accesses > 0 else 0
 
-            # Full capacity for this table
+            # Full capacity for this feature's vocab
             full_capacity_bytes = vocab_size * bytes_per_item
             total_capacity_bytes += full_capacity_bytes
 
@@ -545,11 +551,15 @@ class EmbeddingAccessTracer:
                 'total_accesses': total_accesses,
             })
 
+        if len(table_analyses) == 0:
+            print("[EmbeddingAccessTracer] No valid table data collected")
+            return None
+
         # Sort by capacity (largest tables first)
         table_analyses.sort(key=lambda x: x['full_capacity_bytes'], reverse=True)
 
         # Print per-table analysis
-        print(f"\nPER-TABLE ANALYSIS ({len(table_analyses)} dynamicemb tables):")
+        print(f"\nPER-TABLE ANALYSIS ({len(table_analyses)} dynamicemb features):")
         print()
 
         for i, analysis in enumerate(table_analyses, 1):
@@ -557,7 +567,7 @@ class EmbeddingAccessTracer:
             mean_ws_mb = analysis['mean_ws_bytes'] / (1024 * 1024)
             p95_ws_mb = analysis['p95_ws_bytes'] / (1024 * 1024)
 
-            print(f"{i}. TABLE: {analysis['feature_name']}")
+            print(f"{i}. FEATURE: {analysis['feature_name']}")
             print(f"   Vocab size:              {analysis['vocab_size']:,}")
             print(f"   Full capacity:           {capacity_mb:.1f} MB")
             print(f"   Per-batch unique (mean): {analysis['mean_unique_per_batch']:.1f} items")
