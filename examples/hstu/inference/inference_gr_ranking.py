@@ -421,29 +421,35 @@ class EmbeddingAccessTracer:
         self.cumulative_unique = set()  # Set[int] - all items seen so far
         self.batch_idx = 0
 
-    def record_batch_access(self, batch, emb_configs):
-        """Extract and record all embedding IDs accessed in this batch."""
+    def record_batch_access(self, features, emb_configs):
+        """Extract and record all embedding IDs from KeyedJaggedTensor.
+
+        Args:
+            features: KeyedJaggedTensor from batch.features
+            emb_configs: List of embedding configs
+        """
         unique_this_batch = set()
 
-        # Extract item IDs from KeyedJaggedTensor
-        if hasattr(batch, 'sparse_features') and batch.sparse_features is not None:
-            kjt = batch.sparse_features
-            if isinstance(kjt, dict):
-                # Handle dict format
-                for feature_name, tensor_data in kjt.items():
-                    if hasattr(tensor_data, 'values'):
-                        values = tensor_data.values()
-                    else:
-                        values = tensor_data
-                    if torch.is_tensor(values):
-                        item_ids = values.cpu().numpy()
-                        unique_this_batch.update(item_ids.tolist())
-            else:
-                # Handle KeyedJaggedTensor format
-                values = kjt.values()
-                if torch.is_tensor(values):
-                    item_ids = values.cpu().numpy()
-                    unique_this_batch.update(item_ids.tolist())
+        # KeyedJaggedTensor.values() contains all the embedding IDs
+        if hasattr(features, 'values'):
+            values_tensor = features.values()
+            if torch.is_tensor(values_tensor):
+                # Convert to CPU and extract unique IDs
+                item_ids = values_tensor.cpu().numpy().tolist()
+                unique_this_batch.update(item_ids)
+
+        # If still empty, try direct extraction from keys
+        if len(unique_this_batch) == 0 and hasattr(features, 'keys'):
+            feature_keys = features.keys()
+            for key in feature_keys:
+                try:
+                    # Try to get per-key values
+                    key_values = features[key].values()
+                    if torch.is_tensor(key_values):
+                        item_ids = key_values.cpu().numpy().tolist()
+                        unique_this_batch.update(item_ids)
+                except:
+                    pass
 
         # Record unique items this batch
         self.batch_unique_items.append(unique_this_batch)
@@ -478,6 +484,14 @@ class EmbeddingAccessTracer:
 
         # 1. Per-batch statistics
         unique_per_batch = [len(s) for s in self.batch_unique_items]
+        if len(unique_per_batch) == 0 or sum(unique_per_batch) == 0:
+            print("\n[ERROR] No embedding IDs captured!")
+            print("This usually means:")
+            print("  1. The batch.features structure is different than expected")
+            print("  2. Features are on GPU and weren't transferred to CPU")
+            print("  3. The model uses a different embedding access pattern")
+            return None
+
         mean_unique = np.mean(unique_per_batch)
         p50_unique = np.percentile(unique_per_batch, 50)
         p95_unique = np.percentile(unique_per_batch, 95)
@@ -629,6 +643,7 @@ def _estimate_embedding_value_density(emb_configs, max_batch_size, max_num_candi
         }
 
 
+
 def run_ranking_gr_simulate(
     checkpoint_dir: str,
     check_auc: bool = False,
@@ -763,10 +778,11 @@ def run_ranking_gr_simulate(
                 if batch is not None:
                     # ============================================================
                     # INSTRUMENTATION: Record embedding access for this batch
+                    # Extract IDs from batch.features (KeyedJaggedTensor)
                     # ============================================================
-                    if enable_access_tracing:
+                    if enable_access_tracing and hasattr(batch, 'features'):
                         try:
-                            access_tracer.record_batch_access(batch, emb_configs)
+                            access_tracer.record_batch_access(batch.features, emb_configs)
                         except Exception as e:
                             print(f"[AccessTracer] Failed to record batch {num_batches_ctr}: {e}")
 
