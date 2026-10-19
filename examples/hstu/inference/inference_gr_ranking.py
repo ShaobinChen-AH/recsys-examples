@@ -407,240 +407,244 @@ def get_inference_hstu_model(
 class EmbeddingAccessTracer:
     """Instrument actual embedding access patterns to derive value density formula.
 
-    Collects:
-    - Unique items touched per batch
-    - Access frequency distribution (Zipf analysis)
-    - Per-batch working set size
-    - Cumulative working set growth over time
-    - Temporal locality (recency window analysis)
+    Tracks per-table statistics for each dynamicemb table separately:
+    - Per-table unique items accessed vs vocab size
+    - Per-table working set footprint
+    - Per-table access frequency distribution
+
+    Then aggregates by capacity share to get weighted value score.
     """
     def __init__(self):
-        self.batch_unique_items = []  # List[Set[int]] - unique items per batch
-        self.global_item_counts = {}  # Dict[int, int] - item_id -> access count
-        self.batch_working_set_sizes = []  # List[int] - bytes per batch
-        self.cumulative_unique = set()  # Set[int] - all items seen so far
+        # Per-table tracking: feature_name -> stats
+        self.table_stats = {}  # feature -> {unique_per_batch: [], cumulative: set(), counts: {}}
         self.batch_idx = 0
 
     def record_batch_access(self, features, emb_configs):
-        """Extract and record all embedding IDs from KeyedJaggedTensor.
+        """Extract and record per-table embedding IDs from KeyedJaggedTensor.
 
         Args:
             features: KeyedJaggedTensor from batch.features
-            emb_configs: List of embedding configs
+            emb_configs: List of embedding configs with feature names
         """
-        unique_this_batch = set()
+        # Build map of feature_name -> config for dynamicemb tables
+        dynamicemb_features = {cfg.feature_name: cfg for cfg in emb_configs if cfg.use_dynamicemb}
 
-        # KeyedJaggedTensor.values() contains all the embedding IDs
-        if hasattr(features, 'values'):
-            values_tensor = features.values()
-            if torch.is_tensor(values_tensor):
-                # Convert to CPU and extract unique IDs
-                item_ids = values_tensor.cpu().numpy().tolist()
-                unique_this_batch.update(item_ids)
-
-        # If still empty, try direct extraction from keys
-        if len(unique_this_batch) == 0 and hasattr(features, 'keys'):
+        # Extract IDs per feature
+        if hasattr(features, 'keys') and callable(features.keys):
             feature_keys = features.keys()
-            for key in feature_keys:
+
+            for feature_name in feature_keys:
+                # Only track dynamicemb tables
+                if feature_name not in dynamicemb_features:
+                    continue
+
+                # Initialize tracking for this table if first time
+                if feature_name not in self.table_stats:
+                    self.table_stats[feature_name] = {
+                        'unique_per_batch': [],
+                        'cumulative': set(),
+                        'counts': {},  # item_id -> access count
+                    }
+
+                stats = self.table_stats[feature_name]
+
                 try:
-                    # Try to get per-key values
-                    key_values = features[key].values()
-                    if torch.is_tensor(key_values):
-                        item_ids = key_values.cpu().numpy().tolist()
-                        unique_this_batch.update(item_ids)
-                except:
-                    pass
+                    # Get values for this specific feature
+                    feature_tensor = features[feature_name]
+                    if hasattr(feature_tensor, 'values'):
+                        values_tensor = feature_tensor.values()
+                    else:
+                        values_tensor = feature_tensor
 
-        # Record unique items this batch
-        self.batch_unique_items.append(unique_this_batch)
+                    if torch.is_tensor(values_tensor):
+                        # Convert to CPU and extract unique IDs for this batch
+                        item_ids = values_tensor.cpu().numpy().tolist()
+                        unique_this_batch = set(item_ids)
 
-        # Update global frequency counts
-        for item_id in unique_this_batch:
-            self.global_item_counts[item_id] = self.global_item_counts.get(item_id, 0) + 1
+                        # Record per-batch unique count
+                        stats['unique_per_batch'].append(len(unique_this_batch))
 
-        # Update cumulative unique set
-        self.cumulative_unique.update(unique_this_batch)
+                        # Update cumulative unique set
+                        stats['cumulative'].update(unique_this_batch)
 
-        # Estimate working set bytes for this batch
-        # Assume hidden_size=128, fp32=4 bytes per embedding
-        hidden_size = 128  # Will be updated from emb_configs if available
-        if emb_configs and len(emb_configs) > 0:
-            hidden_size = emb_configs[0].dim
-        bytes_per_item = hidden_size * 4  # fp32
-        working_set_bytes = len(unique_this_batch) * bytes_per_item
-        self.batch_working_set_sizes.append(working_set_bytes)
+                        # Update global frequency counts
+                        for item_id in unique_this_batch:
+                            stats['counts'][item_id] = stats['counts'].get(item_id, 0) + 1
+
+                except Exception as e:
+                    # Record zero for this batch if extraction fails
+                    stats['unique_per_batch'].append(0)
 
         self.batch_idx += 1
 
     def analyze_and_report(self, emb_configs):
-        """Analyze collected traces and derive data-driven constants."""
-        if len(self.batch_unique_items) == 0:
+        """Analyze per-table traces and derive weighted value density formula."""
+        if len(self.table_stats) == 0:
             print("[EmbeddingAccessTracer] No data collected")
             return None
 
         print("\n" + "="*80)
-        print("EMBEDDING ACCESS PATTERN ANALYSIS (Data-Driven)")
+        print("EMBEDDING ACCESS PATTERN ANALYSIS (Per-Table, Data-Driven)")
         print("="*80)
 
-        # 1. Per-batch statistics
-        unique_per_batch = [len(s) for s in self.batch_unique_items]
-        if len(unique_per_batch) == 0 or sum(unique_per_batch) == 0:
-            print("\n[ERROR] No embedding IDs captured!")
-            print("This usually means:")
-            print("  1. The batch.features structure is different than expected")
-            print("  2. Features are on GPU and weren't transferred to CPU")
-            print("  3. The model uses a different embedding access pattern")
-            return None
+        # Build map of feature_name -> config for vocab and dim lookup
+        dynamicemb_configs = {cfg.feature_name: cfg for cfg in emb_configs if cfg.use_dynamicemb}
 
-        mean_unique = np.mean(unique_per_batch)
-        p50_unique = np.percentile(unique_per_batch, 50)
-        p95_unique = np.percentile(unique_per_batch, 95)
-        max_unique = max(unique_per_batch)
+        # Aggregate stats across all tables
+        total_capacity_bytes = 0
+        table_analyses = []
 
-        print(f"\n1. PER-BATCH UNIQUE ITEMS:")
-        print(f"   Mean:  {mean_unique:.1f} items/batch")
-        print(f"   P50:   {p50_unique:.1f} items/batch")
-        print(f"   P95:   {p95_unique:.1f} items/batch")
-        print(f"   Max:   {max_unique} items/batch")
-
-        # 2. Working set size in bytes
-        mean_ws_bytes = np.mean(self.batch_working_set_sizes)
-        p95_ws_bytes = np.percentile(self.batch_working_set_sizes, 95)
-        mean_ws_mb = mean_ws_bytes / (1024 * 1024)
-        p95_ws_mb = p95_ws_bytes / (1024 * 1024)
-
-        print(f"\n2. PER-BATCH WORKING SET SIZE:")
-        print(f"   Mean:  {mean_ws_mb:.2f} MB/batch")
-        print(f"   P95:   {p95_ws_mb:.2f} MB/batch")
-
-        # 3. Cumulative working set growth
-        total_unique_items = len(self.cumulative_unique)
-        total_vocab = sum(cfg.vocab_size for cfg in emb_configs if cfg.use_dynamicemb)
-        coverage_ratio = total_unique_items / total_vocab if total_vocab > 0 else 0
-
-        print(f"\n3. CUMULATIVE WORKING SET:")
-        print(f"   Total unique items accessed: {total_unique_items:,}")
-        print(f"   Total vocabulary size:       {total_vocab:,}")
-        print(f"   Coverage ratio:              {coverage_ratio:.4%}")
-        print(f"   (Only {coverage_ratio:.2%} of vocab actually accessed!)")
-
-        # 4. Access frequency distribution (Zipf analysis)
-        sorted_counts = sorted(self.global_item_counts.values(), reverse=True)
-        total_accesses = sum(sorted_counts)
-
-        # Calculate concentration metrics
-        top_1_pct = int(0.01 * len(sorted_counts))
-        top_10_pct = int(0.10 * len(sorted_counts))
-        top_1_pct_accesses = sum(sorted_counts[:top_1_pct]) if top_1_pct > 0 else 0
-        top_10_pct_accesses = sum(sorted_counts[:top_10_pct]) if top_10_pct > 0 else 0
-
-        print(f"\n4. ACCESS FREQUENCY DISTRIBUTION:")
-        print(f"   Total accesses:              {total_accesses:,}")
-        print(f"   Top 1% items account for:    {100*top_1_pct_accesses/total_accesses:.1f}% of accesses")
-        print(f"   Top 10% items account for:   {100*top_10_pct_accesses/total_accesses:.1f}% of accesses")
-
-        # 5. Temporal locality (recency window analysis)
-        # Calculate: what % of items in batch N were also in batch N-k?
-        recency_windows = [1, 5, 10, 20, 50]
-        print(f"\n5. TEMPORAL LOCALITY (Recency Window Analysis):")
-        for window in recency_windows:
-            if len(self.batch_unique_items) <= window:
+        for feature_name, stats in self.table_stats.items():
+            if feature_name not in dynamicemb_configs:
                 continue
 
-            overlaps = []
-            for i in range(window, len(self.batch_unique_items)):
-                current_batch = self.batch_unique_items[i]
-                recent_union = set()
-                for j in range(max(0, i-window), i):
-                    recent_union.update(self.batch_unique_items[j])
+            config = dynamicemb_configs[feature_name]
+            vocab_size = config.vocab_size
+            dim = config.dim
 
-                if len(current_batch) > 0:
-                    overlap = len(current_batch & recent_union) / len(current_batch)
-                    overlaps.append(overlap)
+            # Per-batch statistics
+            unique_per_batch = stats['unique_per_batch']
+            if len(unique_per_batch) == 0 or sum(unique_per_batch) == 0:
+                continue
 
-            if overlaps:
-                avg_overlap = np.mean(overlaps)
-                print(f"   Window={window:3d} batches: {avg_overlap:.1%} of items are repeats")
+            mean_unique = np.mean(unique_per_batch)
+            p95_unique = np.percentile(unique_per_batch, 95)
 
-        # 6. DERIVE DATA-DRIVEN CONSTANTS
-        print(f"\n" + "="*80)
-        print("DERIVED CONSTANTS FOR VALUE DENSITY FORMULA:")
+            # Cumulative working set
+            cumulative_unique = len(stats['cumulative'])
+            coverage_ratio = cumulative_unique / vocab_size if vocab_size > 0 else 0
+
+            # Working set footprint in bytes
+            bytes_per_item = dim * 4  # fp32
+            mean_ws_bytes = mean_unique * bytes_per_item
+            p95_ws_bytes = p95_unique * bytes_per_item
+
+            # Access frequency distribution
+            sorted_counts = sorted(stats['counts'].values(), reverse=True)
+            total_accesses = sum(sorted_counts)
+            top_10_pct = int(0.10 * len(sorted_counts))
+            top_10_pct_accesses = sum(sorted_counts[:top_10_pct]) if top_10_pct > 0 else 0
+            access_concentration = top_10_pct_accesses / total_accesses if total_accesses > 0 else 0
+
+            # Full capacity for this table
+            full_capacity_bytes = vocab_size * bytes_per_item
+            total_capacity_bytes += full_capacity_bytes
+
+            table_analyses.append({
+                'feature_name': feature_name,
+                'vocab_size': vocab_size,
+                'dim': dim,
+                'mean_unique_per_batch': mean_unique,
+                'p95_unique_per_batch': p95_unique,
+                'cumulative_unique': cumulative_unique,
+                'coverage_ratio': coverage_ratio,
+                'mean_ws_bytes': mean_ws_bytes,
+                'p95_ws_bytes': p95_ws_bytes,
+                'access_concentration': access_concentration,
+                'full_capacity_bytes': full_capacity_bytes,
+                'total_accesses': total_accesses,
+            })
+
+        # Sort by capacity (largest tables first)
+        table_analyses.sort(key=lambda x: x['full_capacity_bytes'], reverse=True)
+
+        # Print per-table analysis
+        print(f"\nPER-TABLE ANALYSIS ({len(table_analyses)} dynamicemb tables):")
+        print()
+
+        for i, analysis in enumerate(table_analyses, 1):
+            capacity_mb = analysis['full_capacity_bytes'] / (1024 * 1024)
+            mean_ws_mb = analysis['mean_ws_bytes'] / (1024 * 1024)
+            p95_ws_mb = analysis['p95_ws_bytes'] / (1024 * 1024)
+
+            print(f"{i}. TABLE: {analysis['feature_name']}")
+            print(f"   Vocab size:              {analysis['vocab_size']:,}")
+            print(f"   Full capacity:           {capacity_mb:.1f} MB")
+            print(f"   Per-batch unique (mean): {analysis['mean_unique_per_batch']:.1f} items")
+            print(f"   Per-batch unique (P95):  {analysis['p95_unique_per_batch']:.1f} items")
+            print(f"   Working set (mean):      {mean_ws_mb:.2f} MB")
+            print(f"   Working set (P95):       {p95_ws_mb:.2f} MB")
+            print(f"   Cumulative unique:       {analysis['cumulative_unique']:,}")
+            print(f"   Coverage ratio:          {analysis['coverage_ratio']:.2%}")
+            print(f"   Access concentration:    {analysis['access_concentration']:.1%} (top 10%)")
+            print()
+
+        # Compute capacity-weighted metrics
+        weighted_mean_ws_bytes = sum(a['mean_ws_bytes'] * a['full_capacity_bytes'] for a in table_analyses) / total_capacity_bytes
+        weighted_p95_ws_bytes = sum(a['p95_ws_bytes'] * a['full_capacity_bytes'] for a in table_analyses) / total_capacity_bytes
+        weighted_coverage = sum(a['coverage_ratio'] * a['full_capacity_bytes'] for a in table_analyses) / total_capacity_bytes
+        weighted_concentration = sum(a['access_concentration'] * a['full_capacity_bytes'] for a in table_analyses) / total_capacity_bytes
+
         print("="*80)
+        print("CAPACITY-WEIGHTED AGGREGATE METRICS:")
+        print("="*80)
+        print(f"Total embedding capacity:    {total_capacity_bytes / (1024**2):.1f} MB")
+        print(f"Weighted mean working set:   {weighted_mean_ws_bytes / (1024**2):.2f} MB")
+        print(f"Weighted P95 working set:    {weighted_p95_ws_bytes / (1024**2):.2f} MB")
+        print(f"Weighted coverage ratio:     {weighted_coverage:.2%}")
+        print(f"Weighted concentration:      {weighted_concentration:.1%}")
+        print()
 
-        # Constant 1: Working set multiplier
-        # How much larger is working set vs per-batch access?
-        working_set_multiplier = total_unique_items / mean_unique if mean_unique > 0 else 1.0
-        print(f"\nConstant 1: WORKING_SET_MULTIPLIER = {working_set_multiplier:.1f}")
-        print(f"   (Cumulative unique / per-batch unique)")
-        print(f"   Current hardcoded guess: 10x")
-        print(f"   Data-driven value:       {working_set_multiplier:.1f}x")
-
-        # Constant 2: Typical cache size (from P95 working set)
-        typical_cache_mb = p95_ws_mb
-        print(f"\nConstant 2: TYPICAL_CACHE_SIZE = {typical_cache_mb:.1f} MB")
-        print(f"   (P95 working set size)")
-        print(f"   Current hardcoded guess: 50 MB")
-        print(f"   Data-driven value:       {typical_cache_mb:.1f} MB")
-
-        # Constant 3: Access concentration (how hot is the hot set?)
-        access_concentration = top_10_pct_accesses / total_accesses if total_accesses > 0 else 0.5
-        print(f"\nConstant 3: ACCESS_CONCENTRATION = {access_concentration:.3f}")
-        print(f"   (Top 10% items' share of total accesses)")
-        print(f"   Higher = more concentrated = better cache hit ratio")
-
-        # Constant 4: Vocab coverage ratio (how sparse is access really?)
-        print(f"\nConstant 4: VOCAB_COVERAGE_RATIO = {coverage_ratio:.6f}")
-        print(f"   (Accessed items / total vocab)")
-        print(f"   Lower = sparser = less value in caching full vocab")
-
-        # 7. PROPOSED FORMULA
-        print(f"\n" + "="*80)
+        # DERIVED FORMULA
+        print("="*80)
         print("PROPOSED VALUE DENSITY FORMULA (Data-Driven):")
         print("="*80)
+
+        typical_cache_mb = weighted_p95_ws_bytes / (1024 * 1024)
+
         print(f"""
 def _estimate_embedding_value_density(emb_configs, max_batch_size, max_num_candidates):
-    # Use measured working set, not vocab size
-    measured_working_set_items = {total_unique_items}  # from trace
-    measured_cache_size_mb = {typical_cache_mb:.1f}  # from P95 working set
+    # Measured from trace: P95 working set across all dynamicemb tables
+    MEASURED_TYPICAL_CACHE_MB = {typical_cache_mb:.2f}  # MB
 
-    # Calculate actual footprint
-    total_accessed_bytes = 0
+    # Measured access concentration (top 10% items)
+    MEASURED_CONCENTRATION = {weighted_concentration:.3f}
+
+    # Measured coverage ratio (accessed / vocab)
+    MEASURED_COVERAGE = {weighted_coverage:.4f}
+
+    # Calculate actual working set footprint from configs
+    total_working_set_bytes = 0
     for config in emb_configs:
         if config.use_dynamicemb:
-            # Use actual access coverage, not full vocab
-            accessed_items = min(measured_working_set_items, config.vocab_size)
-            total_accessed_bytes += accessed_items * config.dim * 4
+            # Use measured coverage ratio per table
+            accessed_items = int(config.vocab_size * MEASURED_COVERAGE)
+            total_working_set_bytes += accessed_items * config.dim * 4
 
-    working_set_mb = total_accessed_bytes / (1024 * 1024)
+    working_set_mb = total_working_set_bytes / (1024 * 1024)
 
-    # Scale by measured cache pressure
-    footprint_pressure = min(1.0, working_set_mb / measured_cache_size_mb)
+    # Footprint pressure: how much cache needed vs typical
+    footprint_pressure = min(1.0, working_set_mb / MEASURED_TYPICAL_CACHE_MB)
 
-    # Weight by access concentration (measured)
-    concentration_factor = {access_concentration:.3f}  # from trace
+    # Embedding value: lower than KV since working set is small
+    # and regeneration is cheaper than KV recomputation
+    # Range: [0.05, 0.20] vs KV's [0.4, 1.0]
+    base_value = 0.05
+    pressure_factor = 0.10 * footprint_pressure
+    concentration_factor = 0.05 * MEASURED_CONCENTRATION
 
-    # Embedding value: lower baseline since working set is tiny
-    # Range: [0.05, 0.20] - much lower than KV's [0.4, 1.0]
-    return 0.05 + 0.15 * footprint_pressure * concentration_factor
+    return base_value + pressure_factor + concentration_factor
         """)
 
-        print(f"\n" + "="*80)
-        print(f"KEY INSIGHT: Actual working set ({total_unique_items:,} items, {mean_ws_mb:.1f} MB)")
-        print(f"             is MUCH smaller than vocab ({total_vocab:,} items)")
-        print(f"             Coverage: {coverage_ratio:.2%} - this is why embedding gets over-allocated!")
+        print("="*80)
+        print("KEY INSIGHTS:")
+        print("="*80)
+        print(f"1. Actual working set ({weighted_mean_ws_bytes/(1024**2):.1f} MB mean, {weighted_p95_ws_bytes/(1024**2):.1f} MB P95)")
+        print(f"   is MUCH smaller than full capacity ({total_capacity_bytes/(1024**2):.1f} MB)")
+        print(f"2. Coverage: {weighted_coverage:.2%} - only a fraction of vocab is accessed")
+        print(f"3. Access is concentrated: top 10% items = {weighted_concentration:.1%} of accesses")
+        print(f"4. This explains over-allocation: value score used vocab size, not actual access")
         print("="*80 + "\n")
 
         return {
-            "mean_unique_per_batch": mean_unique,
-            "p95_unique_per_batch": p95_unique,
-            "mean_working_set_mb": mean_ws_mb,
-            "p95_working_set_mb": p95_ws_mb,
-            "total_unique_items": total_unique_items,
-            "vocab_coverage_ratio": coverage_ratio,
-            "working_set_multiplier": working_set_multiplier,
-            "typical_cache_mb": typical_cache_mb,
-            "access_concentration": access_concentration,
+            "table_analyses": table_analyses,
+            "weighted_mean_ws_mb": weighted_mean_ws_bytes / (1024**2),
+            "weighted_p95_ws_mb": weighted_p95_ws_bytes / (1024**2),
+            "weighted_coverage_ratio": weighted_coverage,
+            "weighted_concentration": weighted_concentration,
+            "total_capacity_mb": total_capacity_bytes / (1024**2),
         }
+
 
 
 
