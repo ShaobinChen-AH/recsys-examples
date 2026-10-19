@@ -502,7 +502,8 @@ class EmbeddingAdapter:
 
         # These aggregate handles are policy estimates only.  They are never
         # used as the physical HBM byte measurement.
-        print(f"[DEBUG export_handles] Using aggregate fallback handles", flush=True)return [
+        print(f"[DEBUG export_handles] Using aggregate fallback handles", flush=True)
+        return [
             StateHandle(
                 state_type=StateType.EMBEDDING_HOT_ROWS,
                 logical_key="emb:item:hot_rows",
