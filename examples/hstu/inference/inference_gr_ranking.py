@@ -20,6 +20,7 @@ import sys
 import time
 
 import gin
+import numpy as np
 import torch
 from commons.datasets import get_data_loader
 from commons.datasets.hstu_sequence_dataset import get_dataset
@@ -403,6 +404,231 @@ def get_inference_hstu_model(
     return model
 
 
+class EmbeddingAccessTracer:
+    """Instrument actual embedding access patterns to derive value density formula.
+
+    Collects:
+    - Unique items touched per batch
+    - Access frequency distribution (Zipf analysis)
+    - Per-batch working set size
+    - Cumulative working set growth over time
+    - Temporal locality (recency window analysis)
+    """
+    def __init__(self):
+        self.batch_unique_items = []  # List[Set[int]] - unique items per batch
+        self.global_item_counts = {}  # Dict[int, int] - item_id -> access count
+        self.batch_working_set_sizes = []  # List[int] - bytes per batch
+        self.cumulative_unique = set()  # Set[int] - all items seen so far
+        self.batch_idx = 0
+
+    def record_batch_access(self, batch, emb_configs):
+        """Extract and record all embedding IDs accessed in this batch."""
+        unique_this_batch = set()
+
+        # Extract item IDs from KeyedJaggedTensor
+        if hasattr(batch, 'sparse_features') and batch.sparse_features is not None:
+            kjt = batch.sparse_features
+            if isinstance(kjt, dict):
+                # Handle dict format
+                for feature_name, tensor_data in kjt.items():
+                    if hasattr(tensor_data, 'values'):
+                        values = tensor_data.values()
+                    else:
+                        values = tensor_data
+                    if torch.is_tensor(values):
+                        item_ids = values.cpu().numpy()
+                        unique_this_batch.update(item_ids.tolist())
+            else:
+                # Handle KeyedJaggedTensor format
+                values = kjt.values()
+                if torch.is_tensor(values):
+                    item_ids = values.cpu().numpy()
+                    unique_this_batch.update(item_ids.tolist())
+
+        # Record unique items this batch
+        self.batch_unique_items.append(unique_this_batch)
+
+        # Update global frequency counts
+        for item_id in unique_this_batch:
+            self.global_item_counts[item_id] = self.global_item_counts.get(item_id, 0) + 1
+
+        # Update cumulative unique set
+        self.cumulative_unique.update(unique_this_batch)
+
+        # Estimate working set bytes for this batch
+        # Assume hidden_size=128, fp32=4 bytes per embedding
+        hidden_size = 128  # Will be updated from emb_configs if available
+        if emb_configs and len(emb_configs) > 0:
+            hidden_size = emb_configs[0].dim
+        bytes_per_item = hidden_size * 4  # fp32
+        working_set_bytes = len(unique_this_batch) * bytes_per_item
+        self.batch_working_set_sizes.append(working_set_bytes)
+
+        self.batch_idx += 1
+
+    def analyze_and_report(self, emb_configs):
+        """Analyze collected traces and derive data-driven constants."""
+        if len(self.batch_unique_items) == 0:
+            print("[EmbeddingAccessTracer] No data collected")
+            return None
+
+        print("\n" + "="*80)
+        print("EMBEDDING ACCESS PATTERN ANALYSIS (Data-Driven)")
+        print("="*80)
+
+        # 1. Per-batch statistics
+        unique_per_batch = [len(s) for s in self.batch_unique_items]
+        mean_unique = np.mean(unique_per_batch)
+        p50_unique = np.percentile(unique_per_batch, 50)
+        p95_unique = np.percentile(unique_per_batch, 95)
+        max_unique = max(unique_per_batch)
+
+        print(f"\n1. PER-BATCH UNIQUE ITEMS:")
+        print(f"   Mean:  {mean_unique:.1f} items/batch")
+        print(f"   P50:   {p50_unique:.1f} items/batch")
+        print(f"   P95:   {p95_unique:.1f} items/batch")
+        print(f"   Max:   {max_unique} items/batch")
+
+        # 2. Working set size in bytes
+        mean_ws_bytes = np.mean(self.batch_working_set_sizes)
+        p95_ws_bytes = np.percentile(self.batch_working_set_sizes, 95)
+        mean_ws_mb = mean_ws_bytes / (1024 * 1024)
+        p95_ws_mb = p95_ws_bytes / (1024 * 1024)
+
+        print(f"\n2. PER-BATCH WORKING SET SIZE:")
+        print(f"   Mean:  {mean_ws_mb:.2f} MB/batch")
+        print(f"   P95:   {p95_ws_mb:.2f} MB/batch")
+
+        # 3. Cumulative working set growth
+        total_unique_items = len(self.cumulative_unique)
+        total_vocab = sum(cfg.vocab_size for cfg in emb_configs if cfg.use_dynamicemb)
+        coverage_ratio = total_unique_items / total_vocab if total_vocab > 0 else 0
+
+        print(f"\n3. CUMULATIVE WORKING SET:")
+        print(f"   Total unique items accessed: {total_unique_items:,}")
+        print(f"   Total vocabulary size:       {total_vocab:,}")
+        print(f"   Coverage ratio:              {coverage_ratio:.4%}")
+        print(f"   (Only {coverage_ratio:.2%} of vocab actually accessed!)")
+
+        # 4. Access frequency distribution (Zipf analysis)
+        sorted_counts = sorted(self.global_item_counts.values(), reverse=True)
+        total_accesses = sum(sorted_counts)
+
+        # Calculate concentration metrics
+        top_1_pct = int(0.01 * len(sorted_counts))
+        top_10_pct = int(0.10 * len(sorted_counts))
+        top_1_pct_accesses = sum(sorted_counts[:top_1_pct]) if top_1_pct > 0 else 0
+        top_10_pct_accesses = sum(sorted_counts[:top_10_pct]) if top_10_pct > 0 else 0
+
+        print(f"\n4. ACCESS FREQUENCY DISTRIBUTION:")
+        print(f"   Total accesses:              {total_accesses:,}")
+        print(f"   Top 1% items account for:    {100*top_1_pct_accesses/total_accesses:.1f}% of accesses")
+        print(f"   Top 10% items account for:   {100*top_10_pct_accesses/total_accesses:.1f}% of accesses")
+
+        # 5. Temporal locality (recency window analysis)
+        # Calculate: what % of items in batch N were also in batch N-k?
+        recency_windows = [1, 5, 10, 20, 50]
+        print(f"\n5. TEMPORAL LOCALITY (Recency Window Analysis):")
+        for window in recency_windows:
+            if len(self.batch_unique_items) <= window:
+                continue
+
+            overlaps = []
+            for i in range(window, len(self.batch_unique_items)):
+                current_batch = self.batch_unique_items[i]
+                recent_union = set()
+                for j in range(max(0, i-window), i):
+                    recent_union.update(self.batch_unique_items[j])
+
+                if len(current_batch) > 0:
+                    overlap = len(current_batch & recent_union) / len(current_batch)
+                    overlaps.append(overlap)
+
+            if overlaps:
+                avg_overlap = np.mean(overlaps)
+                print(f"   Window={window:3d} batches: {avg_overlap:.1%} of items are repeats")
+
+        # 6. DERIVE DATA-DRIVEN CONSTANTS
+        print(f"\n" + "="*80)
+        print("DERIVED CONSTANTS FOR VALUE DENSITY FORMULA:")
+        print("="*80)
+
+        # Constant 1: Working set multiplier
+        # How much larger is working set vs per-batch access?
+        working_set_multiplier = total_unique_items / mean_unique if mean_unique > 0 else 1.0
+        print(f"\nConstant 1: WORKING_SET_MULTIPLIER = {working_set_multiplier:.1f}")
+        print(f"   (Cumulative unique / per-batch unique)")
+        print(f"   Current hardcoded guess: 10x")
+        print(f"   Data-driven value:       {working_set_multiplier:.1f}x")
+
+        # Constant 2: Typical cache size (from P95 working set)
+        typical_cache_mb = p95_ws_mb
+        print(f"\nConstant 2: TYPICAL_CACHE_SIZE = {typical_cache_mb:.1f} MB")
+        print(f"   (P95 working set size)")
+        print(f"   Current hardcoded guess: 50 MB")
+        print(f"   Data-driven value:       {typical_cache_mb:.1f} MB")
+
+        # Constant 3: Access concentration (how hot is the hot set?)
+        access_concentration = top_10_pct_accesses / total_accesses if total_accesses > 0 else 0.5
+        print(f"\nConstant 3: ACCESS_CONCENTRATION = {access_concentration:.3f}")
+        print(f"   (Top 10% items' share of total accesses)")
+        print(f"   Higher = more concentrated = better cache hit ratio")
+
+        # Constant 4: Vocab coverage ratio (how sparse is access really?)
+        print(f"\nConstant 4: VOCAB_COVERAGE_RATIO = {coverage_ratio:.6f}")
+        print(f"   (Accessed items / total vocab)")
+        print(f"   Lower = sparser = less value in caching full vocab")
+
+        # 7. PROPOSED FORMULA
+        print(f"\n" + "="*80)
+        print("PROPOSED VALUE DENSITY FORMULA (Data-Driven):")
+        print("="*80)
+        print(f"""
+def _estimate_embedding_value_density(emb_configs, max_batch_size, max_num_candidates):
+    # Use measured working set, not vocab size
+    measured_working_set_items = {total_unique_items}  # from trace
+    measured_cache_size_mb = {typical_cache_mb:.1f}  # from P95 working set
+
+    # Calculate actual footprint
+    total_accessed_bytes = 0
+    for config in emb_configs:
+        if config.use_dynamicemb:
+            # Use actual access coverage, not full vocab
+            accessed_items = min(measured_working_set_items, config.vocab_size)
+            total_accessed_bytes += accessed_items * config.dim * 4
+
+    working_set_mb = total_accessed_bytes / (1024 * 1024)
+
+    # Scale by measured cache pressure
+    footprint_pressure = min(1.0, working_set_mb / measured_cache_size_mb)
+
+    # Weight by access concentration (measured)
+    concentration_factor = {access_concentration:.3f}  # from trace
+
+    # Embedding value: lower baseline since working set is tiny
+    # Range: [0.05, 0.20] - much lower than KV's [0.4, 1.0]
+    return 0.05 + 0.15 * footprint_pressure * concentration_factor
+        """)
+
+        print(f"\n" + "="*80)
+        print(f"KEY INSIGHT: Actual working set ({total_unique_items:,} items, {mean_ws_mb:.1f} MB)")
+        print(f"             is MUCH smaller than vocab ({total_vocab:,} items)")
+        print(f"             Coverage: {coverage_ratio:.2%} - this is why embedding gets over-allocated!")
+        print("="*80 + "\n")
+
+        return {
+            "mean_unique_per_batch": mean_unique,
+            "p95_unique_per_batch": p95_unique,
+            "mean_working_set_mb": mean_ws_mb,
+            "p95_working_set_mb": p95_ws_mb,
+            "total_unique_items": total_unique_items,
+            "vocab_coverage_ratio": coverage_ratio,
+            "working_set_multiplier": working_set_multiplier,
+            "typical_cache_mb": typical_cache_mb,
+            "access_concentration": access_concentration,
+        }
+
+
 def run_ranking_gr_simulate(
     checkpoint_dir: str,
     check_auc: bool = False,
@@ -501,6 +727,12 @@ def run_ranking_gr_simulate(
         scheduler_telemetry_interval = 100  # Log scheduler state every N batches
         cross_state_interval = 200  # Log cross-state comparison every N batches
         semantic_interval = 300  # Log semantic policies every N batches
+
+        # ============================================================
+        # INSTRUMENTATION: Trace actual embedding access patterns
+        # ============================================================
+        access_tracer = EmbeddingAccessTracer()
+        enable_access_tracing = True  # Set to True to collect trace data
         while True:
             try:
                 uids, dates, seq_endptrs = next(dataloader_iter)
@@ -529,6 +761,15 @@ def run_ranking_gr_simulate(
                 total_history_lengths = seq_endptrs * 2 + num_contextual_features
 
                 if batch is not None:
+                    # ============================================================
+                    # INSTRUMENTATION: Record embedding access for this batch
+                    # ============================================================
+                    if enable_access_tracing:
+                        try:
+                            access_tracer.record_batch_access(batch, emb_configs)
+                        except Exception as e:
+                            print(f"[AccessTracer] Failed to record batch {num_batches_ctr}: {e}")
+
                     # ============================================================
                     # GAP 3: Transfer Scheduler Telemetry
                     # Log scheduler coordination metrics periodically
@@ -732,6 +973,21 @@ def run_ranking_gr_simulate(
         end_time = time.time()
         print("Total #batch:", num_batches_ctr)
         print("Total time(s):", end_time - start_time)
+
+        # ============================================================
+        # INSTRUMENTATION: Analyze and report embedding access patterns
+        # ============================================================
+        if enable_access_tracing:
+            try:
+                trace_analysis = access_tracer.analyze_and_report(emb_configs)
+                if trace_analysis:
+                    print("\n[AccessTracer] Trace analysis completed successfully")
+                    print(f"   Use these measured constants to replace hardcoded guesses")
+                    print(f"   in _estimate_embedding_value_density()")
+            except Exception as e:
+                print(f"[AccessTracer] Analysis failed: {e}")
+                import traceback
+                traceback.print_exc()
 
         # ================================================================
         # GAP 3: Report Transfer Scheduler Activity Summary
