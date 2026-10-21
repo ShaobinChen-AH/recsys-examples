@@ -156,15 +156,18 @@ class HotSetManager:
                         and h.logical_key.rsplit(":", 1)[-1].isdigit()
                     ]
                     planned_embedding_keys = selected_item_keys[:target_keys]
-                    if self.skip_kv_handles_for_admission_smoke and not selected_item_keys:
-                        # Compatibility path for aggregate admission-smoke adapters.
-                        planned_embedding_keys = self.value_engine.rank_embedding_item_indices(
+                    if not selected_item_keys:
+                        # Aggregate handles reserve bytes but do not identify
+                        # individual rows. Use the current demand to turn that
+                        # selected embedding budget into concrete row actions.
+                        ranked_item_keys = self.value_engine.rank_embedding_item_indices(
                             item_indices=item_indices,
                             item_sequence=getattr(demand, "item_sequence", item_indices),
                             demand=demand,
                             row_size_bytes=row_size,
                             return_trace=False,
-                        )[:target_keys]
+                        )
+                        planned_embedding_keys = ranked_item_keys[:target_keys]
             except (RuntimeError, TypeError, ValueError):
                 # Host-only/admission-smoke configurations have no physical
                 # movement API; the adapter will report no applied action.

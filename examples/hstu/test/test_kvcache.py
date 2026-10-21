@@ -128,7 +128,7 @@ def get_test_userids_and_metadata(
             for idx in range(batch_size)
         ],
         0,
-    ).int()
+    ).int().to(user_ids.device)
 
     kv_offload_handle = paged_kvcache_ops.KVOffloadHandle(
         num_layers, gpu_kvcache_mgr, True
