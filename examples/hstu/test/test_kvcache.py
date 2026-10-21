@@ -436,7 +436,7 @@ def test_kvcache_suffix_release_then_append_after_host_prefix(
         manager.cache_table[0, append_page, 0, 0, 0], keys[0, 0]
     )
     assert torch.equal(
-        manager.cache_table[0, append_page, 1, 31, 0], values[31, 0, 0]
+        manager.cache_table[0, append_page, 1, 31, 0], values[31, 0]
     )
 
 
@@ -444,6 +444,7 @@ if __name__ == "__main__":
     random.seed(1)
     torch.manual_seed(0)
     test_kvcache_offload_onload()
+
 
 
 
