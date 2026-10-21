@@ -324,7 +324,8 @@ def run_arbiter(dataset, total_available, warmup_batches, measure_batches,
         with torch.inference_mode():
             logits = model.forward_with_kvcache(batch, uids, thl)
         torch.cuda.synchronize()
-        latency_ms = (time.perf_counter() - t0) * 1000.0
+        forward_latency_ms = (time.perf_counter() - t0) * 1000.0
+        end_to_end_latency_ms = forward_latency_ms
 
         try:
             async_kvcache = model.dense_module.async_kvcache
@@ -355,7 +356,11 @@ def run_arbiter(dataset, total_available, warmup_batches, measure_batches,
             "kv_budget_bytes": kv_budget,
             "blocks_in_primary_pool": blocks,
             "batch_idx": len(trace_records),
-            "latency_ms": latency_ms,
+            "latency_ms": end_to_end_latency_ms,
+            "forward_latency_ms": forward_latency_ms,
+            "end_to_end_latency_ms": end_to_end_latency_ms,
+            "latency_metric": "end_to_end_latency_ms",
+            "end_to_end_scope": "forward_completion",
             "seq_history_len": hist_len,
             "user_id": user_id,
         }
@@ -363,14 +368,15 @@ def run_arbiter(dataset, total_available, warmup_batches, measure_batches,
         i += 1
 
         if i % 20 == 0:
-            print(f"  [{i}/{measure_batches}] latency={latency_ms:.2f}ms "
+            print(f"  [{i}/{measure_batches}] end_to_end={end_to_end_latency_ms:.2f}ms "
                   f"hist={hist_len}")
 
     # ── Cleanup ───────────────────────────────────────────────────────────
     teardown_model(model)
 
     # ── Statistics ────────────────────────────────────────────────────────
-    lats = sorted(r["latency_ms"] for r in trace_records)
+    lats = sorted(r["end_to_end_latency_ms"] for r in trace_records)
+    forward_lats = sorted(r["forward_latency_ms"] for r in trace_records)
     n = len(lats)
 
     def pct(sorted_vals, ratio):
@@ -388,7 +394,18 @@ def run_arbiter(dataset, total_available, warmup_batches, measure_batches,
         "max": max(lats) if n else float("nan"),
         "switch_count": switch_count,
         "num_records": n,
+        "comparison_latency_metric": "end_to_end_latency_ms",
+        "forward_latency_stats": {
+            "n": len(forward_lats),
+            "mean_ms": sum(forward_lats) / len(forward_lats)
+            if forward_lats else float("nan"),
+            "p95_ms": pct(forward_lats, 0.95),
+            "p99_ms": pct(forward_lats, 0.99),
+            "max_ms": max(forward_lats) if forward_lats else float("nan"),
+        },
     }
+    if results["forward_latency_stats"]["n"] == 0:
+        results["forward_latency_stats"] = None
 
     # ── Write JSONL ───────────────────────────────────────────────────────
     with open(out_jsonl, "w") as f:
@@ -449,6 +466,8 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
                          static_baseline_jsonl=None,
                          require_static_baseline=False):
     """Run with full HotState controller — zero rebuilds, self-discovering."""
+
+    from modules.hotstate.inference_runtime import measure_inference_request
 
     state_budget = int(
         total_hbm_bytes if state_hbm_budget_bytes is None else state_hbm_budget_bytes
@@ -544,27 +563,27 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
         batch, uids, thl = next(it)
        
         batch_fingerprint = make_batch_fingerprint(batch, uids, thl)
-        control_start = time.perf_counter()
-        control = controller.before_batch(batch, uids, thl)
-        hotstate_control_ms = (time.perf_counter() - control_start) * 1000.0
+        accepts_before = int(hotstate_admit_strategy.num_accepted) if hotstate_admit_strategy else 0
+        rejects_before = int(hotstate_admit_strategy.num_rejected) if hotstate_admit_strategy else 0
+        logits, control, post_control, timings = measure_inference_request(
+            model,
+            batch,
+            uids,
+            thl,
+            controller=controller,
+            batch_idx=i,
+        )
+        hotstate_control_ms = timings["hotstate_control_ms"]
+        hotstate_post_control_ms = timings["hotstate_post_control_ms"]
+        forward_latency_ms = timings["forward_latency_ms"]
+        end_to_end_latency_ms = timings["end_to_end_latency_ms"]
+        latency_ms = end_to_end_latency_ms
 
         origin_cached_length = None
         max_origin_cached_length = None
         new_tokens = None
         offload_pages = None
         max_seqlen = None
-
-        accepts_before = int(hotstate_admit_strategy.num_accepted) if hotstate_admit_strategy else 0
-        rejects_before = int(hotstate_admit_strategy.num_rejected) if hotstate_admit_strategy else 0
-
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-
-        with torch.inference_mode():
-            logits = model.forward_with_kvcache(batch, uids, thl)
-
-        torch.cuda.synchronize()
-        latency_ms = (time.perf_counter() - t0) * 1000.0
 
         accepts_after = int(hotstate_admit_strategy.num_accepted) if hotstate_admit_strategy else 0
         rejects_after = int(hotstate_admit_strategy.num_rejected) if hotstate_admit_strategy else 0
@@ -591,9 +610,6 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
             if i == 0:
                 print(f"[HotState metric debug] failed: {repr(e)}")
         
-        post_control_start = time.perf_counter()
-        post_control = controller.after_batch(batch, latency_ms)
-        hotstate_post_control_ms = (time.perf_counter() - post_control_start) * 1000.0
         physical_after = controller.physical_hbm_snapshot()
 
         hist_len = thl[0].item() // 2
@@ -629,7 +645,11 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
             "policy_planned_admitted": control.get("admitted", []),
             "batch_idx": i,
             "latency_ms": latency_ms,
+            "forward_latency_ms": forward_latency_ms,
+            "end_to_end_latency_ms": end_to_end_latency_ms,
+            "latency_metric": "end_to_end_latency_ms",
             "latency_semantics": "inference_only",
+            "end_to_end_scope": timings["end_to_end_scope"],
             "batch_fingerprint": batch_fingerprint,
             "hotstate_control_ms": hotstate_control_ms,
             "hotstate_post_control_ms": hotstate_post_control_ms,
@@ -714,23 +734,26 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
             "admission_strategy_enabled": hotstate_admit_strategy is not None,
             "implementation_scope": "fixed_shared_hbm_inference",
             "benchmark_variant": "admission_smoke" if smoke_mode else "physical_envelope",
-            "online_reallocation_observed": False,
+            "online_pool_resize_observed": False,
             "model_rebuild_count": 0,
         })
         if i < 5 or latency_ms > 10:
             print(
-                f"[KVDBG {i+1}] latency={latency_ms:.2f}ms hist={hist_len} "
+                f"[KVDBG {i+1}] end_to_end={end_to_end_latency_ms:.2f}ms "
+                f"forward={forward_latency_ms:.2f}ms hist={hist_len} "
                 f"origin={origin_cached_length} max_origin={max_origin_cached_length} "
                 f"new_tokens={new_tokens} offload_pages={offload_pages} "
                 f"max_seqlen={max_seqlen}"
         )
         if i % 20 == 0:
-            print(f"  [{i+1}/{measure_batches}] latency={latency_ms:.2f}ms "
+            print(f"  [{i+1}/{measure_batches}] end_to_end={end_to_end_latency_ms:.2f}ms "
+                  f"forward={forward_latency_ms:.2f}ms "
                   f"hist={hist_len} kv_pages={control['kv_page_budget']}")
 
     teardown_model(model, wait_for_workers=False)
 
-    lats = sorted(r["latency_ms"] for r in trace_records)
+    lats = sorted(r["end_to_end_latency_ms"] for r in trace_records)
+    forward_lats = sorted(r["forward_latency_ms"] for r in trace_records)
     n = len(lats)
     def pct(v, r):
         return v[min(len(v)-1, int(len(v)*r))] if v else float("nan")
@@ -769,6 +792,15 @@ def run_hotstate_arbiter(dataset, total_available, warmup_batches,
         "mean": sum(lats)/n, "p50": pct(lats,0.5), "p95": pct(lats,0.95),
         "p99": pct(lats,0.99), "p99_9": pct(lats,0.999),
         "max": max(lats), "num_records": n,
+        "comparison_latency_metric": "end_to_end_latency_ms",
+        "forward_latency_stats": {
+            "n": len(forward_lats),
+            "mean_ms": sum(forward_lats) / len(forward_lats)
+            if forward_lats else float("nan"),
+            "p95_ms": pct(forward_lats, 0.95),
+            "p99_ms": pct(forward_lats, 0.99),
+            "max_ms": max(forward_lats) if forward_lats else float("nan"),
+        },
         "switch_count": 0,
         "planned_kv_page_budget_range": (
             f"{min(kv_budget_history)}-{max(kv_budget_history)}"
@@ -926,12 +958,17 @@ def main():
     print(f"\n{'=' * 60}")
     print(f"RESULTS ({args.mode} mode)")
     print(f"{'=' * 60}")
-    print(f"  Mean:          {results['mean']:6.2f}ms")
-    print(f"  P50:           {results['p50']:6.2f}ms")
-    print(f"  P95:           {results['p95']:6.2f}ms")
-    print(f"  P99:           {results['p99']:6.2f}ms")
-    print(f"  P99.9:         {results['p99_9']:6.2f}ms")
-    print(f"  Max:           {results['max']:6.2f}ms")
+    print(f"  Mean end-to-end: {results['mean']:6.2f}ms")
+    print(f"  P50 end-to-end:  {results['p50']:6.2f}ms")
+    print(f"  P95 end-to-end:  {results['p95']:6.2f}ms")
+    print(f"  P99 end-to-end:  {results['p99']:6.2f}ms")
+    print(f"  P99.9 end-to-end:{results['p99_9']:6.2f}ms")
+    print(f"  Max end-to-end:  {results['max']:6.2f}ms")
+    if results.get("forward_latency_stats"):
+        print(
+            "  Mean forward (attribution): "
+            f"{results['forward_latency_stats']['mean_ms']:6.2f}ms"
+        )
     print(f"  Switches:      {results['switch_count']}")
     print(f"  Records:       {results['num_records']}")
     if "discovered_policy" in results:
@@ -943,8 +980,8 @@ def main():
         print(f"  Evidence scope: {report['implementation_scope']}")
         print(f"  Physical rows validated: {report['physical_rows_validated']}")
         print(
-            "  Online reallocation demonstrated: "
-            f"{report['claims']['online_cross_type_reallocation']}"
+            "  Online cross-pool physical resize demonstrated: "
+            f"{report['claims']['online_cross_pool_resize']}"
         )
         if results.get("static_comparison") is not None:
             print(

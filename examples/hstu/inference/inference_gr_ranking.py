@@ -179,12 +179,13 @@ def get_inference_hstu_model(
     total_hbm_bytes = get_hbm_budget_bytes()
     hotstate_enabled = get_hotstate_enabled()
     policy_config = load_policy_config()
+    embedding_ratio = None
 
     if total_hbm_bytes > 0:
         ratio_override = get_embedding_hbm_ratio()
-        embedding_ratio = ratio_override if ratio_override is not None else (
-            policy_config.initial_embedding_ratio if hotstate_enabled
-            else policy_config.static_embedding_ratio
+        embedding_ratio = policy_config.construction_embedding_ratio(
+            hotstate_enabled=hotstate_enabled,
+            override=ratio_override,
         )
         budget_plan = plan_physical_budget(
             state_budget_bytes=total_hbm_bytes,
@@ -210,14 +211,20 @@ def get_inference_hstu_model(
         blocks_in_primary_pool = 10240
         kv_page_bytes = 0
 
-    # Log budget allocation for constraint binding analysis
+    # Log the construction-time pool split and fixed capacities.
     import sys
-    print(f"[BUDGET_ALLOCATION] total_hbm_budget_bytes={total_hbm_bytes}", file=sys.stderr)
-    print(f"[BUDGET_ALLOCATION] hotstate_enabled={hotstate_enabled}", file=sys.stderr)
-    print(f"[BUDGET_ALLOCATION] embedding_hbm_bytes={embedding_hbm_bytes}", file=sys.stderr)
-    print(f"[BUDGET_ALLOCATION] kv_hbm_bytes={kv_hbm_bytes}", file=sys.stderr)
-    print(f"[BUDGET_ALLOCATION] kv_page_bytes={kv_page_bytes if kv_hbm_bytes > 0 else 0}", file=sys.stderr)
-    print(f"[BUDGET_ALLOCATION] blocks_in_primary_pool={blocks_in_primary_pool}", file=sys.stderr)
+    print(f"[HOTSTATE_CONSTRUCTION] state_budget_bytes={total_hbm_bytes}", file=sys.stderr)
+    print(f"[HOTSTATE_CONSTRUCTION] controller_enabled={hotstate_enabled}", file=sys.stderr)
+    print(f"[HOTSTATE_CONSTRUCTION] embedding_pool_bytes={embedding_hbm_bytes}", file=sys.stderr)
+    print(
+        "[HOTSTATE_CONSTRUCTION] "
+        f"embedding_pool_ratio={embedding_ratio if embedding_ratio is not None else 'unbounded'}",
+        file=sys.stderr,
+    )
+    print(f"[HOTSTATE_CONSTRUCTION] kv_pool_bytes={kv_hbm_bytes}", file=sys.stderr)
+    print(f"[HOTSTATE_CONSTRUCTION] kv_page_bytes={kv_page_bytes if kv_hbm_bytes > 0 else 0}", file=sys.stderr)
+    print(f"[HOTSTATE_CONSTRUCTION] kv_primary_pages={blocks_in_primary_pool}", file=sys.stderr)
+    print("[HOTSTATE_CONSTRUCTION] pool_split_fixed_after_model_build=true", file=sys.stderr)
 
     kvcache_args = {
         "blocks_in_primary_pool": blocks_in_primary_pool,
@@ -702,7 +709,7 @@ def run_ranking_gr_simulate(
         # ================================================================
         if hotstate_controller is not None:
             try:
-                budget_summary = hotstate_controller.report_budget_enforcement_summary()
+                hotstate_controller.report_residency_limit_summary()
                 scheduler_summary = hotstate_controller.report_scheduler_summary()
 
                 # ================================================================

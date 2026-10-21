@@ -232,7 +232,7 @@ class KVAdapter:
             "active_page_limit_bytes": active_pages * page_bytes,
             "active_page_limit_pages": active_pages,
             "resident_page_bytes": int(self.actual_resident_kv_bytes()),
-            "physical_resize_supported": False,
+            "physical_pool_resize_supported": False,
             "logical_limit_supported": hasattr(self._gpu_mgr, "set_active_page_limit"),
             "segment_release_supported": callable(getattr(self._gpu_mgr, "evict_user_suffix_pages", None)),
             "requested_granularity": self.granularity,

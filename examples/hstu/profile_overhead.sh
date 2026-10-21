@@ -46,7 +46,7 @@ echo "[2/3] HotState enabled complete. Extracting metrics..."
 grep "^\[PROFILE" $OUTPUT_DIR/hotstate_enabled.log > $OUTPUT_DIR/hotstate_timings.txt
 grep "^Total time" $OUTPUT_DIR/hotstate_enabled.log >> $OUTPUT_DIR/hotstate_timings.txt
 
-# Test 3: HotState enabled but frozen (no reallocation to isolate overhead)
+# Test 3: HotState enabled with residency changes frozen to isolate overhead
 echo "[3/3] Running with HotState frozen (overhead only, no benefit)..."
 export HOTSTATE_ENABLED=1
 export HOTSTATE_FREEZE_ALLOCATION=1

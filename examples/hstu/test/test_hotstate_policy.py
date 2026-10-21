@@ -54,8 +54,19 @@ def test_policy_configuration_is_validated_and_reproducible():
         benefit_weight=2.0, kv_granularity="user"
     ).snapshot()["config_id"]
     assert WeightedValue(config)(ValueInputs(3.0, 1.0, 0.5, 0.5)) == pytest.approx(4.0)
-    with pytest.raises(ValueError, match="initial_embedding_ratio"):
-        PolicyConfig(initial_embedding_ratio=1.5)
+    with pytest.raises(ValueError, match="construction_embedding_hbm_ratio"):
+        PolicyConfig(construction_embedding_hbm_ratio=1.5)
+    with pytest.raises(ValueError, match="construction_embedding_hbm_ratio"):
+        PolicyConfig(construction_embedding_hbm_ratio=float("nan"))
+
+
+def test_construction_pool_split_is_a_real_configurable_parameter():
+    config = PolicyConfig(construction_embedding_hbm_ratio=0.37)
+    assert config.construction_embedding_ratio(hotstate_enabled=True) == pytest.approx(0.37)
+    assert config.construction_embedding_ratio(hotstate_enabled=False) == pytest.approx(0.6)
+    assert config.construction_embedding_ratio(
+        hotstate_enabled=True, override=0.42
+    ) == pytest.approx(0.42)
 
 
 def test_policy_reserves_current_user_and_only_selects_contiguous_kv_prefix():

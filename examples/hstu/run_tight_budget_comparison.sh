@@ -28,7 +28,7 @@ mkdir -p "${RESULTS_DIR}/logs"
 export PYTHONPATH="${PYTHONPATH}:$(cd ${REPO_ROOT}/../ && pwd)"
 
 echo "=== Tight Budget Experiment: Forcing KV Constraint Binding ==="
-echo "Target: Expose HotState reallocation when KV budget is actually constrained"
+echo "Target: Exercise in-pool KV residency control under a constrained KV budget"
 echo ""
 
 for budget in "${BUDGETS[@]}"; do

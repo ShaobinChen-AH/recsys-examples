@@ -1005,11 +1005,12 @@ def build_mixed_evidence_summary(records: Sequence[Dict[str, Any]]) -> Dict[str,
         best_static = min(static, key=lambda record: record["combined_cycle_mean_ms"])
     return {
         "record_type": "mixed_evidence_summary",
-        "evidence_schema_version": 1,
+        "evidence_schema_version": 2,
         "implementation_scope": "mixed_physical_static_envelope",
         "claim_boundary": (
             "training and inference are measured in one process per fixed policy; "
-            "each policy rebuilds its model and no online HBM reallocation is demonstrated"
+            "inference pools are split at model construction and residency is managed "
+            "in-pool; no online physical pool resizing is demonstrated"
         ),
         "successful_policy_count": len(successful),
         "static_policy_count": len(static),
@@ -1040,7 +1041,7 @@ def build_mixed_evidence_summary(records: Sequence[Dict[str, Any]]) -> Dict[str,
                 "measured" if len(paired_cycles) >= 2 else "not_measured"
             ),
             "unified_controller_beats_best_static": "not_demonstrated",
-            "online_cross_type_reallocation": "not_demonstrated",
+            "online_cross_pool_resize": "not_demonstrated",
             "paper_scale_generalization": "not_demonstrated",
         },
     }
@@ -1070,7 +1071,7 @@ def run_policy_benchmark(
             "best_static_replay" if record_type == "oracle_replay" else "physical_static_split"
         ),
         "implementation_scope": "mixed_physical_static_envelope",
-        "online_reallocation_observed": False,
+        "online_pool_resize_observed": False,
         "model_rebuild_count": 1,
         "allocation_lifecycle": "one_model_construction_per_policy",
         "policy": policy["policy"],

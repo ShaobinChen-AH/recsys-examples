@@ -130,9 +130,8 @@ class HotSetManager:
             target_pages = max(target_pages, resident_pages + append_margin_pages)
             target_pages = min(max(config.kv_min_primary_pages, target_pages), max_pages)
 
-            # The fixed-envelope phase has no safe in-place KV resize API.
-            # Keep this as a policy estimate only; changing the logical page
-            # limit must never be presented as physical HBM enforcement.
+            # The physical KV pool split and capacity are fixed at model
+            # construction. This page target is only a policy estimate.
 
         # Turn the aggregate score into concrete operations.  Embedding rows
         # are ranked from current demand and promoted into the already

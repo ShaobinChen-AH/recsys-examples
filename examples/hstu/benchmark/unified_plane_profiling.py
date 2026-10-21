@@ -168,6 +168,8 @@ def run_static_sweep(
     warmup_ratio,
     out_jsonl,
 ):
+    from modules.hotstate.inference_runtime import measure_inference_request
+
     dtype = torch.bfloat16 if dtype_str in ("bfloat16", "float16") else torch.float32
     max_seqlen = max_history_length * 2 + max_num_candidates
     
@@ -284,12 +286,15 @@ def run_static_sweep(
                     batch, user_ids, total_history_lengths
                 )
 
-                torch.cuda.synchronize()
-                t0 = time.perf_counter()
-                with torch.inference_mode():
-                    model.forward_with_kvcache(batch, user_ids, total_history_lengths)
-                torch.cuda.synchronize()
-                latency_ms = (time.perf_counter() - t0) * 1000.0
+                _, _, _, timings = measure_inference_request(
+                    model,
+                    batch,
+                    user_ids,
+                    total_history_lengths,
+                )
+                forward_latency_ms = timings["forward_latency_ms"]
+                end_to_end_latency_ms = timings["end_to_end_latency_ms"]
+                latency_ms = end_to_end_latency_ms
 
                 # Re-measure after every request.  DynamicEmb and the KV
                 # manager are expected to keep fixed capacities, but the trace
@@ -367,12 +372,16 @@ def run_static_sweep(
                     "managed_state_physical_hbm_bytes": measured_state_bytes,
                     "remaining_state_budget_bytes": total_hbm_budget_bytes - measured_state_bytes,
                     "implementation_scope": "physical_static_shared_hbm_baseline",
-                    "online_reallocation_observed": False,
+                    "online_pool_resize_observed": False,
                     "model_rebuild_count": 0,
                     "blocks_in_primary_pool": blocks,
                     "batch_idx": i,
                     "latency_ms": latency_ms,
+                    "forward_latency_ms": forward_latency_ms,
+                    "end_to_end_latency_ms": end_to_end_latency_ms,
+                    "latency_metric": "end_to_end_latency_ms",
                     "latency_semantics": "inference_only",
+                    "end_to_end_scope": timings["end_to_end_scope"],
                     "batch_fingerprint": batch_fingerprint,
                     "seq_history_len": hist_len,
                     "user_id": int(user_ids[0].item()) if torch.is_tensor(user_ids) else int(user_ids[0]),
@@ -385,7 +394,11 @@ def run_static_sweep(
                 trace_records.append(record)
 
                 if (i + 1) % 20 == 0:
-                    print(f"  [{i+1}/{measure_batches}] latency={latency_ms:.2f}ms hist={hist_len}")
+                    print(
+                        f"  [{i+1}/{measure_batches}] "
+                        f"end_to_end={end_to_end_latency_ms:.2f}ms "
+                        f"forward={forward_latency_ms:.2f}ms hist={hist_len}"
+                    )
 
         except Exception as exc:
             import traceback
@@ -413,7 +426,17 @@ def run_static_sweep(
 
         valid = [r for r in trace_records if "latency_ms" in r]
         mean_lat = sum(r["latency_ms"] for r in valid) / max(1, len(valid)) if valid else float("nan")
-        results.append({"split": split_name, "num_records": len(valid), "mean_latency_ms": mean_lat})
+        mean_forward_lat = (
+            sum(r["forward_latency_ms"] for r in valid) / max(1, len(valid))
+            if valid else float("nan")
+        )
+        results.append({
+            "split": split_name,
+            "num_records": len(valid),
+            "mean_latency_ms": mean_lat,
+            "mean_end_to_end_latency_ms": mean_lat,
+            "mean_forward_latency_ms": mean_forward_lat,
+        })
 
     baseline_report = validate_static_baseline_trace(all_trace_records)
     valid_record_count = int(baseline_report["record_count"])
@@ -425,11 +448,11 @@ def run_static_sweep(
             json.dumps(
                 {
                     "record_type": "evidence_summary",
-                    "evidence_schema_version": 1,
+                    "evidence_schema_version": 3,
                     "implementation_scope": "physical_static_shared_hbm_baseline",
                     "claim_boundary": (
-                        "fixed static embedding/KV splits with measured physical state; "
-                        "no online reallocation or unified controller"
+                        "fixed embedding/KV splits configured at construction with "
+                        "measured physical state; no online residency controller"
                     ),
                     "record_count": valid_record_count,
                     "configured_state_budget_bytes": baseline_report[
@@ -439,6 +462,10 @@ def run_static_sweep(
                         "physical_rows_validated"
                     ],
                     "latency_stats": baseline_report["latency_stats"],
+                    "forward_latency_stats": baseline_report[
+                        "forward_latency_stats"
+                    ],
+                    "comparison_latency_metric": "end_to_end_latency_ms",
                     "static_splits": baseline_report["static_splits"],
                     "claims": {
                         "fixed_shared_hbm_envelope": (
@@ -451,7 +478,7 @@ def run_static_sweep(
                             "measured" if complete_sweep else "not_measured"
                         ),
                         "paired_hotstate_comparison": "requires_hotstate_trace",
-                        "online_cross_type_reallocation": "not_demonstrated",
+                        "online_cross_pool_resize": "not_demonstrated",
                         "paper_scale_generalization": "not_demonstrated",
                     },
                 }
@@ -504,7 +531,10 @@ def main():
     print("SWEEP SUMMARY")
     print("=" * 60)
     for r in results:
-        print(f"  {r['split']}: mean={r['mean_latency_ms']:.2f}ms, n={r['num_records']}")
+        print(
+            f"  {r['split']}: end-to-end={r['mean_end_to_end_latency_ms']:.2f}ms, "
+            f"forward={r['mean_forward_latency_ms']:.2f}ms, n={r['num_records']}"
+        )
 
 
 if __name__ == "__main__":

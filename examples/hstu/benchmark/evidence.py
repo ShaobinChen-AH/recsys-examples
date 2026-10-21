@@ -24,7 +24,7 @@ CLAIM_CATALOG = {
     "physical_embedding_and_kv_accounting": "measured",
     "per_batch_inference_latency": "measured",
     "paired_static_baseline_comparison": "requires_static_baseline",
-    "online_cross_type_reallocation": "not_demonstrated",
+    "online_cross_pool_resize": "not_demonstrated",
     "unified_training_inference_arbitration": "not_demonstrated",
     "paper_scale_generalization": "not_demonstrated",
 }
@@ -56,7 +56,14 @@ def _latency_records(records: Iterable[dict]) -> List[dict]:
         record
         for record in records
         if record.get("record_type") != "evidence_summary"
-        and record.get("latency_ms") is not None
+        and any(
+            record.get(field) is not None
+            for field in (
+                "end_to_end_latency_ms",
+                "forward_latency_ms",
+                "latency_ms",
+            )
+        )
     ]
 
 
@@ -79,17 +86,19 @@ def _number(record: dict, name: str) -> int:
     return value
 
 
-def _latency_value(record: dict) -> float:
-    """Return a finite, non-negative latency value from one trace row."""
+def _latency_value(record: dict, field: str) -> float:
+    """Return a finite, non-negative latency measurement from one trace row."""
     try:
-        value = float(record["latency_ms"])
+        value = float(record[field])
     except (KeyError, TypeError, ValueError) as exc:
         raise EvidenceValidationError(
-            f"record line {record.get('_line_number', '?')} has no numeric latency_ms"
+            f"record line {record.get('_line_number', '?')} "
+            f"has no numeric {field}"
         ) from exc
     if not math.isfinite(value) or value < 0:
         raise EvidenceValidationError(
-            f"record line {record.get('_line_number', '?')} has invalid latency_ms={value}"
+            f"record line {record.get('_line_number', '?')} "
+            f"has invalid {field}={value}"
         )
     return value
 
@@ -160,8 +169,11 @@ def _percentile(values: Sequence[float], fraction: float) -> Optional[float]:
     return ordered[index]
 
 
-def latency_stats(records: Iterable[dict]) -> dict:
-    values = [_latency_value(record) for record in records]
+def latency_stats(
+    records: Iterable[dict], *, field: str = "end_to_end_latency_ms"
+) -> dict:
+    """Summarize a named latency measurement; defaults to paper E2E latency."""
+    values = [_latency_value(record, field) for record in records]
     if not values:
         return {"n": 0, "mean_ms": None, "p50_ms": None, "p95_ms": None, "p99_ms": None, "max_ms": None}
     return {
@@ -216,12 +228,24 @@ def validate_hotstate_trace(records: Iterable[dict], *, require_physical: bool =
         )
     physical_rows = 0
     action_rows = 0
-    online_reallocation = False
-    physical_reallocation_events = 0
+    online_pool_resize = False
+    physical_pool_resize_events = 0
     rebuild_count = 0
     remaining_values = []
     for row in rows:
-        _latency_value(row)
+        end_to_end_ms = _latency_value(row, "end_to_end_latency_ms")
+        forward_ms = _latency_value(row, "forward_latency_ms")
+        if end_to_end_ms + 1e-9 < forward_ms:
+            raise EvidenceValidationError(
+                "end_to_end_latency_ms cannot be shorter than forward_latency_ms"
+            )
+        if row.get("latency_ms") is not None and not math.isclose(
+            _latency_value(row, "latency_ms"), end_to_end_ms,
+            rel_tol=0.0, abs_tol=1e-9,
+        ):
+            raise EvidenceValidationError(
+                "latency_ms comparison field must match end_to_end_latency_ms"
+            )
         if row.get("latency_semantics") != "inference_only":
             raise EvidenceValidationError(
                 "HotState evidence requires latency_semantics='inference_only'"
@@ -250,15 +274,15 @@ def validate_hotstate_trace(records: Iterable[dict], *, require_physical: bool =
             remaining_values.append(budget - measured)
             if row.get("physical_admitted_keys") or row.get("physical_evicted_keys"):
                 action_rows += 1
-        if row.get("online_reallocation_observed"):
-            events = row.get("physical_reallocation_events", ())
+        if row.get("online_pool_resize_observed"):
+            events = row.get("physical_pool_resize_events", ())
             if not isinstance(events, (list, tuple)):
                 raise EvidenceValidationError(
-                    "physical_reallocation_events must be a list when present"
+                    "physical_pool_resize_events must be a list when present"
                 )
             if events:
-                online_reallocation = True
-                physical_reallocation_events += len(events)
+                online_pool_resize = True
+                physical_pool_resize_events += len(events)
         rebuild_count = max(rebuild_count, int(row.get("model_rebuild_count", 0)))
 
     if require_physical and physical_rows != len(rows):
@@ -276,11 +300,11 @@ def validate_hotstate_trace(records: Iterable[dict], *, require_physical: bool =
         )
     else:
         claims["paired_static_baseline_comparison"] = "requires_static_baseline"
-    claims["online_cross_type_reallocation"] = (
-        "measured" if online_reallocation and rebuild_count == 0 else "not_demonstrated"
+    claims["online_cross_pool_resize"] = (
+        "measured" if online_pool_resize and rebuild_count == 0 else "not_demonstrated"
     )
     return {
-        "evidence_schema_version": 1,
+        "evidence_schema_version": 3,
         "implementation_scope": (
             "admission_smoke_diagnostic" if not require_physical
             else "fixed_shared_hbm_inference"
@@ -292,10 +316,14 @@ def validate_hotstate_trace(records: Iterable[dict], *, require_physical: bool =
             min(remaining_values) if remaining_values else None
         ),
         "physical_action_rows": action_rows,
-        "online_reallocation_observed": online_reallocation,
-        "physical_reallocation_events": physical_reallocation_events,
+        "online_pool_resize_observed": online_pool_resize,
+        "physical_pool_resize_events": physical_pool_resize_events,
         "model_rebuild_count": rebuild_count,
+        "comparison_latency_metric": "end_to_end_latency_ms",
+        "attribution_only_latency_metric": "forward_latency_ms",
         "latency_stats": latency_stats(rows),
+        "end_to_end_latency_stats": latency_stats(rows),
+        "forward_latency_stats": latency_stats(rows, field="forward_latency_ms"),
         "claims": claims,
     }
 
@@ -308,7 +336,20 @@ def validate_static_baseline_trace(records: Iterable[dict]) -> dict:
     budgets = set()
     splits = set()
     for row in rows:
-        _latency_value(row)
+        end_to_end_ms = _latency_value(row, "end_to_end_latency_ms")
+        forward_ms = _latency_value(row, "forward_latency_ms")
+        if end_to_end_ms + 1e-9 < forward_ms:
+            raise EvidenceValidationError(
+                "end_to_end_latency_ms cannot be shorter than forward_latency_ms"
+            )
+        if row.get("latency_ms") is not None and not math.isclose(
+            _latency_value(row, "latency_ms"),
+            _latency_value(row, "end_to_end_latency_ms"),
+            rel_tol=0.0, abs_tol=1e-9,
+        ):
+            raise EvidenceValidationError(
+                "latency_ms comparison field must match end_to_end_latency_ms"
+            )
         if row.get("latency_semantics") != "inference_only":
             raise EvidenceValidationError(
                 "static baseline rows require latency_semantics='inference_only'"
@@ -349,7 +390,11 @@ def validate_static_baseline_trace(records: Iterable[dict]) -> dict:
         "configured_state_budget_bytes": budgets.pop(),
         "static_splits": sorted(splits),
         "physical_rows_validated": len(rows),
+        "comparison_latency_metric": "end_to_end_latency_ms",
         "latency_stats": latency_stats(rows),
+        "end_to_end_latency_stats": latency_stats(rows),
+        "forward_latency_stats": latency_stats(rows, field="forward_latency_ms"),
+        "attribution_only_latency_metric": "forward_latency_ms",
     }
 
 
@@ -403,8 +448,13 @@ def compare_static_baseline(
                 f"{split} has incomplete pairing: common_samples={len(common)} "
                 f"hotstate_samples={len(hot_by_key)}"
             )
-        hot_values = [float(hot_by_key[key]["latency_ms"]) for key in common]
-        static_values = [float(rows[key]["latency_ms"]) for key in common]
+        hot_values = [
+            _latency_value(hot_by_key[key], "end_to_end_latency_ms")
+            for key in common
+        ]
+        static_values = [
+            _latency_value(rows[key], "end_to_end_latency_ms") for key in common
+        ]
         hot_mean = sum(hot_values) / len(hot_values)
         static_mean = sum(static_values) / len(static_values)
         split_reports.append({
@@ -413,6 +463,17 @@ def compare_static_baseline(
             "pairing_coverage": len(common) / len(hot_by_key),
             "hotstate": latency_stats([hot_by_key[key] for key in common]),
             "static": latency_stats([rows[key] for key in common]),
+            "hotstate_forward_attribution": latency_stats(
+                [hot_by_key[key] for key in common], field="forward_latency_ms"
+            ),
+            "static_forward_attribution": latency_stats(
+                [rows[key] for key in common], field="forward_latency_ms"
+            ),
+            "paired_end_to_end_mean_delta_ms": hot_mean - static_mean,
+            "hotstate_end_to_end_gain_vs_split_pct": (
+                100.0 * (static_mean - hot_mean) / static_mean
+                if static_mean > 0 else None
+            ),
             "paired_mean_delta_ms": hot_mean - static_mean,
             "hotstate_gain_vs_split_pct": (
                 100.0 * (static_mean - hot_mean) / static_mean if static_mean > 0 else None
@@ -425,12 +486,19 @@ def compare_static_baseline(
     hot_mean = best_static["hotstate"]["mean_ms"]
     best_mean = best_static["static"]["mean_ms"]
     return {
-        "comparison_schema_version": 1,
+        "comparison_schema_version": 2,
+        "comparison_metric": "end_to_end_latency_ms",
         "paired": True,
         "static_splits": split_reports,
         "best_static_split": best_static["split"],
         "hotstate_stats_on_common_samples": best_static["hotstate"],
         "best_static_stats_on_common_samples": best_static["static"],
+        "hotstate_forward_attribution_on_common_samples": best_static[
+            "hotstate_forward_attribution"
+        ],
+        "best_static_forward_attribution_on_common_samples": best_static[
+            "static_forward_attribution"
+        ],
         "gain_vs_best_static_pct": (
             100.0 * (best_mean - hot_mean) / best_mean if best_mean > 0 else None
         ),
@@ -442,17 +510,21 @@ def compare_static_baseline(
 def evidence_summary(trace_report: dict, comparison: Optional[dict] = None) -> dict:
     if trace_report["implementation_scope"] == "admission_smoke_diagnostic":
         claim_boundary = (
-            "admission callback smoke diagnostic only; physical HBM envelope and "
-            "online reallocation are not measured"
+            "admission callback smoke diagnostic only; construction-time pool split, "
+            "physical HBM envelope, and physical pool resizing are not measured"
         )
     else:
         claim_boundary = (
-            "fixed physical shared-HBM inference prototype; no online model resize"
+            "embedding/KV pool split fixed at model construction; residency managed "
+            "within those pools; end-to-end latency is the comparison metric and "
+            "forward latency is attribution only"
         )
     summary = {
         "record_type": "evidence_summary",
-        "evidence_schema_version": 1,
+        "evidence_schema_version": 3,
         "implementation_scope": trace_report["implementation_scope"],
+        "comparison_latency_metric": "end_to_end_latency_ms",
+        "attribution_only_latency_metric": "forward_latency_ms",
         "claim_boundary": claim_boundary,
         "trace_report": trace_report,
         "comparison": comparison,

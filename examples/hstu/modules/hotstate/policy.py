@@ -6,7 +6,7 @@ import math
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Optional, Protocol
 
 from modules.hotstate.state_handle import Placement
 
@@ -15,12 +15,14 @@ from modules.hotstate.state_handle import Placement
 class PolicyConfig:
     """Experimental settings; defaults are priors, not calibrated claims.
 
+    ``construction_embedding_hbm_ratio`` fixes the inference pool split when
+    the model is built. ``HOTSTATE_EMBEDDING_HBM_RATIO`` can override it.
     Set HOTSTATE_POLICY_CONFIG to a JSON file or pass a config to the controller.
     A custom ValueFunction can replace the formula without changing execution.
     """
 
     selection: str = "value_density"
-    initial_embedding_ratio: float = 0.5
+    construction_embedding_hbm_ratio: float = 0.5
     static_embedding_ratio: float = 0.6
     benefit_weight: float = 1.0
     movement_weight: float = 1.0
@@ -48,10 +50,11 @@ class PolicyConfig:
             raise ValueError("unknown HotState selection policy")
         if self.kv_granularity not in ("segment", "user"):
             raise ValueError("kv_granularity must be segment or user")
-        for name in ("initial_embedding_ratio", "static_embedding_ratio",
+        for name in ("construction_embedding_hbm_ratio", "static_embedding_ratio",
                      "reuse_interval_alpha", "reuse_probability_alpha",
                      "embedding_recency_weight", "bandwidth_fraction"):
-            if not 0.0 <= getattr(self, name) <= 1.0:
+            value = getattr(self, name)
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1]")
         for name in ("benefit_weight", "movement_weight", "risk_weight",
                      "opportunity_weight", "density_time_exponent",
@@ -77,6 +80,20 @@ class PolicyConfig:
         values = asdict(self)
         digest = hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
         return {"config_id": digest, "parameters": values}
+
+    def construction_embedding_ratio(
+        self, *, hotstate_enabled: bool, override: Optional[float] = None
+    ) -> float:
+        """Resolve the immutable embedding/KV pool split used at model build."""
+        ratio = (
+            self.static_embedding_ratio if not hotstate_enabled
+            else self.construction_embedding_hbm_ratio
+        )
+        if override is not None:
+            ratio = float(override)
+        if not math.isfinite(ratio) or not 0.0 <= ratio <= 1.0:
+            raise ValueError("construction embedding HBM ratio must be in [0, 1]")
+        return ratio
 
 
 def load_policy_config(path=None):
@@ -119,8 +136,8 @@ class WeightedValue:
 class InferenceBudget:
     """One state envelope with explicit physical capacities and overhead.
 
-    Residency changes reuse existing pools. They do not transfer physical
-    capacity between pools; future resize backends must report that separately.
+    Pool capacities and their split are fixed at model construction. Residency
+    decisions operate within those pools and do not transfer physical capacity.
     """
 
     state_bytes: int
@@ -169,7 +186,7 @@ class InferenceBudget:
 
     def snapshot(self):
         return {**asdict(self), "residency_budget_bytes": self.residency_bytes,
-                "physical_capacity_reallocation_supported": False,
+                "physical_pool_resize_supported": False,
                 "physical_budget_valid": self.physical_bytes <= self.state_bytes,
                 "allocation_scope": "residency_within_fixed_physical_pools"}
 

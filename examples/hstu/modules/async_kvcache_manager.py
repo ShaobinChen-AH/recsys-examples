@@ -547,32 +547,32 @@ class AsyncHSTUKVCacheManager:
         return replace(batch, features=new_features)
 
     # ============================================================
-    # HotState Budget Enforcement Methods
-    # These methods allow the HotState controller to dynamically adjust
-    # the KV cache budget during inference.
+    # HotState logical KV page-limit methods
+    # These methods restrict residency within the KV pool allocated at model
+    # construction; they do not change the physical pool capacity.
     # ============================================================
 
     def get_active_page_limit(self) -> int:
-        """Get the current active page allocation limit.
+        """Get the current logical active-page limit within the fixed KV pool.
 
         Returns:
-            int: Current page limit (defaults to physical pool size)
+            int: Current page limit (defaults to the pool size configured at construction)
         """
         return getattr(self, '_active_page_limit', self.num_primary_cache_pages)
 
     def set_active_page_limit(self, new_limit: int):
-        """Set the logical page allocation limit.
+        """Set the logical active-page limit within the fixed KV pool.
 
         This constrains the KV cache manager to use at most `new_limit` pages
         from the primary cache pool, even if more physical pages are available.
-        The physical KV tensor is unchanged; this does not reallocate HBM
-        between embedding and KV pools.
+        The physical KV tensor and construction-time pool split are unchanged;
+        the limit only controls KV residency within its preallocated pool.
 
         Args:
             new_limit (int): Maximum number of pages to use (must be <= num_primary_cache_pages)
         """
         new_limit = int(new_limit)
-        # Clamp to physical pool size
+        # Clamp to the fixed physical pool capacity.
         new_limit = max(1, min(new_limit, self.num_primary_cache_pages))
         self._active_page_limit = new_limit
 

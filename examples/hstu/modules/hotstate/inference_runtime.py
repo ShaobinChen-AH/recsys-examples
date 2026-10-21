@@ -26,34 +26,82 @@ def batch_fingerprint(batch, user_ids, history_lengths):
     return digest.hexdigest()
 
 
-def run_inference_request(model, batch, user_ids, history_lengths, *, controller=None,
-                          batch_idx=0, state_budget_bytes=None, static_split="static_default"):
-    """Run prepare, forward, completion, and observation at one safe boundary.
+def measure_inference_request(
+    model, batch, user_ids, history_lengths, *, controller=None, batch_idx=0,
+    use_kvcache=True,
+):
+    """Measure one prepared-input request using the same boundaries for all policies.
 
-    Timings include a forward completion wait, making mapping reuse safe on the
-    next request. JSON serialization and fingerprinting are outside the timed
-    interval, identically for HotState and static comparison runs.
+    End-to-end covers before_batch, forward and its device completion wait,
+    and after_batch with its completion wait. Forward time is attribution only
+    and remains the input to the forward cost model. Input loading, fingerprinting,
+    extra physical snapshots, logging, and serialization are outside this scope.
+
+    Return logits, pre-forward control results, post-forward results, and timings.
     """
-    fingerprint = batch_fingerprint(batch, user_ids, history_lengths)
-    started = time.perf_counter()
     control = {}
     post = {}
-    try:
-        if controller is not None:
-            control = controller.before_batch(batch, user_ids, history_lengths, batch_idx)
-        prepared = time.perf_counter()
-        logits = model.forward_with_kvcache(batch, user_ids, history_lengths)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        forwarded = time.perf_counter()
-        forward_ms = (forwarded - prepared) * 1000.0
-        if controller is not None:
-            post = controller.after_batch(batch, forward_ms)
-        completed = time.perf_counter()
-    except Exception as exc:
-        if controller is not None:
-            controller.abort_batch(str(exc))
-        raise
+    use_cuda = torch.cuda.is_available()
+    if use_cuda:
+        torch.cuda.synchronize()
+    with torch.inference_mode():
+        started = time.perf_counter()
+        try:
+            if controller is not None:
+                control = controller.before_batch(
+                    batch, user_ids, history_lengths, batch_idx
+                )
+            if use_cuda and controller is not None:
+                # Finish any device work submitted by the control phase before
+                # starting forward-only attribution. The wait remains in the
+                # end-to-end request interval.
+                torch.cuda.synchronize()
+            prepared = time.perf_counter()
+            if use_kvcache:
+                logits = model.forward_with_kvcache(batch, user_ids, history_lengths)
+            else:
+                logits = model.forward_nokvcache(batch)
+            if use_cuda:
+                torch.cuda.synchronize()
+            forwarded = time.perf_counter()
+            forward_ms = (forwarded - prepared) * 1000.0
+            if controller is not None:
+                post = controller.after_batch(batch, forward_ms)
+                if use_cuda:
+                    torch.cuda.synchronize()
+            completed = time.perf_counter()
+        except Exception as exc:
+            if controller is not None:
+                controller.abort_batch(str(exc))
+            raise
+
+    end_to_end_ms = (completed - started) * 1000.0
+    timings = {
+        "latency_schema_version": 2,
+        "latency_ms": end_to_end_ms,
+        "forward_latency_ms": forward_ms,
+        "end_to_end_latency_ms": end_to_end_ms,
+        "latency_metric": "end_to_end_latency_ms",
+        "latency_semantics": "inference_only",
+        "end_to_end_scope": (
+            "hotstate_control_forward_completion"
+            if controller is not None else "forward_completion"
+        ),
+        "attribution_only_latency_metric": "forward_latency_ms",
+        "hotstate_control_ms": (prepared - started) * 1000.0,
+        "hotstate_post_control_ms": (completed - forwarded) * 1000.0,
+    }
+    return logits, control, post, timings
+
+
+def run_inference_request(model, batch, user_ids, history_lengths, *, controller=None,
+                          batch_idx=0, state_budget_bytes=None, static_split="static_default"):
+    """Measure a request and emit physical state evidence outside the timed interval."""
+    fingerprint = batch_fingerprint(batch, user_ids, history_lengths)
+    logits, control, post, timings = measure_inference_request(
+        model, batch, user_ids, history_lengths,
+        controller=controller, batch_idx=batch_idx,
+    )
 
     if controller is not None:
         physical = controller.physical_hbm_snapshot()
@@ -69,6 +117,7 @@ def run_inference_request(model, batch, user_ids, history_lengths, *, controller
         budget = state_budget_bytes
     record = {
         **physical,
+        **timings,
         "record_type": "hotstate" if controller is not None else "static",
         "implementation_scope": ("fixed_shared_hbm_inference" if controller is not None
                                  else "physical_static_shared_hbm_baseline"),
@@ -79,14 +128,8 @@ def run_inference_request(model, batch, user_ids, history_lengths, *, controller
         "user_id": int(torch.as_tensor(user_ids).reshape(-1)[0].item()),
         "seq_history_len": int(torch.as_tensor(history_lengths).reshape(-1)[0].item() // 2),
         "batch_fingerprint": fingerprint,
-        "latency_ms": forward_ms,
-        "latency_semantics": "inference_only",
-        "end_to_end_latency_ms": (completed - started) * 1000.0,
-        "end_to_end_scope": "control_forward_completion_observation",
-        "hotstate_control_ms": (prepared - started) * 1000.0,
-        "hotstate_post_control_ms": (completed - forwarded) * 1000.0,
-        "physical_capacity_reallocation_applied": False,
-        "online_reallocation_observed": False,
+        "physical_pool_resize_applied": False,
+        "online_pool_resize_observed": False,
         "model_rebuild_count": 0,
         "policy": controller.policy_config.snapshot() if controller is not None else None,
         "policy_budget": control.get("policy_budget"),

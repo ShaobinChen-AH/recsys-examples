@@ -96,26 +96,14 @@ class HotStateController:
         self._pending_batch_cost_context = None
 
         # ================================================================
-        # GAP 2: Budget Tracking and Enforcement (New)
+        # Residency and fixed-pool limit monitoring
         # ================================================================
-        # Track current budget allocations
-        self._current_embedding_budget = 0
-        self._current_kv_budget = 0
-
-        # Track budget enforcement metrics
-        self._budget_enforcement_history = []  # Recent measurements
-        self._enforcement_history_size = 20    # Keep last N measurements
-        self._last_budget_check_batch = 0
-
-        # Budget drift detection
-        self._embedding_budget_violations = 0
-        self._kv_budget_violations = 0
-        self._total_budget_checks = 0
-
-        # Reallocation frequency control
-        self._default_reallocation_interval = 100
-        self._adaptive_reallocation_interval = 100
-        self._reallocation_interval = self._default_reallocation_interval
+        # Track measured occupancy beyond the configured residency limits.
+        self._residency_limit_history = []
+        self._residency_history_size = 20
+        self._embedding_limit_violations = 0
+        self._kv_limit_violations = 0
+        self._total_residency_checks = 0
 
         # ================================================================
         # GAP 5: Semantic Differences and Consistency Policies (New)
@@ -637,7 +625,7 @@ class HotStateController:
             "policy_planned_kv_bytes": planned_kv_bytes,
             "policy_planned_embedding_bytes": planned_embedding_bytes,
             "policy_budget": result.budget_snapshot,
-            "physical_capacity_reallocation_supported": False,
+            "physical_pool_resize_supported": False,
             "evicted": len(result.evicted_keys),
             "admitted": len(result.admitted_keys),
             "epoch": self.epoch - 1,
@@ -923,35 +911,44 @@ class HotStateController:
         return records
 
     # ============================================================================
-    # Dynamic Allocation API: Runtime HBM Arbitration for Gap 1 Closure
+    # Runtime residency planning within fixed HBM pools
     # ============================================================================
 
     def get_current_occupancy(self) -> dict:
-        """Query current HBM occupancy of embedding and KV states.
+        """Report fixed pool capacities and current logical residency.
 
         Returns dict with:
-        - embedding_physical_hbm_bytes: actual embedding HBM usage
-        - kv_physical_hbm_bytes: actual KV cache HBM usage
-        - embedding_utilization_ratio: occupancy / budget
-        - kv_utilization_ratio: occupancy / budget
+        - physical HBM allocations, including pool overhead
+        - value/page residency and the capacities those values can occupy
+        - utilization ratios within the fixed pools
         """
-        embedding_bytes = int(self.emb_adapter.physical_hbm_bytes())
-        kv_bytes = int(self.kv_adapter.physical_hbm_bytes())
+        embedding_physical_bytes = int(self.emb_adapter.physical_hbm_bytes())
+        kv_physical_bytes = int(self.kv_adapter.physical_hbm_bytes())
+        embedding_resident_bytes = int(self.emb_adapter.logical_hbm_resident_bytes())
+        kv_resident_bytes = int(self.kv_adapter.actual_resident_kv_bytes())
+        embedding_capacity_bytes = int(self.emb_adapter.hbm_value_capacity_bytes())
+        kv_capacity_bytes = int(self.kv_adapter.physical_kv_cache_bytes())
+        kv_residency_limit_bytes = int(self.kv_adapter.logical_kv_budget_bytes())
 
-        baseline = getattr(self, "_initial_physical_snapshot", {})
-        embedding_budget = int(baseline.get("embedding_physical_hbm_bytes", embedding_bytes))
-        kv_budget = int(baseline.get("kv_physical_hbm_bytes", kv_bytes))
-
-        embedding_util = embedding_bytes / embedding_budget if embedding_budget > 0 else 0.0
-        kv_util = kv_bytes / kv_budget if kv_budget > 0 else 0.0
+        embedding_util = (
+            embedding_resident_bytes / embedding_capacity_bytes
+            if embedding_capacity_bytes > 0 else 0.0
+        )
+        kv_util = (
+            kv_resident_bytes / kv_residency_limit_bytes
+            if kv_residency_limit_bytes > 0 else 0.0
+        )
 
         return {
-            "embedding_physical_hbm_bytes": embedding_bytes,
-            "kv_physical_hbm_bytes": kv_bytes,
-            "embedding_budget_bytes": embedding_budget,
-            "kv_budget_bytes": kv_budget,
-            "embedding_utilization_ratio": min(1.0, max(0.0, embedding_util)),
-            "kv_utilization_ratio": min(1.0, max(0.0, kv_util)),
+            "embedding_physical_hbm_bytes": embedding_physical_bytes,
+            "kv_physical_hbm_bytes": kv_physical_bytes,
+            "embedding_resident_bytes": embedding_resident_bytes,
+            "kv_resident_bytes": kv_resident_bytes,
+            "embedding_pool_capacity_bytes": embedding_capacity_bytes,
+            "kv_pool_capacity_bytes": kv_capacity_bytes,
+            "kv_residency_limit_bytes": kv_residency_limit_bytes,
+            "embedding_utilization_ratio": embedding_util,
+            "kv_utilization_ratio": kv_util,
             "total_configured_bytes": self.configured_state_budget_bytes,
         }
 
@@ -1020,46 +1017,48 @@ class HotStateController:
         }
 
     def compute_adaptive_allocation(self) -> dict:
-        """Return the latest policy recommendation without changing capacity."""
+        """Return the latest residency recommendation for the fixed pools."""
         result = getattr(self, "_last_epoch_result", None)
         return {
-            "recommended_embedding_hbm_bytes": result.planned_embedding_bytes if result else 0,
-            "recommended_kv_hbm_bytes": result.planned_kv_bytes if result else 0,
-            "reallocation_triggered": False,
-            "reallocation_ratio": 0.0,
-            "decision_reason": "residency_plan_within_existing_pools",
-            "physical_capacity_reallocation_supported": False,
-            "allocation_semantics": "policy_recommendation_only",
+            "planned_embedding_residency_bytes": (
+                result.planned_embedding_bytes if result else 0
+            ),
+            "planned_kv_residency_bytes": result.planned_kv_bytes if result else 0,
+            "residency_recommendation_available": result is not None,
+            "physical_pool_resize_applied": False,
+            "decision_reason": "residency_plan_within_construction_pools",
+            "physical_pool_resize_supported": False,
+            "allocation_semantics": "recommendation_within_fixed_construction_pools",
             "policy": self.policy_config.snapshot(),
         }
 
     def enforce_adaptive_allocation(self, allocation_plan: dict) -> bool:
-        """Reject physical resize requests; before_batch executes residency plans.
+        """Keep capacity fixed; before_batch executes residency plans in-pool.
 
-        Changing a KV active limit or admission list cannot resize a pool.
-        This compatibility method never reports such changes as enforcement.
+        Changing a KV active limit or admission list does not alter physical
+        pool capacity. This compatibility method reports that distinction.
         """
-        allocation_plan["physical_capacity_reallocation_applied"] = False
-        allocation_plan["physical_capacity_reallocation_supported"] = False
-        allocation_plan["allocation_semantics"] = "unsupported_physical_resize"
+        allocation_plan["physical_pool_resize_applied"] = False
+        allocation_plan["physical_pool_resize_supported"] = False
+        allocation_plan["allocation_semantics"] = "residency_within_fixed_construction_pools"
         return False
 
-    def detect_budget_drift(self) -> dict:
-        """Detect when actual occupancy deviates from allocated budgets.
+    def detect_residency_limit_drift(self) -> dict:
+        """Measure residency against fixed embedding and KV pool limits.
 
         Returns dict with:
-        - embedding_drift_ratio: (actual - budget) / budget (< 0 = under, > 0 = over)
-        - kv_drift_ratio: (actual - budget) / budget
-        - has_embedding_violation: actual > budget * 1.1 (10% overshoot tolerance)
-        - has_kv_violation: actual > budget * 1.1
-        - recommendation: "reduce_embedding", "reduce_kv", "rebalance", or "ok"
+        - embedding_drift_ratio: (resident - capacity) / capacity
+        - kv_drift_ratio: (resident - active page limit) / active page limit
+        - limit violation flags using a 10% overshoot tolerance
+        - recommendation: reduce embedding or KV residency within its fixed pool,
+          or "ok"
         """
         occupancy = self.get_current_occupancy()
 
-        emb_actual = occupancy["embedding_physical_hbm_bytes"]
-        kv_actual = occupancy["kv_physical_hbm_bytes"]
-        emb_budget = occupancy["embedding_budget_bytes"]
-        kv_budget = occupancy["kv_budget_bytes"]
+        emb_actual = occupancy["embedding_resident_bytes"]
+        kv_actual = occupancy["kv_resident_bytes"]
+        emb_budget = occupancy["embedding_pool_capacity_bytes"]
+        kv_budget = occupancy["kv_residency_limit_bytes"]
 
         # Calculate drift ratios (positive = over budget, negative = under budget)
         emb_drift = (emb_actual - emb_budget) / emb_budget if emb_budget > 0 else 0.0
@@ -1071,142 +1070,127 @@ class HotStateController:
 
         # Record violations
         if emb_violation:
-            self._embedding_budget_violations += 1
+            self._embedding_limit_violations += 1
         if kv_violation:
-            self._kv_budget_violations += 1
-        self._total_budget_checks += 1
+            self._kv_limit_violations += 1
+        self._total_residency_checks += 1
 
         # Determine recommendation
         recommendation = "ok"
         if emb_violation and kv_drift < -0.3:
-            recommendation = "reduce_embedding_expand_kv"
+            recommendation = "reduce_embedding_residency_in_fixed_pool"
         elif kv_violation and emb_drift < -0.3:
-            recommendation = "reduce_kv_expand_embedding"
+            recommendation = "reduce_kv_residency_in_fixed_pool"
         elif emb_violation:
-            recommendation = "reduce_embedding_global"
+            recommendation = "reduce_embedding_residency_in_fixed_pool"
         elif kv_violation:
-            recommendation = "reduce_kv_global"
+            recommendation = "reduce_kv_residency_in_fixed_pool"
 
         return {
             "embedding_drift_ratio": emb_drift,
             "kv_drift_ratio": kv_drift,
             "embedding_actual_bytes": emb_actual,
-            "embedding_budget_bytes": emb_budget,
+            "embedding_limit_bytes": emb_budget,
             "kv_actual_bytes": kv_actual,
-            "kv_budget_bytes": kv_budget,
+            "kv_limit_bytes": kv_budget,
             "has_embedding_violation": emb_violation,
             "has_kv_violation": kv_violation,
             "recommendation": recommendation,
-            "violation_rate": (self._embedding_budget_violations + self._kv_budget_violations) / max(1, self._total_budget_checks),
+            "limit_violation_rate": (
+                self._embedding_limit_violations + self._kv_limit_violations
+            ) / max(1, 2 * self._total_residency_checks),
         }
 
-    def validate_budget_enforcement(self) -> dict:
-        """Check if allocated budgets are actually being respected by the system.
+    def validate_residency_limits(self) -> dict:
+        """Summarize recent residency measurements against fixed-pool limits.
 
-        Returns dict with enforcement quality metrics.
+        Returns recent and cumulative limit-violation measurements.
         """
-        drift = self.detect_budget_drift()
+        drift = self.detect_residency_limit_drift()
 
-        # Track enforcement history
-        self._budget_enforcement_history.append(drift)
-        if len(self._budget_enforcement_history) > self._enforcement_history_size:
-            self._budget_enforcement_history.pop(0)
+        self._residency_limit_history.append(drift)
+        if len(self._residency_limit_history) > self._residency_history_size:
+            self._residency_limit_history.pop(0)
 
-        # Calculate enforcement effectiveness
+        # Summarize recent checks that exceeded either residency limit.
         recent_violations = sum(
-            1 for d in self._budget_enforcement_history
+            1 for d in self._residency_limit_history
             if d["has_embedding_violation"] or d["has_kv_violation"]
         )
-        recent_count = len(self._budget_enforcement_history)
-        enforcement_success_rate = 1.0 - (recent_violations / recent_count if recent_count > 0 else 0.0)
+        recent_count = len(self._residency_limit_history)
+        within_limits_rate = 1.0 - (
+            recent_violations / recent_count if recent_count > 0 else 0.0
+        )
 
         return {
             "current_drift": drift,
-            "enforcement_success_rate": enforcement_success_rate,
+            "within_limits_rate": within_limits_rate,
             "recent_violations": recent_violations,
             "recent_checks": recent_count,
-            "total_violations": self._embedding_budget_violations + self._kv_budget_violations,
-            "total_checks": self._total_budget_checks,
+            "total_violations": self._embedding_limit_violations + self._kv_limit_violations,
+            "total_checks": self._total_residency_checks,
         }
 
-    def should_trigger_emergency_reallocation(self) -> bool:
-        """Check if budget violations warrant immediate reallocation.
+    def should_trigger_emergency_residency_check(self) -> bool:
+        """Check whether residency-limit violations warrant another check.
 
         Returns True if:
         - Current check violates budget
-        - Recent violation rate > 20%
+        - Cumulative limit-violation rate > 20%
         """
-        drift = self.detect_budget_drift()
+        drift = self.detect_residency_limit_drift()
 
         # Emergency trigger: active violation
         if drift["has_embedding_violation"] or drift["has_kv_violation"]:
             return True
 
         # Emergency trigger: high recent violation rate
-        if drift["violation_rate"] > 0.2:
+        if drift["limit_violation_rate"] > 0.2:
             return True
 
         return False
-
-    def update_reallocation_frequency(self) -> None:
-        """Adapt reallocation check frequency based on budget enforcement success.
-
-        - If enforcement is good (> 90% success): check every 100 batches
-        - If enforcement is poor (< 50% success): check every 20 batches
-        """
-        validation = self.validate_budget_enforcement()
-        success_rate = validation["enforcement_success_rate"]
-
-        if success_rate > 0.9:
-            self._reallocation_interval = 100
-        elif success_rate > 0.7:
-            self._reallocation_interval = 50
-        elif success_rate > 0.5:
-            self._reallocation_interval = 25
-        else:
-            # Poor enforcement: check very frequently
-            self._reallocation_interval = 10
 
     def compute_corrective_allocation(self, protected_uids=None) -> dict:
         """Validate the physical envelope; report the current residency plan."""
         self.validate_physical_budget()
         return self.compute_adaptive_allocation()
 
-    def report_budget_enforcement_summary(self) -> dict:
-        """Generate end-of-inference report on budget enforcement effectiveness.
+    def report_residency_limit_summary(self) -> dict:
+        """Report end-of-inference residency and fixed-pool limit measurements.
 
-        Returns summary of how well budgets were maintained throughout inference.
+        The pool split stays fixed at construction; this reports residency
+        within each pool and its configured limit.
         """
-        validation = self.validate_budget_enforcement()
+        validation = self.validate_residency_limits()
         drift = validation["current_drift"]
 
         total_violations = validation["total_violations"]
         total_checks = validation["total_checks"]
-        violation_rate = total_violations / max(1, total_checks)
+        violation_rate = total_violations / max(1, 2 * total_checks)
 
         summary = {
-            "total_budget_checks": total_checks,
-            "total_violations": total_violations,
-            "violation_rate": violation_rate,
-            "enforcement_success_rate": validation["enforcement_success_rate"],
-            "embedding_violations": self._embedding_budget_violations,
-            "kv_violations": self._kv_budget_violations,
+            "total_residency_checks": total_checks,
+            "total_limit_violations": total_violations,
+            "limit_violation_rate": violation_rate,
+            "within_limits_rate": validation["within_limits_rate"],
+            "embedding_limit_violations": self._embedding_limit_violations,
+            "kv_limit_violations": self._kv_limit_violations,
             "final_embedding_drift": drift["embedding_drift_ratio"],
             "final_kv_drift": drift["kv_drift_ratio"],
-            "final_embedding_actual_bytes": drift["embedding_actual_bytes"],
-            "final_embedding_budget_bytes": drift["embedding_budget_bytes"],
-            "final_kv_actual_bytes": drift["kv_actual_bytes"],
-            "final_kv_budget_bytes": drift["kv_budget_bytes"],
+            "final_embedding_resident_bytes": drift["embedding_actual_bytes"],
+            "final_embedding_pool_capacity_bytes": drift["embedding_limit_bytes"],
+            "final_kv_resident_bytes": drift["kv_actual_bytes"],
+            "final_kv_residency_limit_bytes": drift["kv_limit_bytes"],
             "status": "PASS" if violation_rate < 0.1 else "WARN" if violation_rate < 0.3 else "FAIL",
         }
 
         print(
-            f"\n[HotState Budget Enforcement Summary]\n"
+            f"\n[HotState Residency Limit Summary]\n"
             f"  Checks: {total_checks}\n"
-            f"  Violations: {total_violations} ({violation_rate:.1%})\n"
-            f"  Success Rate: {validation['enforcement_success_rate']:.1%}\n"
-            f"  Final Embedding: {drift['embedding_actual_bytes']/(1024**3):.3f}/{drift['embedding_budget_bytes']/(1024**3):.3f} GiB (Drift: {drift['embedding_drift_ratio']:+.1%})\n"
-            f"  Final KV: {drift['kv_actual_bytes']/(1024**3):.3f}/{drift['kv_budget_bytes']/(1024**3):.3f} GiB (Drift: {drift['kv_drift_ratio']:+.1%})\n"
+            f"  Limit violations: {total_violations} ({violation_rate:.1%})\n"
+            f"  Checks within limits: {validation['within_limits_rate']:.1%}\n"
+            f"  Embedding residency/capacity: {drift['embedding_actual_bytes']/(1024**3):.3f}/{drift['embedding_limit_bytes']/(1024**3):.3f} GiB (Drift: {drift['embedding_drift_ratio']:+.1%})\n"
+            f"  KV residency/active limit: {drift['kv_actual_bytes']/(1024**3):.3f}/{drift['kv_limit_bytes']/(1024**3):.3f} GiB (Drift: {drift['kv_drift_ratio']:+.1%})\n"
             f"  Status: {summary['status']}\n"
         )
 
@@ -1704,12 +1688,13 @@ class HotStateController:
         return self._semantic_policies.get(state_type, {})
 
     def compute_semantic_allocation(self) -> dict:
-        """Compute allocation that respects semantic differences between state types.
+        """Recommend a policy budget partition using current utilization.
 
-        Embedding: flexible, can be evicted more aggressively
-        KV: must preserve session state, higher minimum budget
+        Embedding state can be evicted more aggressively; KV recommendations
+        preserve the configured minimum for session state. This is a policy
+        recommendation only: construction-time pool capacities stay fixed.
 
-        Returns allocation with semantic minimums enforced.
+        Returns a recommendation with semantic minimums enforced.
         """
         total_budget = self.configured_state_budget_bytes
         occupancy = self.get_current_occupancy()
@@ -1721,18 +1706,18 @@ class HotStateController:
         kv_min_budget = int(total_budget * kv_semantic_min_ratio)
         embedding_min_budget = int(total_budget * embedding_semantic_min_ratio)
 
-        # Allocate remaining budget based on current utilization
+        # Recommend shares from current utilization; pool capacities stay fixed.
         current_emb = occupancy["embedding_utilization_ratio"]
         current_kv = occupancy["kv_utilization_ratio"]
 
-        # Adjust allocation if utilization patterns suggest rebalancing
+        # Adjust the recommended shares if utilization patterns differ.
         if current_kv > 0.80 and current_emb < 0.60:
-            # KV is heavily used, embedding is underutilized
-            # Increase KV within semantic bounds
+            # KV is heavily used, embedding is underutilized.
+            # Recommend a larger KV share within semantic bounds.
             kv_ratio = min(0.70, 0.35 + (current_kv - current_emb) * 0.2)
         elif current_emb > 0.80 and current_kv < 0.60:
-            # Embedding is heavily used, KV is underutilized
-            # Increase embedding but maintain KV minimum
+            # Embedding is heavily used, KV is underutilized.
+            # Recommend a larger embedding share while maintaining the KV minimum.
             kv_ratio = max(kv_semantic_min_ratio, 0.35 - (current_emb - current_kv) * 0.15)
         else:
             # Balanced or moderate pressure
@@ -1744,13 +1729,21 @@ class HotStateController:
 
         embedding_budget = int(total_budget * embedding_ratio)
         kv_budget = total_budget - embedding_budget
+        target_fits_fixed_pools = (
+            embedding_budget <= occupancy["embedding_pool_capacity_bytes"]
+            and kv_budget <= occupancy["kv_residency_limit_bytes"]
+        )
 
         return {
-            "embedding_budget_bytes": embedding_budget,
-            "kv_budget_bytes": kv_budget,
-            "embedding_ratio": embedding_ratio,
-            "kv_ratio": kv_ratio,
-            "semantic_constraints_enforced": True,
+            "target_embedding_residency_bytes": embedding_budget,
+            "target_kv_residency_bytes": kv_budget,
+            "target_embedding_residency_ratio": embedding_ratio,
+            "target_kv_residency_ratio": kv_ratio,
+            "residency_target_fits_fixed_pools": target_fits_fixed_pools,
+            "physical_pool_resize_applied": False,
+            "allocation_semantics": "unapplied_residency_target_recommendation",
+            "semantic_constraints_satisfied": True,
+            "physical_pool_resize_supported": False,
             "kv_semantic_min": kv_min_budget,
             "embedding_semantic_min": embedding_min_budget,
         }
@@ -1828,27 +1821,28 @@ class HotStateController:
         }
 
     def compute_semantic_aware_allocation(self) -> dict:
-        """Compute adaptive allocation while respecting semantic differences.
+        """Recommend a budget partition while respecting semantic differences.
 
         Combines value-based allocation with semantic constraints.
 
-        Returns allocation plan.
+        Returns a policy recommendation; it does not change physical capacities.
         """
         adaptive_plan = self.compute_adaptive_allocation()
         semantic_plan = self.compute_semantic_allocation()
+        current_pool_state = self.get_current_occupancy()
 
         # Merge: semantic constraints override if necessary
-        emb_adaptive = adaptive_plan.get("recommended_embedding_hbm_bytes", 0)
-        kv_adaptive = adaptive_plan.get("recommended_kv_hbm_bytes", 0)
+        emb_adaptive = adaptive_plan.get("planned_embedding_residency_bytes", 0)
+        kv_adaptive = adaptive_plan.get("planned_kv_residency_bytes", 0)
 
-        emb_semantic = semantic_plan.get("embedding_budget_bytes", 0)
-        kv_semantic = semantic_plan.get("kv_budget_bytes", 0)
+        emb_semantic = semantic_plan.get("target_embedding_residency_bytes", 0)
+        kv_semantic = semantic_plan.get("target_kv_residency_bytes", 0)
 
-        # Final allocation: use semantic if stricter, else adaptive
+        # Final residency target: use semantic if stricter, else adaptive.
         emb_final = max(emb_adaptive, emb_semantic)
         kv_final = max(kv_adaptive, kv_semantic)
 
-        # Normalize to stay within total budget
+        # Normalize targets to stay within the policy state budget.
         total = emb_final + kv_final
         if total > self.configured_state_budget_bytes:
             # Reduce over-budget state while respecting semantic minimums
@@ -1858,19 +1852,45 @@ class HotStateController:
             if kv_final > kv_semantic:
                 kv_final = int(kv_final * self.configured_state_budget_bytes / total)
 
-        # Final adjustment to fit budget
+        # Final adjustment to fit the policy budget.
         if emb_final + kv_final != self.configured_state_budget_bytes:
             kv_final = self.configured_state_budget_bytes - emb_final
+        target_fits_fixed_pools = (
+            emb_final <= current_pool_state["embedding_pool_capacity_bytes"]
+            and kv_final <= current_pool_state["kv_residency_limit_bytes"]
+        )
 
         return {
-            "recommended_embedding_hbm_bytes": emb_final,
-            "recommended_kv_hbm_bytes": kv_final,
-            "reallocation_triggered": True,
-            "reallocation_ratio": abs((emb_final / self.configured_state_budget_bytes) - 0.5),
+            "target_embedding_residency_bytes": emb_final,
+            "target_kv_residency_bytes": kv_final,
+            "target_embedding_residency_ratio": (
+                emb_final / self.configured_state_budget_bytes
+            ),
+            "physical_pool_resize_applied": False,
+            "physical_pool_resize_supported": False,
+            "allocation_semantics": "unapplied_residency_target_recommendation",
+            "residency_target_fits_fixed_pools": target_fits_fixed_pools,
+            "current_pool_state": {
+                "embedding_physical_hbm_bytes": current_pool_state[
+                    "embedding_physical_hbm_bytes"
+                ],
+                "kv_physical_hbm_bytes": current_pool_state["kv_physical_hbm_bytes"],
+                "embedding_resident_bytes": current_pool_state[
+                    "embedding_resident_bytes"
+                ],
+                "kv_resident_bytes": current_pool_state["kv_resident_bytes"],
+                "embedding_pool_capacity_bytes": current_pool_state[
+                    "embedding_pool_capacity_bytes"
+                ],
+                "kv_pool_capacity_bytes": current_pool_state["kv_pool_capacity_bytes"],
+                "active_kv_residency_limit_bytes": current_pool_state[
+                    "kv_residency_limit_bytes"
+                ],
+            },
             "decision_reason": "semantic_aware_adaptive",
             "adaptive_plan": adaptive_plan,
             "semantic_plan": semantic_plan,
-            "semantic_constraints_enforced": True,
+            "semantic_constraints_satisfied": True,
         }
 
     def report_semantic_adherence(self) -> dict:

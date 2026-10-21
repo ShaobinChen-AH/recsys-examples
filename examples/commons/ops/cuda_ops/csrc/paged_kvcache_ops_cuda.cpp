@@ -316,7 +316,11 @@ PYBIND11_MODULE(paged_kvcache_ops, m) {
     .def("get_user_cache_interval", &kvcache::GPUKVCacheMangerImpl::get_user_cache_interval)
     .def("evict_user_suffix_pages", &kvcache::GPUKVCacheMangerImpl::evict_user_suffix_pages,
          py::arg("uid"), py::arg("num_pages"), py::arg("expected_start"), py::arg("expected_end"))
-    .def("set_active_page_limit", &kvcache::GPUKVCacheMangerImpl::set_active_page_limit, py::arg("new_limit"), "Dynamically adjust the number of usable cache pages")
+    .def(
+        "set_active_page_limit",
+        &kvcache::GPUKVCacheMangerImpl::set_active_page_limit,
+        py::arg("new_limit"),
+        "Set the logical active-page limit within the preallocated KV pool")
     .def("onload_kvcache", &kvcache::GPUKVCacheMangerImpl::onload_kvcache, py::call_guard<py::gil_scoped_release>())
     .def("offload_kvcache", &kvcache::GPUKVCacheMangerImpl::offload_kvcache, py::call_guard<py::gil_scoped_release>())
     .def("is_busy_offloading", &kvcache::GPUKVCacheMangerImpl::is_busy_offloading)

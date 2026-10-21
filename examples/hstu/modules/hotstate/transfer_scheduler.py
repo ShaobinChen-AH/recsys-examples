@@ -303,9 +303,9 @@ class TransferScheduler:
                 source=Placement.HBM,
                 target=(Placement.HOST_DRAM if has_host_copy else None)
                 if page_index is None else None,
-                # Releasing a primary-pool mapping is a physical capacity
-                # action, but it does not itself move bytes.  Keep the freed
-                # footprint as metadata so transfer accounting stays honest.
+                # Releasing a primary-pool mapping frees page slots for later
+                # residency within the fixed pool; pool allocation is unchanged.
+                # Keep the freed footprint as metadata for transfer accounting.
                 bytes_moved=0,
                 priority=self._priority(scoring_map, key, "release", footprint),
                 deadline_epoch=epoch,
@@ -388,10 +388,10 @@ class TransferScheduler:
 
         ordered_evictions = self._ordered(selected_evictions)
         ordered_admissions = self._ordered(admissions)
-        # Phase 1: release capacity.  Admissions are intentionally not marked
-        # in flight until every prerequisite has reached a successful terminal
-        # state.  This makes the dependency graph operational rather than
-        # trace-only metadata.
+        # Phase 1: release resident rows and KV mappings within the fixed pools.
+        # Admissions are intentionally not marked in flight until every
+        # prerequisite has reached a successful terminal state. This makes the
+        # dependency graph operational rather than trace-only metadata.
         for request in ordered_evictions:
             self._start(request, epoch)
             result.submitted_ids.append(request.transfer_id)

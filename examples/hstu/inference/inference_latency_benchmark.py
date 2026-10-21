@@ -12,6 +12,7 @@ from pathlib import Path
 # Reuse existing inference functions
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from inference_gr_ranking import get_inference_dataset_and_embedding_configs, get_inference_hstu_model
+from modules.hotstate.inference_runtime import measure_inference_request
 
 def percentile(values, q):
     if not values:
@@ -71,7 +72,8 @@ def run_inference_with_latency_tracking(
         dataloader = get_data_loader(dataset=dataset)
         dataloader_iter = iter(dataloader)
 
-        batch_latencies = []
+        end_to_end_latencies = []
+        forward_latencies = []
         num_batches = 0
         start_time = time.time()
         cur_date = None
@@ -95,28 +97,19 @@ def run_inference_with_latency_tracking(
                 total_history_lengths = seq_endptrs * 2 + num_contextual_features
 
                 if batch is not None:
-                    if hotstate_controller is not None:
-                        hotstate_controller.before_batch(
-                            batch=batch,
-                            user_ids=uids,
-                            total_history_lengths=total_history_lengths,
-                            batch_idx=num_batches,
-                        )
-
-                    torch.cuda.synchronize()
-                    batch_start = time.perf_counter()
-
-                    if not disable_kvcache:
-                        _ = model.forward_with_kvcache(batch, uids, total_history_lengths)
-                    else:
-                        _ = model.forward_nokvcache(batch)
-
-                    torch.cuda.synchronize()
-                    batch_end = time.perf_counter()
-                    batch_latencies.append((batch_end - batch_start) * 1000)  # ms
-
-                    if hotstate_controller is not None:
-                        hotstate_controller.after_batch(batch, latency_ms=(batch_end - batch_start) * 1000)
+                    _, _, _, timings = measure_inference_request(
+                        model,
+                        batch,
+                        uids,
+                        total_history_lengths,
+                        controller=hotstate_controller,
+                        batch_idx=num_batches,
+                        use_kvcache=not disable_kvcache,
+                    )
+                    end_to_end_latencies.append(
+                        timings["end_to_end_latency_ms"]
+                    )
+                    forward_latencies.append(timings["forward_latency_ms"])
 
                 num_batches += 1
             except StopIteration:
@@ -124,6 +117,12 @@ def run_inference_with_latency_tracking(
 
         end_time = time.time()
         total_time = end_time - start_time
+        forward_mean = (
+            statistics.mean(forward_latencies) if forward_latencies else 0.0
+        )
+        forward_stdev = (
+            statistics.stdev(forward_latencies) if len(forward_latencies) > 1 else 0.0
+        )
 
         # Cleanup
         del model
@@ -134,12 +133,27 @@ def run_inference_with_latency_tracking(
         return {
             "num_batches": num_batches,
             "total_time_sec": total_time,
-            "mean_latency_ms": statistics.mean(batch_latencies) if batch_latencies else 0.0,
-            "stdev_latency_ms": statistics.stdev(batch_latencies) if len(batch_latencies) > 1 else 0.0,
-            "p95_latency_ms": percentile(batch_latencies, 0.95),
-            "p99_latency_ms": percentile(batch_latencies, 0.99),
-            "min_latency_ms": min(batch_latencies) if batch_latencies else 0.0,
-            "max_latency_ms": max(batch_latencies) if batch_latencies else 0.0,
+            "comparison_latency_metric": "end_to_end_latency_ms",
+            "mean_latency_ms": (
+                statistics.mean(end_to_end_latencies) if end_to_end_latencies else 0.0
+            ),
+            "stdev_latency_ms": (
+                statistics.stdev(end_to_end_latencies)
+                if len(end_to_end_latencies) > 1 else 0.0
+            ),
+            "p95_latency_ms": percentile(end_to_end_latencies, 0.95),
+            "p99_latency_ms": percentile(end_to_end_latencies, 0.99),
+            "min_latency_ms": min(end_to_end_latencies) if end_to_end_latencies else 0.0,
+            "max_latency_ms": max(end_to_end_latencies) if end_to_end_latencies else 0.0,
+            "forward_latency_stats": {
+                "n": len(forward_latencies),
+                "mean_ms": forward_mean,
+                "stdev_ms": forward_stdev,
+                "p95_ms": percentile(forward_latencies, 0.95),
+                "p99_ms": percentile(forward_latencies, 0.99),
+                "min_ms": min(forward_latencies) if forward_latencies else 0.0,
+                "max_ms": max(forward_latencies) if forward_latencies else 0.0,
+            },
         }
 
 if __name__ == "__main__":

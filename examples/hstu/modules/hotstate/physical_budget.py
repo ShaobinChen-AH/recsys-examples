@@ -8,7 +8,7 @@ leave the returned safety margin available for those costs.
 
 import os
 from dataclasses import dataclass
-from math import ceil
+from math import ceil, isfinite
 from typing import Optional
 
 
@@ -40,12 +40,12 @@ def get_hotstate_enabled() -> bool:
 
 
 def get_embedding_hbm_ratio() -> Optional[float]:
-    """Return an optional startup pool ratio override from the environment."""
+    """Return an optional construction-time pool ratio override from the environment."""
     raw = os.getenv("HOTSTATE_EMBEDDING_HBM_RATIO")
     if raw is None or not raw.strip():
         return None
     ratio = float(raw)
-    if not 0.0 <= ratio <= 1.0:
+    if not isfinite(ratio) or not 0.0 <= ratio <= 1.0:
         raise ValueError("HOTSTATE_EMBEDDING_HBM_RATIO must be in [0, 1]")
     return ratio
 
@@ -233,10 +233,12 @@ def plan_physical_budget(
     element_bytes: int = DEFAULT_ELEMENT_BYTES,
     min_primary_pages: int = 1,
 ) -> PhysicalBudgetPlan:
-    """Split one state budget into DynamicEmb HBM and KV primary pages.
+    """Configure fixed DynamicEmb HBM and KV page pools at model construction.
 
     ``max_sequence_length`` is the actual model sequence length passed to the
     KV manager, including the interleaved item/action representation.
+    Residency changes reuse these pools without transferring capacity between
+    them.
     """
     state_budget = int(state_budget_bytes)
     ratio = float(embedding_hbm_ratio)

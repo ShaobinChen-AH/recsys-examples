@@ -24,6 +24,7 @@ from modules.hotstate.physical_budget import (  # noqa: E402
     plan_physical_budget,
     safety_margin_bytes,
 )
+from modules.hotstate.hotstate_controller import HotStateController  # noqa: E402
 
 
 def test_embedding_row_bytes():
@@ -97,6 +98,59 @@ def test_budget_smaller_than_safety_margin_rejected():
             max_sequence_length=128,
             num_tokens_per_chunk=1024,
         )
+
+
+def test_controller_reports_residency_separately_from_fixed_pool_capacity():
+    class EmbeddingAdapterStub:
+        def physical_hbm_bytes(self):
+            return 120
+
+        def logical_hbm_resident_bytes(self):
+            return 115
+
+        def hbm_value_capacity_bytes(self):
+            return 100
+
+    class KVAdapterStub:
+        def physical_hbm_bytes(self):
+            return 150
+
+        def actual_resident_kv_bytes(self):
+            return 25
+
+        def physical_kv_cache_bytes(self):
+            return 200
+
+        def logical_kv_budget_bytes(self):
+            return 30
+
+    controller = object.__new__(HotStateController)
+    controller.emb_adapter = EmbeddingAdapterStub()
+    controller.kv_adapter = KVAdapterStub()
+    controller.configured_state_budget_bytes = 400
+    controller._embedding_limit_violations = 0
+    controller._kv_limit_violations = 0
+    controller._total_residency_checks = 0
+    controller._residency_limit_history = []
+    controller._residency_history_size = 20
+
+    occupancy = controller.get_current_occupancy()
+    assert occupancy["embedding_physical_hbm_bytes"] == 120
+    assert occupancy["embedding_resident_bytes"] == 115
+    assert occupancy["embedding_pool_capacity_bytes"] == 100
+    assert occupancy["embedding_utilization_ratio"] == pytest.approx(1.15)
+    assert occupancy["kv_physical_hbm_bytes"] == 150
+    assert occupancy["kv_resident_bytes"] == 25
+    assert occupancy["kv_pool_capacity_bytes"] == 200
+    assert occupancy["kv_residency_limit_bytes"] == 30
+
+    drift = controller.detect_residency_limit_drift()
+    assert drift["embedding_actual_bytes"] == 115
+    assert drift["embedding_limit_bytes"] == 100
+    assert drift["kv_actual_bytes"] == 25
+    assert drift["kv_limit_bytes"] == 30
+    assert drift["has_embedding_violation"] is True
+    assert drift["recommendation"] == "reduce_embedding_residency_in_fixed_pool"
 
 
 def test_negative_buffer_counts_rejected():
