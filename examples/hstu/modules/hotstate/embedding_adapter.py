@@ -306,15 +306,28 @@ class EmbeddingAdapter:
         table_ids = torch.zeros_like(keys)
         return keys, table_ids
 
+    def _authoritative_eval_initializer(self):
+        """Return DynamicEmb's eval initializer only for an uncheckpointed model."""
+        if not bool(
+            getattr(self._module, "_hotstate_initializer_authoritative", False)
+        ):
+            return None
+        initializers = getattr(self._embedding_tables(), "_eval_initializers", None)
+        if not initializers or not callable(initializers[0]):
+            raise RuntimeError(
+                "DynamicEmb does not expose its authoritative eval initializer"
+            )
+        return initializers[0]
+
     def apply_residency_plan(
         self, admitted_item_indices, evicted_item_indices=None
     ) -> Tuple[List[int], List[int]]:
         """Apply a physical HybridStorage residency plan.
 
-        The returned lists contain only rows for which DynamicEmb completed a
-        real tier movement.  A host-only DynamicEmb or an admission-smoke
-        configuration returns empty lists and remains governed by its existing
-        admission strategy.
+        The returned lists contain only rows DynamicEmb confirmed resident in
+        HBM. An uncheckpointed model may materialize an absent row only through
+        its authoritative evaluation initializer; checkpoint-backed models
+        may only promote existing host rows.
         """
         if self._module is None or not self.supports_physical_residency_control():
             return [], []
@@ -330,24 +343,25 @@ class EmbeddingAdapter:
 
         if admitted_item_indices is not None and len(admitted_item_indices) > 0:
             keys, table_ids = self._residency_tensors(admitted_item_indices)
-            # In inference, checkpoint values are authoritative and immutable.
-            # ``HybridStorage.admit_keys`` intentionally initializes keys absent
-            # from both tiers; using it here would turn a cache miss into a new
-            # zero/random row.  HotState may only promote a row already backed
-            # by the host tier.
-            promote_fn = getattr(storage, "promote_keys", None)
-            if not callable(promote_fn):
+            admit_fn = getattr(storage, "admit_keys", None)
+            if not callable(admit_fn):
                 raise RuntimeError(
-                    "DynamicEmb storage cannot perform authoritative host-row promotion"
+                    "DynamicEmb storage cannot perform physical row admission"
                 )
-            promoted, displaced = promote_fn(keys, table_ids)
+            initializer = self._authoritative_eval_initializer()
+            promoted, displaced = admit_fn(
+                keys,
+                table_ids,
+                initializer,
+                allow_initialize=initializer is not None,
+            )
             admitted_keys.extend(int(key) for key in promoted.detach().cpu().tolist())
             evicted_keys.extend(int(key) for key in displaced.detach().cpu().tolist())
 
         return admitted_keys, evicted_keys
 
     def admit_keys(self, item_indices) -> List[int]:
-        """Promote host rows and return the rows actually admitted to HBM."""
+        """Admit eligible rows and return those confirmed resident in HBM."""
         admitted, _evicted = self.apply_residency_plan(item_indices)
         return admitted
 
@@ -375,10 +389,10 @@ class EmbeddingAdapter:
     def validate_item_keys(self, item_indices) -> None:
         """Ensure every inference lookup has an authoritative row.
 
-        A cache miss is a placement miss, not permission to initialize a new
-        model value.  DynamicEmb remains responsible for normal lookup; this
-        check prevents the HotState controller from silently changing that
-        contract through an admission action.
+        Checkpoint-backed inference requires an authoritative value in either
+        tier. A fresh model may instead use its explicitly authoritative eval
+        initializer, which is also the only source HotState may use to
+        materialize a row before lookup.
         """
         keys = [int(value) for value in item_indices]
         if not keys or self._module is None or not self.supports_physical_residency_control():
@@ -394,9 +408,8 @@ class EmbeddingAdapter:
                 getattr(self._module, "_hotstate_initializer_authoritative", False)
             ):
                 # The no-checkpoint inference smoke path has an explicit,
-                # deterministic DynamicEmb initializer.  It is a valid source
-                # of first materialization; HotState itself still never calls
-                # the initializer during a residency admission.
+                # authoritative DynamicEmb initializer. Physical admission
+                # materializes these rows before the lookup consumes them.
                 return
             raise ConsistencyError(
                 "inference requested embedding rows absent from both authoritative "

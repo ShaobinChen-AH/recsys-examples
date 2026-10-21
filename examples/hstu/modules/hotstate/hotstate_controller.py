@@ -525,9 +525,8 @@ class HotStateController:
         # captures HBM pressure displacement returned by DynamicEmb.admit_keys.
         self._sync_directory(epoch=self.epoch)
 
-        # Correctness boundary: every row consumed by inference must already
-        # exist in either DynamicEmb tier.  HotState cannot turn a placement
-        # miss into a newly initialized model value.
+        # Checkpoint-backed rows must exist in an authoritative tier. A fresh
+        # model may use its explicitly authoritative evaluation initializer.
         self.emb_adapter.validate_item_keys(item_indices)
 
         # Start the exact native KV prepare/onload that the upcoming model

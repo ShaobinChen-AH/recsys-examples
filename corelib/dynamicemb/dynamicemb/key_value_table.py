@@ -2465,11 +2465,11 @@ class HybridStorage(Storage):
         with the normal evaluation initializer and then inserted into HBM.
         The returned tensors contain only rows confirmed resident after the
         operation and rows displaced to host by HBM pressure.
-        ``allow_initialize`` is deliberately opt-in.  A physical residency
-        controller must never manufacture a value for a key absent from both
-        tiers; inference callers should only promote an authoritative host
-        row.  Admission smoke tests may opt into the historical initializer
-        behavior explicitly.
+        ``allow_initialize`` is deliberately opt-in. A physical residency
+        controller must only use it when the model's configured evaluation
+        initializer is an authoritative source, such as for a fresh
+        uncheckpointed inference model. Checkpoint-backed inference should
+        promote only rows that already exist in the host tier.
         """
         promoted, displaced = self.promote_keys(unique_keys, table_ids)
         if unique_keys.numel() == 0:

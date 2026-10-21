@@ -61,6 +61,11 @@ class HotSetManager:
         config = self.value_engine.config
         num_users = max(1, int(getattr(demand, "num_users", 1)))
         append_margin_pages = num_users * config.kv_append_margin_pages_per_user
+        page_bytes = 1
+        kv_append_reserve_bytes = 0
+        if not self.skip_kv_handles_for_admission_smoke:
+            page_bytes = max(1, int(self.kv._page_bytes()))
+            kv_append_reserve_bytes = append_margin_pages * page_bytes
 
         # Start a versioned observation epoch; the previous snapshot is kept
         # in registry history so lifecycle changes remain auditable.
@@ -80,7 +85,10 @@ class HotSetManager:
         scored = self.value_engine.compute_scores(handles, demand)
 
         budget = InferenceBudget.observe(
-            self.total_hbm, self.emb, self.kv, config.reserve_bytes
+            self.total_hbm,
+            self.emb,
+            self.kv,
+            config.reserve_bytes + kv_append_reserve_bytes,
         )
         if budget.physical_bytes > self.total_hbm and not self.skip_kv_handles_for_admission_smoke:
             raise RuntimeError("managed physical HBM exceeds the configured inference envelope")
@@ -114,7 +122,6 @@ class HotSetManager:
             planned_embedding_bytes = sum(h.footprint_bytes for h in selected if not h.is_kv)
             target_pages = self.kv.get_current_page_limit()
         else:
-            page_bytes = self.kv._page_bytes()
             planned_kv_bytes = sum(h.footprint_bytes for h in selected if h.is_kv)
             planned_embedding_bytes = sum(h.footprint_bytes for h in selected if not h.is_kv)
 
@@ -204,6 +211,7 @@ class HotSetManager:
         # The manager is a planner.  Keep applied-operation fields empty here;
         # HotStateController fills them only after adapter calls succeed.
         budget_record = budget.snapshot()
+        budget_record["kv_append_reserve_bytes"] = kv_append_reserve_bytes
         budget_record["pinned_residency_excess_bytes"] = max(0, used_bytes - budget.residency_bytes)
         return EpochResult(
             evicted_keys=[],
