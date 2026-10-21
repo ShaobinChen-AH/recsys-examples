@@ -216,7 +216,7 @@ def suffix_release_kvcache_mgr():
     manager = AsyncHSTUKVCacheManager(
         num_layers=1,
         num_kv_heads=1,
-        kv_headdim=32,
+        kv_headdim=64,
         num_tokens_per_page=32,
         num_primary_cache_pages=64,
         num_onload_buffer_pages=64,
@@ -444,3 +444,4 @@ if __name__ == "__main__":
     random.seed(1)
     torch.manual_seed(0)
     test_kvcache_offload_onload()
+
