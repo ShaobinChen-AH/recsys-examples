@@ -9,6 +9,7 @@ leave the returned safety margin available for those costs.
 import os
 from dataclasses import dataclass
 from math import ceil
+from typing import Optional
 
 
 MIB = 1024 * 1024
@@ -36,6 +37,17 @@ def get_hotstate_enabled() -> bool:
     Default: False (fixed split mode)
     """
     return os.getenv("HOTSTATE_ENABLED", "0") == "1"
+
+
+def get_embedding_hbm_ratio() -> Optional[float]:
+    """Return an optional startup pool ratio override from the environment."""
+    raw = os.getenv("HOTSTATE_EMBEDDING_HBM_RATIO")
+    if raw is None or not raw.strip():
+        return None
+    ratio = float(raw)
+    if not 0.0 <= ratio <= 1.0:
+        raise ValueError("HOTSTATE_EMBEDDING_HBM_RATIO must be in [0, 1]")
+    return ratio
 
 
 def ceil_div(numerator: int, denominator: int) -> int:

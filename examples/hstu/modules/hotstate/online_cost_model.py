@@ -9,6 +9,8 @@ retaining an unbounded training set or requiring NumPy/sklearn.
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from modules.hotstate.policy import PolicyConfig
+
 
 MIB = 1024.0 * 1024.0
 
@@ -122,7 +124,8 @@ class OnlineSystemCostModel:
         "host_memory_pressure",
     )
 
-    def __init__(self) -> None:
+    def __init__(self, config=None) -> None:
+        self.config = config or PolicyConfig()
         # Priors only make the first few decisions safe.  Every coefficient is
         # subsequently updated by measured batches and exposed with confidence.
         self.batch_model = RecursiveLeastSquares(
@@ -130,8 +133,8 @@ class OnlineSystemCostModel:
             # 150 ms / 100 misses preserves the previous 1.5 ms-per-miss
             # cold-start assumption.  It is a visible prior, not a permanent
             # constant, and rapidly yields to measured latency observations.
-            priors=(1.0, 0.5, 0.1, 0.02, 150.0, 3.5, 0.04, 0.05, 0.1, 0.1),
-            forgetting=0.99,
+            priors=self.config.batch_priors,
+            forgetting=self.config.batch_forgetting,
             initial_variance=4.0,
         )
         self.transfer_models: Dict[Tuple[str, str], RecursiveLeastSquares] = {}
@@ -191,8 +194,8 @@ class OnlineSystemCostModel:
         if model is None:
             model = RecursiveLeastSquares(
                 ("fixed_ms", "transfer_mib", "queue_depth"),
-                priors=(0.0, 0.04, 0.0),
-                forgetting=0.98,
+                priors=self.config.transfer_priors,
+                forgetting=self.config.transfer_forgetting,
                 initial_variance=8.0,
             )
             self.transfer_models[key] = model
@@ -304,7 +307,7 @@ class OnlineSystemCostModel:
     def confidence(self) -> float:
         # Sixteen measured batches are enough to dominate cold-start priors;
         # confidence remains explicit rather than pretending calibration is done.
-        return min(1.0, self.batch_model.samples / 16.0)
+        return min(1.0, self.batch_model.samples / self.config.confidence_samples)
 
     def snapshot(self) -> dict:
         transfer_models = {}

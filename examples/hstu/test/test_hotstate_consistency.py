@@ -143,3 +143,71 @@ def test_kv_eviction_is_blocked_for_inflight_native_owner():
     assert not adapter.evict_user(7)
     adapter._gpu_mgr.frozen.clear()
     assert adapter.evict_user(7)
+
+
+class _SegmentGPU:
+    def __init__(self):
+        self.pages = 3
+        self.start = 64
+        self.end = 160
+        self.releases = []
+
+    def get_user_page_count(self, uid):
+        return self.pages if int(uid) == 0 else 0
+
+    def get_empty_page_count(self):
+        return 8 - self.pages
+
+    def get_total_cache_length(self, uids):
+        return [self.end if int(uid) == 0 else 0 for uid in uids]
+
+    def get_user_cache_interval(self, uid):
+        return [self.start, self.end, self.pages] if int(uid) == 0 else [0, 0, 0]
+
+    def is_user_offload_frozen(self, uid):
+        return False
+
+    def evict_user_suffix_pages(self, uid, pages, expected_start, expected_end):
+        self.releases.append((int(uid), int(pages), int(expected_start), int(expected_end)))
+        if int(uid) != 0 or (expected_start, expected_end) != (self.start, self.end):
+            return False
+        self.pages -= int(pages)
+        self.end = self.start + self.pages * 32
+        return True
+
+
+class _SegmentKV:
+    num_primary_cache_pages = 8
+    max_num_sequences = 1
+    page_size = 32
+    num_layers = 1
+    num_heads = 1
+    head_dim = 1
+
+    def __init__(self):
+        self.gpu_kvcache_mgr = _SegmentGPU()
+        self.host_kv_mgr = type("Host", (), {"get_kvdata_length": lambda _self, uid: 64})()
+        self.cache_table = type("Cache", (), {"device": "cuda:0"})()
+        self.num_onload_buffer_chunks = 0
+        self.num_offload_buffer_chunks = 0
+        self.chunk_size = 1
+        self.enable_nvcomp = False
+
+    def physical_hbm_bytes(self):
+        return 1024
+
+
+def test_kv_adapter_exports_segments_and_releases_only_confirmed_suffix():
+    manager = _SegmentKV()
+    adapter = KVAdapter(manager)
+    handles = adapter.export_handles()
+    page_handles = [h for h in handles if h.metadata.get("segment_tier") == "hbm"]
+
+    assert len(page_handles) == 3
+    assert page_handles[0].metadata["retain_after"] is None
+    assert page_handles[1].metadata["retain_after"] == page_handles[0].logical_key
+    released = adapter.apply_eviction_plan([page_handles[-1].logical_key])
+
+    assert released == [page_handles[-1].logical_key]
+    assert manager.gpu_kvcache_mgr.releases == [(0, 1, 64, 160)]
+    assert adapter.get_page_count_for_user(0) == 2

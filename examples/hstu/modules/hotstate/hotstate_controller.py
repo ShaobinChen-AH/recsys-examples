@@ -1,4 +1,4 @@
-from modules.hotstate.state_handle import Placement
+from modules.hotstate.state_handle import Placement, StateType
 from modules.hotstate.demand_signal import DemandSignal
 from modules.hotstate.state_registry import StateRegistry
 from modules.hotstate.global_directory import GlobalDirectory
@@ -7,9 +7,16 @@ from modules.hotstate.embedding_adapter import EmbeddingAdapter
 from modules.hotstate.kv_adapter import KVAdapter
 from modules.hotstate.hot_set_manager import HotSetManager
 from modules.hotstate.transfer_scheduler import TransferScheduler
+from modules.hotstate.policy import (
+    InferenceBudget,
+    InferencePolicy,
+    PolicyConfig,
+    load_policy_config,
+)
+import json
 import time
 import os
-import sys
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -28,7 +35,16 @@ class HotStateController:
         configured_state_budget_bytes: Optional[int] = None,
         cuda_memory_before_construction: Optional[dict] = None,
         cuda_memory_after_construction: Optional[dict] = None,
+        policy_config: Optional[PolicyConfig] = None,
+        value_function=None,
+        trace_path: Optional[str] = None,
     ):
+        self.policy_config = policy_config or load_policy_config()
+        configured_trace_path = trace_path or os.getenv("HOTSTATE_TRACE_PATH", "")
+        self.trace_path = Path(configured_trace_path) if configured_trace_path else None
+        if self.trace_path is not None:
+            self.trace_path.parent.mkdir(parents=True, exist_ok=True)
+        self.last_trace_record = None
         self.configured_state_budget_bytes = int(
             total_hbm_bytes
             if configured_state_budget_bytes is None
@@ -40,20 +56,28 @@ class HotStateController:
             else self._cuda_memory_snapshot()
         )
         self.emb_adapter = EmbeddingAdapter(embedding_module)
-        self.kv_adapter = KVAdapter(kv_module)
+        self.kv_adapter = KVAdapter(
+            kv_module, granularity=self.policy_config.kv_granularity
+        )
         self.registry = StateRegistry()
         self.directory = GlobalDirectory()
-        self.value_engine = ValueEngine(self.configured_state_budget_bytes)
+        self.value_engine = ValueEngine(
+            self.configured_state_budget_bytes,
+            config=self.policy_config,
+            value_function=value_function,
+        )
         self.hot_set = HotSetManager(
             self.configured_state_budget_bytes, self.value_engine,
             self.registry, self.directory,
             self.emb_adapter, self.kv_adapter, skip_kv_handles_for_admission_smoke=skip_kv_handles_for_admission_smoke,)
+        self.hot_set.policy = InferencePolicy(self.policy_config)
         self.scheduler = TransferScheduler(
             self.kv_adapter,
             self.directory,
             self.value_engine,
             embedding_adapter=self.emb_adapter,
             registry=self.registry,
+            bandwidth_fraction=self.policy_config.bandwidth_fraction,
         )
         self.epoch = 0
 
@@ -64,8 +88,10 @@ class HotStateController:
         self.admission_smoke_max_admitted_keys = admission_smoke_max_admitted_keys
 
         self.trace_detail = "scalar"
+        self.set_trace_detail(os.getenv("HOTSTATE_TRACE_DETAIL", "scalar"))
 
         self.num_users = 8
+        self._protected_uids = []
         self.admission_batch_order_control = False
         self._pending_batch_cost_context = None
 
@@ -152,6 +178,18 @@ class HotStateController:
             self.directory.observe_handle(handle, epoch=epoch)
         return handles
 
+    def _score_state_handles(self, handles, demand=None):
+        """Score state handles with the active demand or a neutral cold-start demand."""
+        demand = demand or getattr(self, "_last_demand", None)
+        if demand is None:
+            demand = DemandSignal(
+                current_user_id=0,
+                history_length=0,
+                num_candidates=0,
+                epoch=self.epoch,
+            )
+        return self.value_engine.compute_scores(handles, demand)
+
     @staticmethod
     def _cuda_memory_snapshot():
         if not torch.cuda.is_available():
@@ -176,6 +214,24 @@ class HotStateController:
         """Return measured state residency, separate from policy estimates."""
         embedding_bytes = int(self.emb_adapter.physical_hbm_bytes())
         kv_bytes = int(self.kv_adapter.physical_hbm_bytes())
+        kv_breakdown = self.kv_adapter.physical_hbm_breakdown()
+        kv_capacity_bytes = int(self.kv_adapter.physical_kv_cache_bytes())
+        capacity_fn = getattr(self.emb_adapter, "hbm_value_capacity_bytes", None)
+        embedding_capacity = (
+            int(capacity_fn()) if callable(capacity_fn)
+            else int(self.emb_adapter.hbm_capacity_keys()) * int(self.emb_adapter.row_size_bytes())
+        )
+        budget = InferenceBudget(
+            state_bytes=self.configured_state_budget_bytes,
+            embedding_capacity_bytes=embedding_capacity,
+            kv_capacity_bytes=kv_capacity_bytes,
+            physical_bytes=embedding_bytes + kv_bytes,
+            fixed_overhead_bytes=max(
+                0, embedding_bytes + kv_bytes - kv_capacity_bytes
+                - embedding_capacity
+            ),
+            reserve_bytes=int(self.policy_config.reserve_bytes),
+        )
         snapshot = {
             "configured_state_budget_bytes": self.configured_state_budget_bytes,
             "embedding_physical_hbm_bytes": embedding_bytes,
@@ -193,7 +249,10 @@ class HotStateController:
             "cuda_memory_before_controller": dict(self._cuda_mem_before),
             "cuda_memory_after_controller": dict(self._cuda_mem_after),
             "cuda_memory_current": self._cuda_memory_snapshot(),
-            "kv_physical_hbm_breakdown": self.kv_adapter.physical_hbm_breakdown(),
+            "kv_physical_hbm_breakdown": kv_breakdown,
+            "budget": budget.snapshot(),
+            "policy": self.policy_config.snapshot(),
+            "capacity": self.kv_adapter.capacity_snapshot(),
         }
         return snapshot
 
@@ -209,6 +268,8 @@ class HotStateController:
                 f"budget={self.configured_state_budget_bytes}"
             )
         self._last_physical_validation = snapshot
+        if not hasattr(self, "_initial_physical_snapshot"):
+            self._initial_physical_snapshot = dict(snapshot)
         return snapshot
 
     def consistency_snapshot(self) -> dict:
@@ -241,6 +302,8 @@ class HotStateController:
 
     def before_batch(self, batch, user_ids, total_history_lengths, batch_idx=0) -> dict:
         """Called before each inference batch. Runs control epoch + transfer planning."""
+        if self._pending_batch_cost_context is not None:
+            raise RuntimeError("previous inference request has not completed")
         t = time.perf_counter()
 
         uid = int(user_ids[0].item())
@@ -251,6 +314,7 @@ class HotStateController:
             protected_uids = [int(value) for value in user_ids.detach().cpu().tolist()]
         else:
             protected_uids = [int(value) for value in user_ids]
+        self._protected_uids = list(protected_uids)
         if hasattr(total_history_lengths, "detach"):
             request_history_lengths = [
                 int(value)
@@ -259,19 +323,8 @@ class HotStateController:
         else:
             request_history_lengths = [int(value) for value in total_history_lengths]
 
-        try:
-            item_values = batch.features["item_feat"].values()
-            item_sequence = [int(x) for x in item_values.detach().cpu().reshape(-1).tolist()]
-            item_indices = []
-            seen_item_indices = set()
-            for item_idx in item_sequence:
-                if item_idx in seen_item_indices:
-                    continue
-                seen_item_indices.add(item_idx)
-                item_indices.append(item_idx)
-        except Exception:
-            item_sequence = []
-            item_indices = []
+        item_sequence = self.emb_adapter.batch_item_sequence(batch)
+        item_indices = list(dict.fromkeys(item_sequence))
 
         requested_unique_keys = len(item_indices)
 
@@ -287,6 +340,8 @@ class HotStateController:
             "num_candidates": batch.max_num_candidates or 100,
             "epoch": self.epoch,
             "item_indices": item_indices,
+            "user_ids": protected_uids,
+            "history_lengths": request_history_lengths,
         }
         demand_fields = getattr(DemandSignal, "__dataclass_fields__", {})
         if "num_users" in demand_fields:
@@ -305,6 +360,7 @@ class HotStateController:
         # 2. Score and decide: what to keep, what to evict
         t_hotset_start = time.perf_counter()
         result = self.hot_set.run_epoch(self.epoch, demand)
+        self._last_epoch_result = result
         hotset_ms = 1000 * (time.perf_counter() - t_hotset_start)
 
         planned_hbm_bytes = int(getattr(result, "planned_hbm_bytes", 0) or 0)
@@ -313,21 +369,10 @@ class HotStateController:
             getattr(result, "planned_embedding_bytes", 0) or 0
         )
 
-        kv_page_budget = int(getattr(result, "kv_page_budget", 0) or 0)
         kv_page_bytes = int(self.kv_adapter._page_bytes())
-        kv_reserved_bytes = kv_page_budget * kv_page_bytes
-
-        total_hbm_bytes = int(getattr(self.hot_set, "total_hbm", 0) or 0)
-        residual_embedding_budget_bytes = (
-            max(0, total_hbm_bytes - kv_reserved_bytes)
-            if total_hbm_bytes > 0
-            else planned_embedding_bytes
-        )
-
-        embedding_budget_bytes = min(
-            planned_embedding_bytes,
-            residual_embedding_budget_bytes,
-        )
+        kv_reserved_bytes = int(self.kv_adapter.physical_kv_cache_bytes())
+        residual_embedding_budget_bytes = int(result.budget_snapshot["embedding_capacity_bytes"])
+        embedding_budget_bytes = min(planned_embedding_bytes, residual_embedding_budget_bytes)
 
         row_size_bytes = max(1, self.emb_adapter.row_size_bytes())
         hotstate_admission_budget_keys = embedding_budget_bytes // row_size_bytes
@@ -340,7 +385,12 @@ class HotStateController:
 
         admission_start = time.perf_counter()
         ranking_ms = 0.0
-        if admit_all_control:
+        if self.emb_adapter.supports_physical_residency_control():
+            admission_item_indices = list(result.planned_embedding_keys)
+            admission_max_keys = len(admission_item_indices)
+            admission_cap_source = "unified_policy_selection"
+            admission_order = "policy_score"
+        elif admit_all_control:
             admission_max_keys = requested_unique_keys
             admission_item_indices = item_indices
             admission_cap_source = "admit_all_control"
@@ -506,39 +556,19 @@ class HotStateController:
 
         t4 = time.perf_counter()
 
-        if self.epoch <= 5 or self.epoch % 50 == 0:
-            print(f"  [PROFILE epoch {self.epoch}] "
-                  f"extract={1000*(t1-t):.1f}ms "
-                  f"record_keys={1000*(t2-t1):.1f}ms "
-                  f"run_epoch={1000*(t3-t2):.1f}ms "
-                  f"scheduler={1000*(t4-t3):.1f}ms "
-                  f"total={1000*(t4-t):.1f}ms"
-                  f"hotset={hotset_ms:.1f}ms "
-                  f"admission={admission_ms:.1f}ms "
-                  f"ranking={ranking_ms:.1f}ms "
-                  f"policy={policy_ms:.1f}ms ")
-
-            # Log KV page pressure for constraint binding analysis
-            kv_pressure = self.kv_adapter.get_page_pressure()
-            print(f"  [KV_PRESSURE epoch {self.epoch}] "
-                  f"resident_pages={kv_pressure['resident_pages']} "
-                  f"page_limit={kv_pressure['page_limit']} "
-                  f"physical_pages={kv_pressure['physical_pages']} "
-                  f"pressure_percent={kv_pressure['pressure_percent']:.1f}% "
-                  f"is_constrained={kv_pressure['is_constrained']}", file=sys.stderr)
-                  
-
-
         # 4. Track demand access only.  Residency movement is not an access;
         # feeding admissions/evictions into reuse history would teach the
         # predictor its own decisions instead of the request stream.
-        self.value_engine.record_access(f"kv:uid:{uid}", self.epoch)
+        for active_uid in protected_uids:
+            self.value_engine.record_access(f"kv:uid:{active_uid}", self.epoch)
 
         if self.epoch % 50 == 0:
             self.value_engine.decay_logs(self.epoch)
 
         self._pending_batch_cost_context = {
-            "history_tokens": total_history_tokens,
+            "history_tokens": sum(request_history_lengths),
+            "batch_idx": int(batch_idx),
+            "seq_history_len": int(hist_len),
             "num_candidates": int(batch.max_num_candidates or 100),
             "embedding_requests": len(item_sequence),
             "embedding_request_sequence": list(item_sequence),
@@ -563,6 +593,18 @@ class HotStateController:
             "staged_kv_generation": kv_stage.get("prepare_generation"),
             "staged_kv_onload_bytes": int(kv_stage.get("onload_bytes", 0)),
             "hbm_pressure": 0.0,
+            "control_profile_ms": {
+                "extract": 1000 * (t1 - t),
+                "record_keys": 1000 * (t2 - t1),
+                "run_epoch": hotset_ms,
+                "scheduler": 1000 * (t4 - t3),
+                "total": 1000 * (t4 - t),
+            },
+            "policy_inputs": (
+                self._state_trace_records(result)
+                if self.trace_path is not None or self.trace_detail == "full"
+                else []
+            ),
         }
 
         self.epoch += 1
@@ -588,11 +630,14 @@ class HotStateController:
 
         return {
             "kv_page_budget": result.kv_page_budget,
+            "active_kv_page_limit_pages": self.kv_adapter.get_current_page_limit(),
             "planned_kv_page_budget": result.planned_kv_page_budget,
             "hbm_bytes_used": physical_hbm["managed_state_physical_hbm_bytes"],
             "policy_planned_hbm_bytes": planned_hbm_bytes,
             "policy_planned_kv_bytes": planned_kv_bytes,
             "policy_planned_embedding_bytes": planned_embedding_bytes,
+            "policy_budget": result.budget_snapshot,
+            "physical_capacity_reallocation_supported": False,
             "evicted": len(result.evicted_keys),
             "admitted": len(result.admitted_keys),
             "epoch": self.epoch - 1,
@@ -647,6 +692,10 @@ class HotStateController:
             "physical_hbm": physical_hbm,
             "consistency": self.consistency_snapshot(),
             "online_cost_model": self.value_engine.cost_model_snapshot(),
+            "policy_inputs": self._pending_batch_cost_context.get("policy_inputs", []),
+            "physical_kv_pool_bytes": self.kv_adapter.physical_kv_cache_bytes(),
+            "logical_kv_page_limit_pages": self.kv_adapter.get_current_page_limit(),
+            "active_kv_page_limit_bytes": self.kv_adapter.logical_kv_budget_bytes(),
             "directory_pending_transfers": self.directory.pending_count(),
             "directory_state": (
                 self.directory.snapshot() if trace_detail == "full" else []
@@ -701,7 +750,7 @@ class HotStateController:
             origin_lengths = getattr(
                 async_kvcache, "last_origin_cached_lengths", None
             )
-            origin = int(origin_lengths[0]) if origin_lengths else 0
+            origin = sum(int(length) for length in origin_lengths) if origin_lengths else 0
             if new_tokens is None:
                 new_tokens = max(0, int(context["history_tokens"]) - origin)
             offload_pages = int(
@@ -732,7 +781,7 @@ class HotStateController:
         self._sync_directory(epoch=self.epoch)
 
         if self.trace_detail != "full":
-            return {
+            result = {
                 "post_num_state_handles": 0,
                 "post_state_trace": [],
                 "post_directory_pending_transfers": self.directory.pending_count(),
@@ -740,6 +789,7 @@ class HotStateController:
                 "online_cost_model": self.value_engine.cost_model_snapshot(),
                 "transfer_scheduler": scheduler_post,
             }
+            return result
 
         demand = getattr(self, "_last_demand", None)
         post_state_trace = []
@@ -762,7 +812,7 @@ class HotStateController:
                 decision_by_key,
             )
 
-        return {
+        result = {
             "post_num_state_handles": len(post_state_trace),
             "post_state_trace": post_state_trace,
             "post_directory_state": self.directory.snapshot(),
@@ -770,10 +820,25 @@ class HotStateController:
             "online_cost_model": self.value_engine.cost_model_snapshot(),
             "transfer_scheduler": scheduler_post,
         }
+        return result
 
-    def _check_completions(self):
-        """Check subsystem-level transfer completion."""
-        return self.scheduler.poll_completions(self.epoch)
+    def record_inference_trace(self, record: dict) -> None:
+        """Send a completed measured request to the configured JSONL sink."""
+        self.last_trace_record = record
+        if self.trace_path is not None:
+            with self.trace_path.open("a", encoding="utf-8") as output:
+                output.write(json.dumps(record, sort_keys=True, default=str) + "\n")
+
+    def abort_batch(self, error: str) -> None:
+        """Drain native owners and release HotState request ownership on failure."""
+        try:
+            abort = getattr(self.kv_adapter._kvcache, "abort_active_prepare", None)
+            if callable(abort):
+                abort()
+        finally:
+            for generation in list(self.scheduler._users_by_generation):
+                self.scheduler.abort_staged_kv_request(generation, self.epoch, error)
+            self._pending_batch_cost_context = None
 
     def abort_staged_kv_request(self, generation: int, error: str) -> None:
         """Unwind request ownership when inference raises before after_batch."""
@@ -851,6 +916,9 @@ class HotStateController:
                 ),
                 "decision_reason": getattr(scored, "decision_reason", ""),
                 "decision": decision_by_key.get(handle.logical_key, "unknown"),
+                "policy_name": getattr(scored, "policy_name", ""),
+                "policy_config_id": getattr(scored, "policy_config_id", ""),
+                "policy_inputs": dict(getattr(scored, "policy_inputs", {})),
             })
         return records
 
@@ -870,9 +938,9 @@ class HotStateController:
         embedding_bytes = int(self.emb_adapter.physical_hbm_bytes())
         kv_bytes = int(self.kv_adapter.physical_hbm_bytes())
 
-        # Get current budgets (may be dynamic from previous allocation)
-        embedding_budget = int(getattr(self, '_current_embedding_budget', 0) or self.configured_state_budget_bytes // 2)
-        kv_budget = int(getattr(self, '_current_kv_budget', 0) or self.configured_state_budget_bytes // 2)
+        baseline = getattr(self, "_initial_physical_snapshot", {})
+        embedding_budget = int(baseline.get("embedding_physical_hbm_bytes", embedding_bytes))
+        kv_budget = int(baseline.get("kv_physical_hbm_bytes", kv_bytes))
 
         embedding_util = embedding_bytes / embedding_budget if embedding_budget > 0 else 0.0
         kv_util = kv_bytes / kv_budget if kv_budget > 0 else 0.0
@@ -899,16 +967,31 @@ class HotStateController:
         # Query value engine for current scoring
         handles = self._sync_directory(epoch=self.epoch, include_registry=False)
 
-        embedding_handles = [h for h in handles if getattr(h.metadata, 'state_type', None) == 'embedding']
-        kv_handles = [h for h in handles if getattr(h.metadata, 'state_type', None) == 'kv_cache']
+        scored_by_key = {
+            scored.handle.logical_key: scored
+            for scored in self._score_state_handles(handles)
+        }
+        embedding_handles = [
+            handle
+            for handle in handles
+            if handle.state_type
+            in (StateType.EMBEDDING_HOT_ROWS, StateType.EMBEDDING_COLD_ROWS)
+        ]
+        kv_handles = [
+            handle
+            for handle in handles
+            if handle.is_kv
+        ]
 
         # Aggregate value densities
         emb_total_density = 0.0
         emb_total_bytes = 0
         for handle in embedding_handles:
-            scored = self.value_engine.score_handle(handle, self.epoch)
+            scored = scored_by_key.get(handle.logical_key)
+            if scored is None:
+                continue
             density = float(getattr(scored, 'value_density_ms_per_byte', 0.0))
-            footprint = int(handle.footprint)
+            footprint = int(handle.footprint_bytes)
             emb_total_density += density * footprint
             emb_total_bytes += footprint
 
@@ -917,9 +1000,11 @@ class HotStateController:
         kv_total_density = 0.0
         kv_total_bytes = 0
         for handle in kv_handles:
-            scored = self.value_engine.score_handle(handle, self.epoch)
+            scored = scored_by_key.get(handle.logical_key)
+            if scored is None:
+                continue
             density = float(getattr(scored, 'value_density_ms_per_byte', 0.0))
-            footprint = int(handle.footprint)
+            footprint = int(handle.footprint_bytes)
             kv_total_density += density * footprint
             kv_total_bytes += footprint
 
@@ -935,170 +1020,29 @@ class HotStateController:
         }
 
     def compute_adaptive_allocation(self) -> dict:
-        """Compute adaptive HBM allocation based on current utilization and value densities.
-
-        This implements the core dynamic allocation logic for Gap 1:
-        - Monitors current occupancy of both state types
-        - Computes value density for each
-        - Redistributes HBM based on measured value density
-        - Returns new budget recommendations
-
-        Returns dict with:
-        - recommended_embedding_hbm_bytes: suggested embedding budget
-        - recommended_kv_hbm_bytes: suggested KV cache budget
-        - reallocation_ratio: how much to shift (0.0 = no change, 1.0 = full rebalance)
-        - decision_reason: explanation of the allocation
-        """
-        occupancy = self.get_current_occupancy()
-        densities = self.compute_value_densities()
-
-        emb_phys = occupancy["embedding_physical_hbm_bytes"]
-        kv_phys = occupancy["kv_physical_hbm_bytes"]
-        emb_util = occupancy["embedding_utilization_ratio"]
-        kv_util = occupancy["kv_utilization_ratio"]
-
-        emb_density = densities["embedding_value_density_ms_per_byte"]
-        kv_density = densities["kv_value_density_ms_per_byte"]
-
-        total_budget = self.configured_state_budget_bytes
-
-        # --- Dynamic Reallocation Logic ---
-        # If one state is underutilized (< 60%) and the other is high-density,
-        # reallocate HBM from the underutilized state to the high-density state
-
-        reallocation_triggered = False
-        decision_reason = "static_split"
-
-        # Check for underutilization + value density mismatch
-        emb_underutilized = emb_util < 0.6
-        kv_underutilized = kv_util < 0.6
-        density_ratio = (kv_density + 1e-6) / (emb_density + 1e-6)  # Avoid division by zero
-
-        if emb_underutilized and kv_underutilized:
-            # Both underutilized: balanced split
-            decision_reason = "both_underutilized_balanced"
-            embedding_hbm_bytes = total_budget // 2
-            kv_hbm_bytes = total_budget - embedding_hbm_bytes
-            reallocation_ratio = 0.0
-        elif emb_underutilized and density_ratio > 1.5:
-            # Embedding underutilized + KV has much higher value density
-            # Shift more budget to KV
-            reallocation_triggered = True
-            decision_reason = "embedding_underutilized_kv_dense"
-            embedding_ratio = 0.35
-            embedding_hbm_bytes = int(total_budget * embedding_ratio)
-            kv_hbm_bytes = total_budget - embedding_hbm_bytes
-            reallocation_ratio = abs(embedding_ratio - 0.5)
-        elif kv_underutilized and density_ratio < 0.67:
-            # KV underutilized + embedding has much higher value density
-            # Shift more budget to embedding
-            reallocation_triggered = True
-            decision_reason = "kv_underutilized_embedding_dense"
-            embedding_ratio = 0.65
-            embedding_hbm_bytes = int(total_budget * embedding_ratio)
-            kv_hbm_bytes = total_budget - embedding_hbm_bytes
-            reallocation_ratio = abs(embedding_ratio - 0.5)
-        elif emb_util > 0.85 and kv_util < 0.50:
-            # Embedding constrained, KV has room
-            reallocation_triggered = True
-            decision_reason = "embedding_constrained_kv_has_room"
-            embedding_ratio = 0.45
-            embedding_hbm_bytes = int(total_budget * embedding_ratio)
-            kv_hbm_bytes = total_budget - embedding_hbm_bytes
-            reallocation_ratio = abs(embedding_ratio - 0.5)
-        elif kv_util > 0.85 and emb_util < 0.50:
-            # KV constrained, embedding has room
-            reallocation_triggered = True
-            decision_reason = "kv_constrained_embedding_has_room"
-            embedding_ratio = 0.55
-            embedding_hbm_bytes = int(total_budget * embedding_ratio)
-            kv_hbm_bytes = total_budget - embedding_hbm_bytes
-            reallocation_ratio = abs(embedding_ratio - 0.5)
-        else:
-            # Default: use current ratio or balanced
-            decision_reason = "maintain_current_split"
-            embedding_hbm_bytes = occupancy["embedding_budget_bytes"]
-            kv_hbm_bytes = occupancy["kv_budget_bytes"]
-            reallocation_ratio = 0.0
-
+        """Return the latest policy recommendation without changing capacity."""
+        result = getattr(self, "_last_epoch_result", None)
         return {
-            "recommended_embedding_hbm_bytes": embedding_hbm_bytes,
-            "recommended_kv_hbm_bytes": kv_hbm_bytes,
-            "reallocation_triggered": reallocation_triggered,
-            "reallocation_ratio": reallocation_ratio,
-            "decision_reason": decision_reason,
-            "current_occupancy": occupancy,
-            "current_densities": densities,
+            "recommended_embedding_hbm_bytes": result.planned_embedding_bytes if result else 0,
+            "recommended_kv_hbm_bytes": result.planned_kv_bytes if result else 0,
+            "reallocation_triggered": False,
+            "reallocation_ratio": 0.0,
+            "decision_reason": "residency_plan_within_existing_pools",
+            "physical_capacity_reallocation_supported": False,
+            "allocation_semantics": "policy_recommendation_only",
+            "policy": self.policy_config.snapshot(),
         }
 
     def enforce_adaptive_allocation(self, allocation_plan: dict) -> bool:
-        """Apply the adaptive allocation plan to the system.
+        """Reject physical resize requests; before_batch executes residency plans.
 
-        Updates embedding and KV cache budgets based on the allocation plan.
-        This is where the dynamic arbitration is actually enforced.
-
-        Returns True if enforcement succeeded, False otherwise.
+        Changing a KV active limit or admission list cannot resize a pool.
+        This compatibility method never reports such changes as enforcement.
         """
-        try:
-            embedding_budget = int(allocation_plan["recommended_embedding_hbm_bytes"])
-            kv_budget = int(allocation_plan["recommended_kv_hbm_bytes"])
-
-            # Store for next occupancy query
-            self._current_embedding_budget = embedding_budget
-            self._current_kv_budget = kv_budget
-
-            # ================================================================
-            # ENFORCEMENT: Update embedding admission policy
-            # ================================================================
-            row_size = max(1, self.emb_adapter.row_size_bytes())
-            embedding_budget_keys = embedding_budget // row_size
-
-            # Call the embedding adapter to enforce the new budget
-            # This updates the admission policy to reject keys beyond the budget
-            self.emb_adapter.update_admission_policy(
-                item_indices=[],  # Use all currently tracked indices
-                max_admitted_keys=embedding_budget_keys,
-                enabled=True,
-            )
-
-            # ================================================================
-            # ENFORCEMENT: Update KV cache page limit
-            # ================================================================
-            kv_page_bytes = int(self.kv_adapter._page_bytes())
-            kv_blocks = max(1, kv_budget // kv_page_bytes)
-
-            # Call the KV adapter to enforce the new page limit
-            # This restricts the KV cache to use only the specified number of pages
-            kv_limit_success = self.kv_adapter.set_page_limit(kv_blocks)
-
-            if not kv_limit_success:
-                print(
-                    f"[HotState] Warning: KV page limit may not have been set correctly. "
-                    f"Requested {kv_blocks} pages."
-                )
-
-            # Log the enforcement action
-            if allocation_plan.get("reallocation_triggered", False):
-                print(
-                    f"[HotState Dynamic Allocation ENFORCED] "
-                    f"Reason: {allocation_plan.get('decision_reason', 'unknown')} | "
-                    f"Embedding: {embedding_budget / (1024**3):.3f} GiB "
-                    f"({embedding_budget_keys} keys) | "
-                    f"KV: {kv_budget / (1024**3):.3f} GiB "
-                    f"({kv_blocks} pages) | "
-                    f"Ratio: {allocation_plan.get('reallocation_ratio', 0.0):.2%}"
-                )
-
-            return True
-        except Exception as e:
-            print(f"[HotState] Failed to enforce adaptive allocation: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-
-    # ============================================================================
-    # GAP 2: Continuous Budget Monitoring and Enforcement
-    # ============================================================================
+        allocation_plan["physical_capacity_reallocation_applied"] = False
+        allocation_plan["physical_capacity_reallocation_supported"] = False
+        allocation_plan["allocation_semantics"] = "unsupported_physical_resize"
+        return False
 
     def detect_budget_drift(self) -> dict:
         """Detect when actual occupancy deviates from allocated budgets.
@@ -1223,64 +1167,10 @@ class HotStateController:
             # Poor enforcement: check very frequently
             self._reallocation_interval = 10
 
-    def compute_corrective_allocation(self) -> dict:
-        """Compute allocation to correct budget violations.
-
-        Used when detect_budget_drift() indicates the current allocation
-        is not being respected. This triggers aggressive rebalancing.
-
-        Returns allocation plan with corrective measures.
-        """
-        drift = self.detect_budget_drift()
-
-        total_budget = self.configured_state_budget_bytes
-        emb_actual = drift["embedding_actual_bytes"]
-        kv_actual = drift["kv_actual_bytes"]
-
-        # ================================================================
-        # GAP 4: Use Cross-State Eviction Oracle for Corrective Action
-        # ================================================================
-        # If we have violations, compute which state type should be evicted
-        if drift["has_embedding_violation"] or drift["has_kv_violation"]:
-            # Calculate how much we need to free
-            bytes_over_budget = 0
-            if drift["has_embedding_violation"]:
-                bytes_over_budget += emb_actual - drift["embedding_budget_bytes"]
-            if drift["has_kv_violation"]:
-                bytes_over_budget += kv_actual - drift["kv_budget_bytes"]
-
-            # Use unified eviction oracle to decide what to evict
-            if bytes_over_budget > 0:
-                eviction_plan = self.compute_cross_state_eviction_plan(bytes_over_budget)
-                self.apply_cross_state_eviction_plan(eviction_plan)
-
-        # Rebalance budget based on which state had violations
-        if drift["has_embedding_violation"] and not drift["has_kv_violation"]:
-            # Embedding is over budget: reduce its allocation
-            new_emb_ratio = 0.3
-        elif drift["has_kv_violation"] and not drift["has_embedding_violation"]:
-            # KV is over budget: reduce its allocation
-            new_emb_ratio = 0.7
-        elif drift["has_embedding_violation"] and drift["has_kv_violation"]:
-            # Both over budget: maintain but enforce strictly
-            new_emb_ratio = 0.5
-        else:
-            # No violation: adaptive based on utilization
-            return self.compute_adaptive_allocation()
-
-        embedding_hbm_bytes = int(total_budget * new_emb_ratio)
-        kv_hbm_bytes = total_budget - embedding_hbm_bytes
-
-        return {
-            "recommended_embedding_hbm_bytes": embedding_hbm_bytes,
-            "recommended_kv_hbm_bytes": kv_hbm_bytes,
-            "reallocation_triggered": True,
-            "reallocation_ratio": abs(new_emb_ratio - 0.5),
-            "decision_reason": f"corrective_enforcement ({drift['recommendation']})",
-            "current_occupancy": self.get_current_occupancy(),
-            "current_densities": self.compute_value_densities(),
-            "budget_drift": drift,
-        }
+    def compute_corrective_allocation(self, protected_uids=None) -> dict:
+        """Validate the physical envelope; report the current residency plan."""
+        self.validate_physical_budget()
+        return self.compute_adaptive_allocation()
 
     def report_budget_enforcement_summary(self) -> dict:
         """Generate end-of-inference report on budget enforcement effectiveness.
@@ -1402,15 +1292,30 @@ class HotStateController:
         """
         try:
             handles = self._sync_directory(epoch=self.epoch, include_registry=False)
+            scored_by_key = {
+                scored.handle.logical_key: scored
+                for scored in self._score_state_handles(handles)
+            }
 
-            embedding_handles = [h for h in handles if getattr(h.metadata, 'state_type', None) == 'embedding']
-            kv_handles = [h for h in handles if getattr(h.metadata, 'state_type', None) == 'kv_cache']
+            embedding_handles = [
+                handle
+                for handle in handles
+                if handle.state_type
+                in (StateType.EMBEDDING_HOT_ROWS, StateType.EMBEDDING_COLD_ROWS)
+            ]
+            kv_handles = [
+                handle
+                for handle in handles
+                if handle.is_kv
+            ]
 
             # Score each handle
             emb_scores = []
             for handle in embedding_handles:
                 try:
-                    scored = self.value_engine.score_handle(handle, self.epoch)
+                    scored = scored_by_key.get(handle.logical_key)
+                    if scored is None:
+                        continue
                     emb_scores.append(float(getattr(scored, 'value_density_ms_per_byte', 0.0)))
                 except:
                     pass
@@ -1418,7 +1323,9 @@ class HotStateController:
             kv_scores = []
             for handle in kv_handles:
                 try:
-                    scored = self.value_engine.score_handle(handle, self.epoch)
+                    scored = scored_by_key.get(handle.logical_key)
+                    if scored is None:
+                        continue
                     kv_scores.append(float(getattr(scored, 'value_density_ms_per_byte', 0.0)))
                 except:
                     pass
@@ -1514,24 +1421,39 @@ class HotStateController:
         """
         try:
             handles = self._sync_directory(epoch=self.epoch, include_registry=False)
+            scored_by_key = {
+                scored.handle.logical_key: scored
+                for scored in self._score_state_handles(handles)
+            }
 
             # Separate handles by type
-            embedding_handles = [h for h in handles if getattr(h.metadata, 'state_type', None) == 'embedding']
-            kv_handles = [h for h in handles if getattr(h.metadata, 'state_type', None) == 'kv_cache']
+            embedding_handles = [
+                handle
+                for handle in handles
+                if handle.state_type
+                in (StateType.EMBEDDING_HOT_ROWS, StateType.EMBEDDING_COLD_ROWS)
+            ]
+            kv_handles = [
+                handle
+                for handle in handles
+                if handle.is_kv
+            ]
 
             # Score all handles
             candidates = []
 
             for handle in embedding_handles:
                 try:
-                    scored = self.value_engine.score_handle(handle, self.epoch)
+                    scored = scored_by_key.get(handle.logical_key)
+                    if scored is None:
+                        continue
                     density = float(getattr(scored, 'value_density_ms_per_byte', 0.0))
                     candidates.append({
                         "logical_key": handle.logical_key,
                         "state_type": "embedding",
                         "value_density_ms_per_byte": density,
-                        "footprint_bytes": int(handle.footprint),
-                        "total_value_ms": density * int(handle.footprint),
+                        "footprint_bytes": int(handle.footprint_bytes),
+                        "total_value_ms": density * int(handle.footprint_bytes),
                         "handle": handle,
                         "scored": scored,
                     })
@@ -1540,14 +1462,16 @@ class HotStateController:
 
             for handle in kv_handles:
                 try:
-                    scored = self.value_engine.score_handle(handle, self.epoch)
+                    scored = scored_by_key.get(handle.logical_key)
+                    if scored is None:
+                        continue
                     density = float(getattr(scored, 'value_density_ms_per_byte', 0.0))
                     candidates.append({
                         "logical_key": handle.logical_key,
                         "state_type": "kv_cache",
                         "value_density_ms_per_byte": density,
-                        "footprint_bytes": int(handle.footprint),
-                        "total_value_ms": density * int(handle.footprint),
+                        "footprint_bytes": int(handle.footprint_bytes),
+                        "total_value_ms": density * int(handle.footprint_bytes),
                         "handle": handle,
                         "scored": scored,
                     })
@@ -1591,7 +1515,14 @@ class HotStateController:
         target_bytes = int(target_bytes_to_free)
         candidates_pool = self.build_unified_eviction_candidates()
 
-        all_candidates = candidates_pool.get("all_candidates_ranked", [])
+        all_candidates = [
+            candidate
+            for candidate in candidates_pool.get("all_candidates_ranked", [])
+            if Placement.HBM
+            in (
+                getattr(candidate.get("handle"), "placement", None) or set()
+            )
+        ]
 
         if not all_candidates:
             return {
@@ -1649,7 +1580,9 @@ class HotStateController:
             "cross_state_comparison": True,
         }
 
-    def apply_cross_state_eviction_plan(self, plan: dict) -> bool:
+    def apply_cross_state_eviction_plan(
+        self, plan: dict, protected_uids=None
+    ) -> bool:
         """Apply the unified eviction plan to both embedding and KV.
 
         Returns True if eviction succeeded.
@@ -1657,37 +1590,70 @@ class HotStateController:
         try:
             embedding_to_evict = plan.get("embedding_candidates", [])
             kv_to_evict = plan.get("kv_candidates", [])
+            embedding_keys = []
+            kv_keys = []
+            scoring_map = {}
 
-            # Evict embedding rows
-            for candidate in embedding_to_evict:
-                logical_key = candidate.get("logical_key")
-                # Could call embedding_adapter methods to evict, but they're not
-                # directly exposed. The admission policy update will achieve this.
-                if logical_key:
-                    print(f"[HotState Eviction] Embedding: {logical_key} "
-                          f"(value: {candidate.get('total_value_ms', 0):.1f} ms)")
+            for candidate in embedding_to_evict + kv_to_evict:
+                logical_key = str(candidate.get("logical_key", ""))
+                if not logical_key:
+                    continue
+                scored = candidate.get("scored")
+                if scored is not None:
+                    scoring_map[logical_key] = scored
+                if logical_key.startswith("emb:item:"):
+                    try:
+                        embedding_keys.append(int(logical_key.rsplit(":", 1)[-1]))
+                    except ValueError:
+                        continue
+                elif logical_key.startswith("kv:uid:"):
+                    kv_keys.append(logical_key)
 
-            # Evict KV pages
-            for candidate in kv_to_evict:
-                logical_key = candidate.get("logical_key")
-                if logical_key:
-                    print(f"[HotState Eviction] KV: {logical_key} "
-                          f"(value: {candidate.get('total_value_ms', 0):.1f} ms)")
+            if not embedding_keys and not kv_keys:
+                return int(plan.get("total_bytes_freed", 0)) <= 0
 
-            # Log the eviction decision
-            if embedding_to_evict or kv_to_evict:
-                print(
-                    f"[HotState Cross-State Eviction Oracle] "
-                    f"Freed {plan.get('total_bytes_freed', 0)/(1024**2):.1f} MiB | "
-                    f"Lost Value: {plan.get('total_value_lost_ms', 0):.1f} ms | "
-                    f"Decision: {plan.get('decision_reason', 'unknown')} | "
-                    f"Embedding evicted: {len(embedding_to_evict)}, "
-                    f"KV evicted: {len(kv_to_evict)}"
-                )
+            if protected_uids is not None:
+                if hasattr(protected_uids, "detach"):
+                    protected_uids = [
+                        int(value)
+                        for value in protected_uids.detach().cpu().reshape(-1).tolist()
+                    ]
+                else:
+                    protected_uids = [int(value) for value in protected_uids]
+            else:
+                protected_uids = list(getattr(self, "_protected_uids", []))
+            if not protected_uids:
+                demand = getattr(self, "_last_demand", None)
+                current_user_id = getattr(demand, "current_user_id", None)
+                if current_user_id is not None:
+                    protected_uids = [int(current_user_id)]
 
-            return True
-        except Exception as e:
-            print(f"[HotState] Failed to apply cross-state eviction: {e}")
+            row_size_bytes = 1
+            if embedding_keys:
+                row_size_bytes = max(1, int(self.emb_adapter.row_size_bytes()))
+            execution = self.scheduler.execute_residency_plan(
+                admitted_embedding_keys=[],
+                evicted_embedding_keys=embedding_keys,
+                evicted_kv_keys=kv_keys,
+                scoring_map=scoring_map,
+                protected_uids=protected_uids,
+                epoch=self.epoch,
+                row_size_bytes=row_size_bytes,
+            )
+            self._sync_directory(epoch=self.epoch)
+
+            confirmed_embedding = {
+                int(key) for key in execution.evicted_embedding_keys
+            }
+            confirmed_kv = set(execution.released_kv_keys)
+            return (
+                set(embedding_keys).issubset(confirmed_embedding)
+                and set(kv_keys).issubset(confirmed_kv)
+                and not execution.backend_errors
+                and not execution.failed_ids
+                and not execution.deferred_ids
+            )
+        except Exception:
             return False
 
     def report_cross_state_comparison(self) -> dict:

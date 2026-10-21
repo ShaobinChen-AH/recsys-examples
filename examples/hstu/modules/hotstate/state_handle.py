@@ -12,6 +12,7 @@ class StateType(Enum):
     EMBEDDING_HOT_ROWS = auto()   # frequently-accessed embedding rows
     EMBEDDING_COLD_ROWS = auto()  # rarely-accessed embedding rows
     SESSION_KV_USER = auto()      # KV pages allocated to a user
+    SESSION_KV_SEGMENT = auto()   # contiguous, page-aligned token interval
 
 
 class Placement(Enum):
@@ -86,6 +87,11 @@ class StateHandle:
         for location in self.placement:
             self.replica_versions.setdefault(location, self.version)
             self.replica_freshness_epochs.setdefault(location, self.freshness_epoch)
+
+    @property
+    def is_kv(self) -> bool:
+        """Whether this object belongs to the session KV subsystem."""
+        return self.state_type in (StateType.SESSION_KV_USER, StateType.SESSION_KV_SEGMENT)
 
     @property
     def placements(self) -> Set[Placement]:
@@ -236,3 +242,6 @@ class ScoredHandle:
     value_density_ms_per_byte: float = 0.0
     decision_reason: str = ""
     opportunity_cost_ms: float = 0.0
+    policy_name: str = "weighted_value_v1"
+    policy_config_id: str = ""
+    policy_inputs: Dict[str, float] = field(default_factory=dict)

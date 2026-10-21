@@ -12,3 +12,5 @@ class DemandSignal:
     item_indices: List[int] = field(default_factory=list)
     num_users: int = 8
     item_sequence: List[int] = field(default_factory=list)
+    user_ids: List[int] = field(default_factory=list)
+    history_lengths: List[int] = field(default_factory=list)

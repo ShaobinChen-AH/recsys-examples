@@ -313,6 +313,9 @@ PYBIND11_MODULE(paged_kvcache_ops, m) {
     .def("has_user", &kvcache::GPUKVCacheMangerImpl::has_user)
     .def("is_user_offload_frozen", &kvcache::GPUKVCacheMangerImpl::is_user_offload_frozen)
     .def("evict_if_present", &kvcache::GPUKVCacheMangerImpl::evict_if_present)
+    .def("get_user_cache_interval", &kvcache::GPUKVCacheMangerImpl::get_user_cache_interval)
+    .def("evict_user_suffix_pages", &kvcache::GPUKVCacheMangerImpl::evict_user_suffix_pages,
+         py::arg("uid"), py::arg("num_pages"), py::arg("expected_start"), py::arg("expected_end"))
     .def("set_active_page_limit", &kvcache::GPUKVCacheMangerImpl::set_active_page_limit, py::arg("new_limit"), "Dynamically adjust the number of usable cache pages")
     .def("onload_kvcache", &kvcache::GPUKVCacheMangerImpl::onload_kvcache, py::call_guard<py::gil_scoped_release>())
     .def("offload_kvcache", &kvcache::GPUKVCacheMangerImpl::offload_kvcache, py::call_guard<py::gil_scoped_release>())

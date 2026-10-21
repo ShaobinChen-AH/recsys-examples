@@ -35,8 +35,14 @@ from configs import (
     get_kvcache_config,
 )
 from modules.metrics import get_multi_event_metric_module
-from modules.hotstate.physical_budget import get_hbm_budget_bytes, get_hotstate_enabled, GIB
-from modules.hotstate.hotstate_controller import HotStateController
+from modules.hotstate.physical_budget import (
+    get_embedding_hbm_ratio,
+    get_hbm_budget_bytes,
+    get_hotstate_enabled,
+    plan_physical_budget,
+)
+from modules.hotstate.policy import load_policy_config
+from modules.hotstate.inference_runtime import run_inference_request
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from utils import DatasetArgs, NetworkArgs, RankingArgs
 
@@ -127,80 +133,6 @@ def get_inference_dataset_and_embedding_configs(
     raise ValueError(f"dataset {dataset_args.dataset_name} is not supported")
 
 
-def _estimate_embedding_value_density(emb_configs, max_batch_size=1, max_num_candidates=100):
-    """Estimate expected value density (bytes per state) for embedding states.
-
-    Returns a value in range [0.1, 0.5] representing relative embedding pressure.
-    Higher = more value in embedding states.
-
-    Uses access-pattern-based estimation instead of vocab-based to avoid
-    over-allocating for large sparse vocabularies with small working sets.
-    """
-    # Count total logical embedding bytes and unique keys
-    total_emb_bytes = 0
-    unique_keys = 0
-    for config in emb_configs:
-        if config.use_dynamicemb:
-            # Dynamic embedding: sparse, multiple small accesses
-            total_emb_bytes += config.vocab_size * config.dim * 4  # fp32
-            unique_keys += config.vocab_size
-
-    if unique_keys == 0:
-        return 0.3  # Default if no dynamic embeddings
-
-    # Estimate actual working set based on access patterns, not full vocab
-    # In recommendation inference: working set ≈ max_num_candidates per batch
-    # With some recency/popularity concentration
-    estimated_working_set = max_num_candidates * max_batch_size * 10  # 10x for recency window
-
-    # Access intensity: how concentrated is the working set vs vocab
-    # Higher concentration (small working set vs large vocab) = lower embedding value
-    # because most vocab is cold
-    access_concentration = min(1.0, estimated_working_set / max(1, unique_keys))
-
-    # Embedding value is proportional to working set size relative to typical batch
-    # Normalize by typical candidate set size (assume ~1000 items)
-    working_set_pressure = min(1.0, estimated_working_set / 1000.0)
-
-    # Lower value than KV by default since embedding can be regenerated more cheaply
-    return 0.1 + 0.3 * working_set_pressure + 0.1 * access_concentration  # Range [0.1, 0.5]
-
-
-def _estimate_kv_value_density(max_batch_size, total_max_seqlen, num_layers):
-    """Estimate expected value density for KV cache states.
-
-    Returns a value in range [0.1, 1.0] representing relative KV pressure.
-    Higher = more value in KV states.
-    """
-    # KV cache is valuable when sequence is long (large recompute cost)
-    # Normalize by typical sequence (assume ~4096 tokens)
-    seq_pressure = min(1.0, total_max_seqlen / 4096.0)
-
-    # KV cache is valuable when batch is small (few concurrent sequences)
-    batch_pressure = 1.0 / max(1.0, math.sqrt(max_batch_size))
-
-    return 0.4 + 0.4 * seq_pressure + 0.2 * batch_pressure  # Range [0.4, 1.0]
-
-
-def _compute_adaptive_hbm_split(
-    emb_configs, max_batch_size, total_max_seqlen, num_layers, available_hbm_bytes, max_num_candidates=100
-):
-    """Compute adaptive HBM split based on workload characteristics.
-
-    Returns (embedding_hbm_bytes, kv_hbm_bytes) based on estimated value density.
-    """
-    emb_density = _estimate_embedding_value_density(emb_configs, max_batch_size, max_num_candidates)
-    kv_density = _estimate_kv_value_density(max_batch_size, total_max_seqlen, num_layers)
-
-    # Normalize densities to probabilities
-    total_density = emb_density + kv_density
-    embedding_ratio = emb_density / total_density if total_density > 0 else 0.5
-    kv_ratio = kv_density / total_density if total_density > 0 else 0.5
-
-    embedding_hbm_bytes = int(available_hbm_bytes * embedding_ratio)
-    kv_hbm_bytes = available_hbm_bytes - embedding_hbm_bytes
-
-    return embedding_hbm_bytes, kv_hbm_bytes
 
 
 def get_inference_hstu_model(
@@ -246,77 +178,37 @@ def get_inference_hstu_model(
     # Compute HBM budget allocation
     total_hbm_bytes = get_hbm_budget_bytes()
     hotstate_enabled = get_hotstate_enabled()
+    policy_config = load_policy_config()
 
     if total_hbm_bytes > 0:
-        # Reserve safety margin for activations and fragmentation
-        DEFAULT_SAFETY_MARGIN_BYTES = 64 * 1024 * 1024  # 64 MiB
-        available_hbm_bytes = total_hbm_bytes - DEFAULT_SAFETY_MARGIN_BYTES
-
-        # TEMPORARILY DISABLED: Auto-disable logic to focus on resource leak investigation
-        # The program hangs after DynamicEmb capacity warnings, before memory table printout
-        # Suspected GPU memory leak - need to isolate the issue without auto-disable interference
-        #
-        # # Auto-disable HotState when budget is very loose (>= 3× estimated working set)
-        # # to avoid control plane overhead when constraint doesn't bind
-        # if hotstate_enabled:
-        #     # Estimate KV working set conservatively: just the active batch
-        #     num_layers = network_args.num_layers
-        #     num_kv_heads = network_args.num_attention_heads
-        #     head_dim = network_args.kv_channels
-        #     page_size = 32
-        #     element_bytes = 2
-        #     kv_page_bytes = num_layers * 2 * page_size * num_kv_heads * head_dim * element_bytes
-        #
-        #     # Only count pages for one batch's actual history, not max_seqlen
-        #     # Typical history per request in KuaiRand-1K ≈ 4096 tokens
-        #     typical_history_tokens = min(4096, total_max_seqlen // 2)
-        #     pages_per_batch = math.ceil(typical_history_tokens / page_size)
-        #     kv_working_set_bytes = pages_per_batch * kv_page_bytes
-        #
-        #     # Estimate embedding working set: only accessed candidates
-        #     embedding_working_set_bytes = max_num_candidates * network_args.hidden_size * 4
-        #
-        #     total_working_set = kv_working_set_bytes + embedding_working_set_bytes
-        #
-        #     # If budget >= 3× working set, constraint won't bind meaningfully
-        #     # Use 3× instead of 2× to be more conservative
-        #     if available_hbm_bytes >= (3.0 * total_working_set):
-        #         import sys
-        #         print(f"[HOTSTATE_AUTO_DISABLE] Budget ({available_hbm_bytes:,}) >= 3× working set ({total_working_set:,})", file=sys.stderr)
-        #         hotstate_enabled = False
-
-        if hotstate_enabled:
-            # HotState: adaptive split based on workload characteristics
-            embedding_hbm_bytes, kv_hbm_bytes = _compute_adaptive_hbm_split(
-                emb_configs=emb_configs,
-                max_batch_size=max_batch_size,
-                total_max_seqlen=total_max_seqlen,
-                num_layers=network_args.num_layers,
-                available_hbm_bytes=available_hbm_bytes,
-                max_num_candidates=max_num_candidates,
-            )
-        else:
-            # Fixed split: 60% embedding, 40% KV
-            embedding_hbm_bytes = int(available_hbm_bytes * 0.6)
-            kv_hbm_bytes = int(available_hbm_bytes * 0.4)
+        ratio_override = get_embedding_hbm_ratio()
+        embedding_ratio = ratio_override if ratio_override is not None else (
+            policy_config.initial_embedding_ratio if hotstate_enabled
+            else policy_config.static_embedding_ratio
+        )
+        budget_plan = plan_physical_budget(
+            state_budget_bytes=total_hbm_bytes,
+            embedding_hbm_ratio=embedding_ratio,
+            num_layers=network_args.num_layers,
+            num_kv_heads=network_args.num_attention_heads,
+            head_dim=network_args.kv_channels,
+            num_tokens_per_page=32,
+            max_batch_size=max_batch_size,
+            max_sequence_length=math.ceil(total_max_seqlen / 32) * 32,
+            num_tokens_per_chunk=1024,
+        )
+        embedding_hbm_bytes = budget_plan.embedding_hbm_bytes
+        kv_hbm_bytes = budget_plan.kv_budget_bytes
+        blocks_in_primary_pool = budget_plan.blocks_in_primary_pool
+        kv_page_bytes = budget_plan.kv_page_bytes
     else:
         # No budget constraint
         embedding_hbm_bytes = 0
         kv_hbm_bytes = 0
 
-    # Compute KV cache blocks from budget
-    if kv_hbm_bytes > 0:
-        # KV page size: num_layers * 2 * page_size * num_kv_heads * head_dim * element_bytes
-        num_layers = network_args.num_layers
-        num_kv_heads = network_args.num_attention_heads  # Assuming num_kv_heads == num_attention_heads
-        head_dim = network_args.kv_channels
-        page_size = 32
-        element_bytes = 2  # bfloat16/fp16
-
-        kv_page_bytes = num_layers * 2 * page_size * num_kv_heads * head_dim * element_bytes
-        blocks_in_primary_pool = max(64, kv_hbm_bytes // kv_page_bytes)
-    else:
-        blocks_in_primary_pool = 10240  # Default
+    if total_hbm_bytes <= 0:
+        blocks_in_primary_pool = 10240
+        kv_page_bytes = 0
 
     # Log budget allocation for constraint binding analysis
     import sys
@@ -349,7 +241,6 @@ def get_inference_hstu_model(
         "length_per_sequence": [128] + [i * 256 for i in range(1, 34)],
     }
 
-    print(f"[ORIGINAL_SYSTEM_DEBUG] About to call get_inference_ranking_gr...", flush=True)
     model = get_inference_ranking_gr(
         hstu_config=hstu_config,
         kvcache_config=kv_cache_config if use_kvcache else None,
@@ -357,47 +248,30 @@ def get_inference_hstu_model(
         use_cudagraph=False,
         cudagraph_configs=hstu_cudagraph_configs,
         dynamic_embedding_hbm_bytes=embedding_hbm_bytes,
+        hotstate_state_budget_bytes=0,
+        hotstate_policy_config=policy_config,
+        hotstate_trace_path=os.getenv("HOTSTATE_TRACE_PATH", "") or None,
     )
-    print(f"[ORIGINAL_SYSTEM_DEBUG] Model created, converting dtype...", flush=True)
 
     if hstu_config.bf16:
         model.bfloat16()
     elif hstu_config.fp16:
         model.half()
 
-    print(f"[ORIGINAL_SYSTEM_DEBUG] Loading checkpoint from {checkpoint_dir}...", flush=True)
     model.load_checkpoint(checkpoint_dir)
-    print(f"[ORIGINAL_SYSTEM_DEBUG] Checkpoint loaded, setting to eval mode...", flush=True)
 
     model.eval()
-    print(f"[ORIGINAL_SYSTEM_DEBUG] Model in eval mode!", flush=True)
 
-    # Optionally create HotStateController for dynamic allocation
-    hotstate_controller = None
-    print(f"[DEBUG] Controller check: return_controller={return_controller}, hotstate_enabled={hotstate_enabled}, total_hbm_bytes={total_hbm_bytes}")
-    if return_controller and hotstate_enabled and total_hbm_bytes > 0:
-        try:
-            print(f"[DEBUG] Model attributes: {[attr for attr in dir(model) if 'kv' in attr.lower() or 'cache' in attr.lower()]}")
-            # Check if it's in a nested module
-            print(f"[DEBUG] Checking nested modules for KV cache manager...")
-            for name, module in model.named_modules():
-                if 'kv' in name.lower() or 'cache' in name.lower():
-                    print(f"[DEBUG] Found submodule: {name} -> {type(module).__name__}")
-
-            kv_module = getattr(model, '_kv_cache_manager', None)
-            embedding_module = getattr(model, 'dense_module', None)
-            print(f"[DEBUG] Modules: kv_module={kv_module is not None}, embedding_module={embedding_module is not None}")
-            if kv_module is not None:
-                hotstate_controller = HotStateController(
-                    total_hbm_bytes=total_hbm_bytes,
-                    kv_module=kv_module,
-                    embedding_module=embedding_module,
-                    configured_state_budget_bytes=embedding_hbm_bytes + kv_hbm_bytes,
-                )
-                # Attach controller to model for easy access
-                model._hotstate_controller = hotstate_controller
-        except Exception as e:
-            print(f"[HotState] Failed to create controller: {e}")
+    if return_controller and hotstate_enabled and total_hbm_bytes > 0 and use_kvcache:
+        model.dense_module.enable_hotstate(
+            total_hbm_bytes=total_hbm_bytes,
+            configured_state_budget_bytes=total_hbm_bytes,
+            policy_config=policy_config,
+            trace_path=os.getenv("HOTSTATE_TRACE_PATH") or None,
+        )
+        model.dense_module.set_hotstate_embedding_module(model.sparse_module)
+        model.dense_module.hotstate.validate_physical_budget()
+    hotstate_controller = model.dense_module.hotstate
 
     if return_controller:
         return model, hotstate_controller
@@ -405,19 +279,19 @@ def get_inference_hstu_model(
 
 
 class EmbeddingAccessTracer:
-    """Instrument actual embedding access patterns to derive value density formula.
+    """Instrument embedding accesses for offline value-model diagnostics.
 
     Tracks per-table statistics for each dynamicemb table separately:
     - Per-table unique items accessed vs vocab size
     - Per-table working set footprint
     - Per-table access frequency distribution
 
-    Then aggregates by capacity share to get weighted value score.
+    The report aggregates these measurements and prints a candidate formula;
+    it does not modify the runtime allocation heuristic.
     """
     def __init__(self):
         # Per-table tracking: feature_name -> stats
         self.table_stats = {}  # feature -> {unique_per_batch: [], cumulative: set(), counts: {}}
-        self.batch_idx = 0
 
     def record_batch_access(self, features, emb_configs):
         """Extract and record per-table embedding IDs from KeyedJaggedTensor.
@@ -483,10 +357,8 @@ class EmbeddingAccessTracer:
                     # Record zero for this batch if extraction fails
                     stats['unique_per_batch'].append(0)
 
-        self.batch_idx += 1
-
-    def analyze_and_report(self, emb_configs):
-        """Analyze per-table traces and derive weighted value density formula."""
+    def analyze_and_report(self):
+        """Report per-table traces and print an offline formula candidate."""
         if len(self.table_stats) == 0:
             print("[EmbeddingAccessTracer] No data collected")
             return None
@@ -595,9 +467,9 @@ class EmbeddingAccessTracer:
         print(f"Weighted concentration:      {weighted_concentration:.1%}")
         print()
 
-        # DERIVED FORMULA
+        # Diagnostic-only candidate formula generated from the collected trace.
         print("="*80)
-        print("PROPOSED VALUE DENSITY FORMULA (Data-Driven):")
+        print("OFFLINE VALUE DENSITY FORMULA CANDIDATE (not executed):")
         print("="*80)
 
         typical_cache_mb = weighted_p95_ws_bytes / (1024 * 1024)
@@ -643,7 +515,7 @@ def _estimate_embedding_value_density(emb_configs, max_batch_size, max_num_candi
         print(f"   is MUCH smaller than full capacity ({total_capacity_bytes/(1024**2):.1f} MB)")
         print(f"2. Coverage: {weighted_coverage:.2%} - only a fraction of vocab is accessed")
         print(f"3. Access is concentrated: top 10% items = {weighted_concentration:.1%} of accesses")
-        print(f"4. This explains over-allocation: value score used vocab size, not actual access")
+        print(f"4. The startup heuristic uses vocabulary scale; this trace reports actual accessed IDs")
         print("="*80 + "\n")
 
         return {
@@ -683,43 +555,35 @@ def run_ranking_gr_simulate(
 
     with torch.inference_mode():
         # Get model and optionally the controller for dynamic allocation
-        print(f"[ORIGINAL_SYSTEM_DEBUG] Getting HotState enabled status...", flush=True)
         hotstate_enabled = get_hotstate_enabled()
-        print(f"[ORIGINAL_SYSTEM_DEBUG] hotstate_enabled={hotstate_enabled}", flush=True)
+        use_kvcache = not disable_kvcache
 
-        print(f"[ORIGINAL_SYSTEM_DEBUG] Getting HBM budget...", flush=True)
         total_hbm_bytes = get_hbm_budget_bytes()
-        print(f"[ORIGINAL_SYSTEM_DEBUG] total_hbm_bytes={total_hbm_bytes}", flush=True)
 
-        return_controller = hotstate_enabled and total_hbm_bytes > 0
-        print(f"[ORIGINAL_SYSTEM_DEBUG] return_controller={return_controller}", flush=True)
+        return_controller = hotstate_enabled and total_hbm_bytes > 0 and use_kvcache
 
         if return_controller:
-            print(f"[ORIGINAL_SYSTEM_DEBUG] Calling get_inference_hstu_model WITH controller...", flush=True)
             model, hotstate_controller = get_inference_hstu_model(
                 emb_configs,
                 max_batch_size,
                 num_contextual_features,
                 total_max_seqlen,
                 checkpoint_dir,
-                True,
+                use_kvcache,
                 return_controller=True,
                 max_num_candidates=max_num_candidates,
             )
-            print(f"[ORIGINAL_SYSTEM_DEBUG] Model loading WITH controller complete!", flush=True)
         else:
-            print(f"[ORIGINAL_SYSTEM_DEBUG] Calling get_inference_hstu_model WITHOUT controller...", flush=True)
             model = get_inference_hstu_model(
                 emb_configs,
                 max_batch_size,
                 num_contextual_features,
                 total_max_seqlen,
                 checkpoint_dir,
-                True,
+                use_kvcache,
                 return_controller=False,
                 max_num_candidates=max_num_candidates,
             )
-            print(f"[ORIGINAL_SYSTEM_DEBUG] Model loading WITHOUT controller complete!", flush=True)
             hotstate_controller = None
 
         if check_auc:
@@ -753,9 +617,6 @@ def run_ranking_gr_simulate(
         num_batches_ctr = 0
         start_time = time.time()
         cur_date = None
-        scheduler_telemetry_interval = 100  # Log scheduler state every N batches
-        cross_state_interval = 200  # Log cross-state comparison every N batches
-        semantic_interval = 300  # Log semantic policies every N batches
 
         # ============================================================
         # INSTRUMENTATION: Trace actual embedding access patterns
@@ -800,200 +661,18 @@ def run_ranking_gr_simulate(
                         except Exception as e:
                             print(f"[AccessTracer] Failed to record batch {num_batches_ctr}: {e}")
 
-                    # ============================================================
-                    # GAP 3: Transfer Scheduler Telemetry
-                    # Log scheduler coordination metrics periodically
-                    # ============================================================
-                    if hotstate_controller is not None and num_batches_ctr % scheduler_telemetry_interval == 0:
-                        try:
-                            coordination = hotstate_controller.get_transfer_coordination_metrics()
-                            value_scoring = hotstate_controller.get_value_scoring_metrics()
-                            scheduler_state = hotstate_controller.get_scheduler_state()
-
-                            print(
-                                f"[Batch {num_batches_ctr}] Scheduler Coordination: "
-                                f"Transfers={{In-Flight: {scheduler_state.get('in_flight_transfers', 0)}, "
-                                f"Queued: {scheduler_state.get('queued_transfers', 0)}}} | "
-                                f"Coordination={{Overlapped: {coordination.get('overlapped_transfers', 0)}, "
-                                f"Ratio: {coordination.get('coordination_ratio', 0):.1%}}} | "
-                                f"Value Scoring={{Emb: {value_scoring.get('embedding_avg_value_density', 0):.4f}, "
-                                f"KV: {value_scoring.get('kv_avg_value_density', 0):.4f}}} "
-                                f"ms/byte"
-                            )
-                        except Exception as e:
-                            print(f"[HotState] Scheduler telemetry failed: {e}")
-
-                    # ============================================================
-                    # GAP 4: Cross-State Value Comparison and Unified Eviction
-                    # Log comparison metrics periodically
-                    # ============================================================
-                    if hotstate_controller is not None and num_batches_ctr % cross_state_interval == 0:
-                        try:
-                            normalized_densities = hotstate_controller.compute_normalized_value_densities()
-                            candidates = hotstate_controller.build_unified_eviction_candidates()
-
-                            print(
-                                f"[Batch {num_batches_ctr}] Cross-State Comparison: "
-                                f"Unified Pool={{Total: {candidates.get('total_candidates', 0)}, "
-                                f"Embedding: {candidates.get('embedding_candidates', 0)}, "
-                                f"KV: {candidates.get('kv_candidates', 0)}}} | "
-                                f"Value Densities={{Emb: {normalized_densities.get('embedding_value_density_ms_per_byte', 0):.6f}, "
-                                f"KV: {normalized_densities.get('kv_value_density_ms_per_byte', 0):.6f}}} "
-                                f"ms/byte | More Valuable: "
-                                f"{'Embedding' if normalized_densities.get('embedding_is_more_valuable') else 'KV'}"
-                            )
-                        except Exception as e:
-                            print(f"[HotState] Cross-state comparison failed: {e}")
-
-                    # ============================================================
-                    # GAP 5: Semantic Differences and Consistency Policies
-                    # Log semantic policy adherence periodically
-                    # ============================================================
-                    if hotstate_controller is not None and num_batches_ctr % semantic_interval == 0:
-                        try:
-                            semantic_plan = hotstate_controller.compute_semantic_allocation()
-                            embedding_policy = hotstate_controller.get_semantic_policy("embedding")
-                            kv_policy = hotstate_controller.get_semantic_policy("kv_cache")
-
-                            print(
-                                f"[Batch {num_batches_ctr}] Semantic Policies: "
-                                f"Embedding={{Consistency: {embedding_policy.get('consistency_class', 'N/A')}, "
-                                f"Regenerable: {embedding_policy.get('regenerable', False)}, "
-                                f"Staleness Tolerance: {embedding_policy.get('staleness_tolerance_epochs', 0)} epochs}} | "
-                                f"KV={{Consistency: {kv_policy.get('consistency_class', 'N/A')}, "
-                                f"Session-Bound: {kv_policy.get('session_bound', False)}, "
-                                f"Authoritative: {kv_policy.get('authoritative_copy_required', False)}}} | "
-                                f"KV Min Budget: {semantic_plan.get('kv_ratio', 0):.1%}"
-                            )
-                        except Exception as e:
-                            print(f"[HotState] Semantic policy logging failed: {e}")
-
-                    # ============================================================
-                    # GAP 2: Continuous Budget Monitoring and Enforcement
-                    # Check if allocated budgets are being respected
-                    # ============================================================
-                    if hotstate_controller is not None:
-                        # Validate budget enforcement periodically
-                        validation = hotstate_controller.validate_budget_enforcement()
-
-                        # Check if emergency reallocation is needed
-                        emergency_realloc = hotstate_controller.should_trigger_emergency_reallocation()
-
-                        # Decide allocation frequency based on enforcement success
-                        hotstate_controller.update_reallocation_frequency()
-                        realloc_interval = hotstate_controller._reallocation_interval
-
-                        # Trigger reallocation if:
-                        # 1. Regular interval check
-                        # 2. Emergency condition (budget violations)
-                        should_realloc = (
-                            (num_batches_ctr % realloc_interval == 0) or
-                            emergency_realloc
+                    if not disable_kvcache and (hotstate_controller is not None or os.getenv("HOTSTATE_TRACE_PATH")):
+                        logits, _record = run_inference_request(
+                            model, batch, uids, total_history_lengths,
+                            controller=hotstate_controller,
+                            batch_idx=num_batches_ctr,
+                            state_budget_bytes=total_hbm_bytes or None,
+                            static_split=os.getenv("HOTSTATE_STATIC_SPLIT", "static_default"),
                         )
-
-                        if should_realloc:
-                            try:
-                                # Use corrective allocation if violations detected, else adaptive
-                                if emergency_realloc:
-                                    allocation_plan = hotstate_controller.compute_corrective_allocation()
-                                    print(
-                                        f"[Batch {num_batches_ctr}] EMERGENCY REALLOCATION: "
-                                        f"{allocation_plan.get('decision_reason', 'unknown')} | "
-                                        f"Success Rate: {validation.get('enforcement_success_rate', 0):.1%}"
-                                    )
-                                else:
-                                    allocation_plan = hotstate_controller.compute_adaptive_allocation()
-
-                                hotstate_controller.enforce_adaptive_allocation(allocation_plan)
-
-                                # Log budget enforcement metrics periodically
-                                if num_batches_ctr % (realloc_interval * 5) == 0:
-                                    drift = validation["current_drift"]
-                                    print(
-                                        f"[Batch {num_batches_ctr}] Budget Enforcement: "
-                                        f"Emb Drift={drift.get('embedding_drift_ratio', 0):.1%} "
-                                        f"KV Drift={drift.get('kv_drift_ratio', 0):.1%} | "
-                                        f"Success Rate={validation.get('enforcement_success_rate', 0):.1%} | "
-                                        f"Interval={realloc_interval}"
-                                    )
-                            except Exception as e:
-                                print(f"[HotState] Budget monitoring check failed: {e}")
-                        else:
-                            # Between reallocation checks, still validate budget
-                            if validation.get("enforcement_success_rate", 1.0) < 0.5 and num_batches_ctr % 10 == 0:
-                                drift = validation["current_drift"]
-                                if drift.get("has_embedding_violation") or drift.get("has_kv_violation"):
-                                    print(
-                                        f"[Batch {num_batches_ctr}] WARNING: Budget violation detected "
-                                        f"(next check in {realloc_interval} batches)"
-                                    )
-
-                    # ============================================================
-                    # Call HotState controller BEFORE each inference batch
-                    # This invokes: transfer scheduling + dynamic allocation
-                    # ============================================================
-                    hotstate_result = None
-                    if hotstate_controller is not None:
-                        try:
-                            # Run the control epoch: dynamic allocation + transfer planning
-                            # This calls execute_residency_plan() and stage_kv_request()
-                            hotstate_result = hotstate_controller.before_batch(
-                                batch=batch,
-                                user_ids=uids,
-                                total_history_lengths=total_history_lengths,
-                                batch_idx=num_batches_ctr,
-                            )
-
-                            # Log transfer scheduler decisions (GAP 3: Verify scheduler is active)
-                            if hotstate_result and num_batches_ctr % (scheduler_telemetry_interval * 2) == 0:
-                                admitted_emb = len(hotstate_result.get("admitted_keys", []))
-                                evicted_emb = len(hotstate_result.get("evicted_keys", []))
-                                if admitted_emb > 0 or evicted_emb > 0:
-                                    print(
-                                        f"[Batch {num_batches_ctr}] Transfer Scheduler Decisions: "
-                                        f"Admitted Emb={admitted_emb}, Evicted Emb={evicted_emb}, "
-                                        f"(Coordinated embedding+KV transfers)"
-                                    )
-
-                            # ============================================================
-                            # CRITICAL FIX: Apply HotState decisions to the model
-                            # This is what was missing - the forward path must consume
-                            # the control plane's decisions
-                            # ============================================================
-                            if hotstate_result:
-                                # Apply embedding prefetch hints if available
-                                if "embedding_prefetch_keys" in hotstate_result:
-                                    prefetch_keys = hotstate_result["embedding_prefetch_keys"]
-                                    if len(prefetch_keys) > 0 and hasattr(model, 'prefetch_embedding_keys'):
-                                        model.prefetch_embedding_keys(prefetch_keys)
-
-                                # Apply KV cache staged handles if available
-                                if "kv_staged_handles" in hotstate_result:
-                                    staged_handles = hotstate_result["kv_staged_handles"]
-                                    if staged_handles and hasattr(model, 'apply_kv_staged_handles'):
-                                        model.apply_kv_staged_handles(staged_handles)
-                        except Exception as e:
-                            print(f"[HotState] before_batch failed: {e}")
-                            import traceback
-                            traceback.print_exc()
-
-                    # PROFILING: Measure forward time
-                    forward_start = time.time()
-                    if not disable_kvcache:
-                        logits = model.forward_with_kvcache(
-                            batch,
-                            uids,
-                            total_history_lengths,
-                        )
+                    elif not disable_kvcache:
+                        logits = model.forward_with_kvcache(batch, uids, total_history_lengths)
                     else:
-                        model.forward_nokvcache(batch)
-                    forward_elapsed_ms = 1000 * (time.time() - forward_start)
-                    # eval_module(logits, batch.labels)
-
-                    # PROFILING: Log overhead vs benefit
-                    if hotstate_controller is not None and hotstate_result is not None:
-                        before_batch_total_ms = hotstate_result.get("profile_ms", {}).get("total", 0)
-                        print(f"[PROFILE BATCH {num_batches_ctr}] before_batch={before_batch_total_ms:.2f}ms forward={forward_elapsed_ms:.2f}ms net={forward_elapsed_ms - before_batch_total_ms:.2f}ms")
+                        logits = model.forward_nokvcache(batch)
 
                 num_batches_ctr += 1
                 # if num_batches_ctr == 1000:
@@ -1009,11 +688,10 @@ def run_ranking_gr_simulate(
         # ============================================================
         if enable_access_tracing:
             try:
-                trace_analysis = access_tracer.analyze_and_report(emb_configs)
+                trace_analysis = access_tracer.analyze_and_report()
                 if trace_analysis:
                     print("\n[AccessTracer] Trace analysis completed successfully")
-                    print(f"   Use these measured constants to replace hardcoded guesses")
-                    print(f"   in _estimate_embedding_value_density()")
+                    print("   Trace metrics are diagnostics for configured policy sweeps.")
             except Exception as e:
                 print(f"[AccessTracer] Analysis failed: {e}")
                 import traceback
@@ -1078,7 +756,7 @@ def run_ranking_gr_evaluate(
         use_kvcache = not disable_kvcache
         hotstate_enabled = get_hotstate_enabled()
         total_hbm_bytes = get_hbm_budget_bytes()
-        return_controller = hotstate_enabled and total_hbm_bytes > 0
+        return_controller = hotstate_enabled and total_hbm_bytes > 0 and use_kvcache
 
         if return_controller:
             model, hotstate_controller = get_inference_hstu_model(
@@ -1126,6 +804,7 @@ def run_ranking_gr_evaluate(
         dataloader = get_data_loader(dataset=eval_dataset)
         dataloader_iter = iter(dataloader)
 
+        batch_idx = 0
         # torch.cuda.profiler.start()
         while True:
             try:
@@ -1144,13 +823,22 @@ def run_ranking_gr_evaluate(
                 )
                 total_history_lengths = total_history_lengths.cpu()
 
-                if not disable_kvcache:
+                if not disable_kvcache and (hotstate_controller is not None or os.getenv("HOTSTATE_TRACE_PATH")):
+                    logits, _record = run_inference_request(
+                        model, batch, user_ids, total_history_lengths,
+                        controller=hotstate_controller,
+                        batch_idx=batch_idx,
+                        state_budget_bytes=total_hbm_bytes or None,
+                        static_split=os.getenv("HOTSTATE_STATIC_SPLIT", "static_default"),
+                    )
+                elif not disable_kvcache:
                     logits = model.forward_with_kvcache(
                         batch, user_ids, total_history_lengths
                     )
                 else:
                     logits = model.forward_nokvcache(batch)
                 eval_module(logits, batch.labels.values())
+                batch_idx += 1
             except StopIteration:
                 break
         # torch.cuda.profiler.stop()

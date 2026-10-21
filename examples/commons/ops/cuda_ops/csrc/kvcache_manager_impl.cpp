@@ -673,6 +673,60 @@ bool GPUKVCacheMangerImpl::evict_if_present(int64_t uid) {
     return true;
 }
 
+std::vector<int32_t> GPUKVCacheMangerImpl::get_user_cache_interval(int64_t uid) {
+    std::lock_guard<std::recursive_mutex> lock(allocation_mutex_);
+    auto it = _uid_to_page_id.find(uid);
+    if (it == _uid_to_page_id.end()) return {0, 0, 0};
+    const int start = _uid_to_paged_cache_startpos.at(uid);
+    return {start, start + _uid_to_paged_cache_length.at(uid),
+            static_cast<int32_t>(it->second.size())};
+}
+
+bool GPUKVCacheMangerImpl::evict_user_suffix_pages(
+    int64_t uid, int num_pages, int expected_start, int expected_end) {
+    std::lock_guard<std::recursive_mutex> lock(allocation_mutex_);
+    if (num_pages <= 0 || is_user_offload_frozen(uid)) return false;
+    auto pages_it = _uid_to_page_id.find(uid);
+    if (pages_it == _uid_to_page_id.end() || pages_it->second.empty()) return false;
+
+    auto& page_ids = pages_it->second;
+    const int start = _uid_to_paged_cache_startpos.at(uid);
+    const int end = start + _uid_to_paged_cache_length.at(uid);
+    if (start != expected_start || end != expected_end ||
+        num_pages > static_cast<int>(page_ids.size())) return false;
+    const int remaining_pages = static_cast<int>(page_ids.size()) - num_pages;
+    if (remaining_pages > 0) {
+        // A mapped suffix may overlap the durable host prefix. Do not leave
+        // get_total_cache_length() behind that prefix after a partial release.
+        std::unique_lock<std::mutex> host_lock(queued_offload_lastpos_mutex_);
+        auto host_it = _uid_to_offloaded_length.find(uid);
+        if (host_it != _uid_to_offloaded_length.end() &&
+            start + remaining_pages * num_tokens_per_page < host_it->second) return false;
+    }
+    const int released = num_pages;
+    for (int index = 0; index < released; ++index) {
+        _empty_pages.push(page_ids.back());
+        page_ids.pop_back();
+    }
+
+    auto length_it = _uid_to_paged_cache_length.find(uid);
+    if (length_it != _uid_to_paged_cache_length.end()) {
+        const int remaining_token_capacity = static_cast<int>(page_ids.size()) * num_tokens_per_page;
+        length_it->second = std::min(length_it->second, remaining_token_capacity);
+    }
+    if (page_ids.empty()) {
+        auto lru_it = _lru_lookup_table.find(uid);
+        if (lru_it != _lru_lookup_table.end()) {
+            _lru_list.erase(lru_it->second);
+            _lru_lookup_table.erase(lru_it);
+        }
+        _uid_to_page_id.erase(pages_it);
+        _uid_to_paged_cache_startpos.erase(uid);
+        _uid_to_paged_cache_length.erase(uid);
+    }
+    return true;
+}
+
 void GPUKVCacheMangerImpl::set_active_page_limit(int new_limit) {
     std::lock_guard<std::recursive_mutex> lock(allocation_mutex_);
     int current_active = num_primary_cache_pages - (int)_withheld_pages.size();

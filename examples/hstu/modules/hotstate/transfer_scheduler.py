@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from modules.hotstate.kv_adapter import KVAdapter
 from modules.hotstate.state_handle import Placement, TransferState
 
 
@@ -127,7 +128,20 @@ class TransferScheduler:
 
     @staticmethod
     def _scored(scoring_map: Mapping[str, Any], key: str) -> Any:
-        return scoring_map.get(key) if scoring_map is not None else None
+        if scoring_map is None:
+            return None
+        direct = scoring_map.get(key)
+        if direct is not None:
+            return direct
+        if key.startswith("kv:uid:"):
+            uid = key.split(":")[2]
+            related = [
+                scored for candidate, scored in scoring_map.items()
+                if candidate.startswith(f"kv:uid:{uid}:")
+            ]
+            if related:
+                return max(related, key=lambda item: float(getattr(item, "score", 0.0)))
+        return None
 
     def _priority(
         self,
@@ -259,22 +273,36 @@ class TransferScheduler:
             evictions.append(request)
 
         for key in dict.fromkeys(str(value) for value in evicted_kv_keys):
-            try:
-                uid = int(key.rsplit(":", 1)[-1])
-            except ValueError:
+            uid = KVAdapter.user_id_from_key(key)
+            if uid is None:
                 continue
             if uid in protected:
                 continue
-            footprint = max(0, self.kv.get_page_count_for_user(uid)) * int(
-                self.kv._page_bytes()
+            handle = self.registry.get(key) if self.registry is not None else None
+            page_index = (
+                int(handle.metadata["page_index"])
+                if handle is not None and "page_index" in handle.metadata
+                else None
             )
-            has_host_copy = bool(self.kv.has_host_copy(uid))
+            segment_manifest = (
+                dict(handle.metadata.get("segments", {})) if handle is not None else None
+            )
+            footprint = (
+                int(handle.footprint_bytes) if handle is not None
+                else max(0, self.kv.get_page_count_for_user(uid)) * int(self.kv._page_bytes())
+            )
+            has_host_copy = (
+                Placement.HOST_DRAM in handle.placement
+                if handle is not None
+                else bool(self.kv.has_host_copy(uid))
+            )
             request = self._enqueue(
                 logical_key=key,
                 state_class="kv",
                 direction="release",
                 source=Placement.HBM,
-                target=Placement.HOST_DRAM if has_host_copy else None,
+                target=(Placement.HOST_DRAM if has_host_copy else None)
+                if page_index is None else None,
                 # Releasing a primary-pool mapping is a physical capacity
                 # action, but it does not itself move bytes.  Keep the freed
                 # footprint as metadata so transfer accounting stays honest.
@@ -285,6 +313,8 @@ class TransferScheduler:
                 resource=TransferResource.HBM_RELEASE,
                 metadata={
                     "uid": uid,
+                    "page_index": page_index,
+                    "segment_manifest": segment_manifest,
                     "host_copy": has_host_copy,
                     "released_footprint_bytes": footprint,
                 },
@@ -790,11 +820,14 @@ class TransferScheduler:
         entry = self.dir.get(request.logical_key)
         if not callable(manifest_fn) or entry is None:
             return
-        uid = int(request.metadata.get("uid", request.logical_key.rsplit(":", 1)[-1]))
+        uid = int(request.metadata.get("uid", self.kv.user_id_from_key(request.logical_key)))
         manifest = manifest_fn(uid)
         entry.metadata["segments"] = manifest
-        entry.version = int(manifest.get("version", entry.version))
-        entry.freshness_epoch = entry.version
+        segment_end = int(
+            entry.metadata.get("segment_end_token", manifest.get("version", entry.version))
+        )
+        entry.version = segment_end
+        entry.freshness_epoch = segment_end
         host_prefix = int(manifest.get("host_prefix_tokens", 0))
         hbm_end = int(manifest.get("hbm_start_token", 0)) + int(
             manifest.get("hbm_tokens", 0)
@@ -802,7 +835,7 @@ class TransferScheduler:
         if Placement.HOST_DRAM in entry.placements:
             entry.replica_versions[Placement.HOST_DRAM] = host_prefix
         if Placement.HBM in entry.placements:
-            entry.replica_versions[Placement.HBM] = hbm_end
+            entry.replica_versions[Placement.HBM] = segment_end
 
     def _fail(self, request: TransferRequest, error: str, epoch: int) -> None:
         if request.status == TransferStatus.IN_FLIGHT:

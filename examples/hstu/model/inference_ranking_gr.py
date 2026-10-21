@@ -223,6 +223,10 @@ def get_inference_ranking_gr(
     hotstate_admit_strategy=None,
     hotstate_admission_counters=None,
     dynamic_embedding_hbm_bytes: int = 0,
+    hotstate_state_budget_bytes: int = 0,
+    hotstate_policy_config=None,
+    hotstate_value_function=None,
+    hotstate_trace_path=None,
 ):
     for ebc_config in task_config.embedding_configs:
         assert (
@@ -244,6 +248,16 @@ def get_inference_ranking_gr(
         cudagraph_configs,
     )
 
+    if hotstate_state_budget_bytes > 0:
+        if kvcache_config is None:
+            raise ValueError("HotState inference requires a KV cache backend")
+        inference_dense.enable_hotstate(
+            total_hbm_bytes=int(hotstate_state_budget_bytes),
+            configured_state_budget_bytes=int(hotstate_state_budget_bytes),
+            policy_config=hotstate_policy_config,
+            value_function=hotstate_value_function,
+            trace_path=hotstate_trace_path,
+        )
     if inference_dense.hotstate is not None:
         inference_dense.hotstate.set_embedding_module(inference_sparse)
 

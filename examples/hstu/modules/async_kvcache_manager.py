@@ -136,6 +136,7 @@ class AsyncHSTUKVCacheManager:
         self.last_consumed_prepare_generation = None
         self._last_offload_completion_target = 0
         self._active_prepare = None
+        self.last_wait_timings = {}
 
     def physical_hbm_breakdown(self) -> dict:
         """Return bytes allocated by the KV state manager on the GPU.
@@ -197,6 +198,7 @@ class AsyncHSTUKVCacheManager:
         static_metadata_gpu_buffer,
         static_onload_handle,
     ):
+        self.last_wait_timings = {}
         origin_cached_lengths = self.gpu_kvcache_mgr.get_total_cache_length(user_ids)
         new_tokens = sum(
             [
@@ -363,7 +365,11 @@ class AsyncHSTUKVCacheManager:
         metadata_gpu_buffer,  # input static
         static_onload_handle,
     ):
+        wait_start = time.perf_counter()
         kvcache_metadata_fut.result()
+        self.last_wait_timings["metadata_future_wait_ms"] = (
+            time.perf_counter() - wait_start
+        ) * 1000.0
         return self.get_kvcache_metadata_from_buffer(
             batch_size,
             new_tokens,
@@ -559,8 +565,8 @@ class AsyncHSTUKVCacheManager:
 
         This constrains the KV cache manager to use at most `new_limit` pages
         from the primary cache pool, even if more physical pages are available.
-        This allows HotState to dynamically reallocate HBM between embedding
-        and KV cache budgets.
+        The physical KV tensor is unchanged; this does not reallocate HBM
+        between embedding and KV pools.
 
         Args:
             new_limit (int): Maximum number of pages to use (must be <= num_primary_cache_pages)

@@ -402,6 +402,8 @@ public:
     // not release the mapping until the worker has copied it to host memory.
     bool is_user_offload_frozen(int64_t uid);
     bool evict_if_present(int64_t uid);
+    std::vector<int32_t> get_user_cache_interval(int64_t uid);
+    bool evict_user_suffix_pages(int64_t uid, int num_pages, int expected_start, int expected_end);
     void set_active_page_limit(int new_limit);
 private:
     std::queue<int64_t> _withheld_pages;   // pages temporarily removed from circulation

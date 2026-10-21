@@ -3,6 +3,7 @@ from collections import defaultdict
 from typing import Dict, List, Optional
 
 from modules.hotstate.demand_signal import DemandSignal
+from modules.hotstate.policy import PolicyConfig, ValueInputs, WeightedValue
 from modules.hotstate.online_cost_model import (
     BatchCostObservation,
     OnlineSystemCostModel,
@@ -23,17 +24,18 @@ class ValueEngine:
     model. Cold-start priors remain visible and decay as observations arrive.
     """
 
-    def __init__(self, total_hbm_bytes: int, cost_model=None):
+    def __init__(self, total_hbm_bytes: int, cost_model=None, config=None, value_function=None):
         self.total_hbm = int(total_hbm_bytes)
-        self.cost_model = cost_model or OnlineSystemCostModel()
-        self._access_log: Dict[str, List[int]] = defaultdict(list)
-        self._hot_key_counts: Dict[str, int] = {}
+        self.config = config or PolicyConfig()
+        self.value_function = value_function or WeightedValue(self.config)
+        self.cost_model = cost_model or OnlineSystemCostModel(self.config)
         self._embedding_last_access_epoch_by_item: Dict[int, int] = {}
         self._last_access_epoch_by_key: Dict[str, int] = {}
         self._reuse_interval_ewma_by_key: Dict[str, float] = {}
         self._reuse_probability_ewma_by_type: Dict[StateType, float] = {
             StateType.EMBEDDING_HOT_ROWS: 0.50,
             StateType.EMBEDDING_COLD_ROWS: 0.10,
+            StateType.SESSION_KV_SEGMENT: 0.50,
             StateType.SESSION_KV_USER: 0.50,
         }
         self._configured_kv_prior = None
@@ -77,6 +79,7 @@ class ValueEngine:
 
     def cost_model_snapshot(self) -> dict:
         snapshot = self.cost_model.snapshot()
+        snapshot["policy"] = self.config.snapshot()
         snapshot["configured_kv_prior_ms_per_1k_tokens"] = self._configured_kv_prior
         snapshot["configured_embedding_prior_ms_per_key"] = self._configured_embedding_prior
         snapshot["tracked_access_keys"] = len(self._last_access_epoch_by_key)
@@ -106,7 +109,7 @@ class ValueEngine:
 
     @staticmethod
     def _state_class(handle: StateHandle) -> str:
-        return "kv" if handle.state_type == StateType.SESSION_KV_USER else "embedding"
+        return "kv" if handle.is_kv else "embedding"
 
     def compute_scores(
         self, handles: List[StateHandle], demand: DemandSignal
@@ -142,16 +145,21 @@ class ValueEngine:
             )
 
             gross_benefit = reuse * (miss_cost + reconstruction_credit)
-            net_benefit = (
-                gross_benefit - movement_cost - risk_cost - opportunity_cost
+            net_benefit = self.value_function(
+                ValueInputs(gross_benefit, movement_cost, risk_cost, opportunity_cost)
             )
             value_density = net_benefit / max(1, handle.footprint_bytes)
+            score = value_density / max(1, handle.expected_reuse_window) ** self.config.density_time_exponent
+            if not math.isfinite(net_benefit) or not math.isfinite(score):
+                raise ValueError("value function returned a non-finite score")
 
             handle.reuse_imminence = reuse
             handle.stall_sensitivity_ms = miss_cost
             handle.movement_cost_ms = movement_cost
             if handle.expected_reuse_window <= 0:
-                interval = self._reuse_interval_ewma_by_key.get(handle.logical_key)
+                interval = self._reuse_interval_ewma_by_key.get(
+                    handle.metadata.get("access_key", handle.logical_key)
+                )
                 if interval is not None:
                     handle.expected_reuse_window = max(1, int(round(interval)))
 
@@ -163,7 +171,7 @@ class ValueEngine:
             scored.append(
                 ScoredHandle(
                     handle=handle,
-                    score=value_density,
+                    score=score,
                     benefit_density=gross_benefit / max(1, handle.footprint_bytes),
                     occupancy_penalty=opportunity_cost,
                     semantic_risk=risk_cost,
@@ -176,6 +184,16 @@ class ValueEngine:
                     value_density_ms_per_byte=value_density,
                     decision_reason=reason,
                     opportunity_cost_ms=opportunity_cost,
+                    policy_name=type(self.value_function).__name__,
+                    policy_config_id=self.config.snapshot()["config_id"],
+                    policy_inputs={
+                        "reuse_probability": reuse,
+                        "miss_cost_ms": miss_cost,
+                        "reconstruction_credit_ms": reconstruction_credit,
+                        "movement_cost_ms": movement_cost,
+                        "risk_cost_ms": risk_cost,
+                        "opportunity_cost_ms": opportunity_cost,
+                    },
                 )
             )
 
@@ -186,15 +204,17 @@ class ValueEngine:
         return scored
 
     def _stall_sensitivity(self, handle: StateHandle, demand: DemandSignal) -> float:
-        if handle.state_type == StateType.SESSION_KV_USER:
-            try:
-                uid = int(handle.logical_key.rsplit(":", 1)[-1])
-            except (ValueError, IndexError):
-                uid = None
+        if handle.is_kv:
+            uid = handle.metadata.get("user_id")
+            if uid is None:
+                try:
+                    uid = int(handle.logical_key.split(":")[2])
+                except (ValueError, IndexError):
+                    uid = None
             page_bytes = max(1, int(handle.metadata.get("page_bytes", 1)))
             page_count = max(1, int(handle.metadata.get("page_count", 1)))
             page_tokens = max(1, int(handle.metadata.get("page_size_tokens", 1)))
-            cached_tokens = page_count * page_tokens
+            cached_tokens = int(handle.metadata.get("token_count", page_count * page_tokens))
             # A KV handle represents already-materialized session state. Its
             # residency value is the measured cost of recovering those cached
             # tokens, not the unrelated cost of appending the current batch.
@@ -209,7 +229,7 @@ class ValueEngine:
         return self.cost_model.embedding_miss_ms(max(1, misses))
 
     def _reuse_imminence(self, handle: StateHandle, demand: DemandSignal) -> float:
-        key = handle.logical_key
+        key = handle.metadata.get("access_key", handle.logical_key)
         current_epoch = int(demand.epoch)
         if key in self._reuse_interval_ewma_by_key:
             interval = max(1.0, self._reuse_interval_ewma_by_key[key])
@@ -218,11 +238,13 @@ class ValueEngine:
             return min(1.0, math.exp(-float(age) / interval))
 
         type_prior = self._reuse_probability_ewma_by_type.get(handle.state_type, 0.25)
-        if handle.state_type == StateType.SESSION_KV_USER:
-            try:
-                uid = int(key.rsplit(":", 1)[-1])
-            except (ValueError, IndexError):
-                uid = None
+        if handle.is_kv:
+            uid = handle.metadata.get("user_id")
+            if uid is None:
+                try:
+                    uid = int(key.split(":")[2])
+                except (ValueError, IndexError):
+                    uid = None
             if uid == demand.current_user_id:
                 return 1.0
         elif key.startswith("emb:item:"):
@@ -240,10 +262,11 @@ class ValueEngine:
         if previous is not None and epoch > previous:
             interval = float(epoch - previous)
             old_interval = self._reuse_interval_ewma_by_key.get(key, interval)
-            self._reuse_interval_ewma_by_key[key] = 0.8 * old_interval + 0.2 * interval
+            alpha = self.config.reuse_interval_alpha
+            self._reuse_interval_ewma_by_key[key] = (1 - alpha) * old_interval + alpha * interval
             if state_type is None:
                 if key.startswith("kv:uid:"):
-                    state_type = StateType.SESSION_KV_USER
+                    state_type = StateType.SESSION_KV_SEGMENT
                 elif key.startswith("emb:item:"):
                     state_type = StateType.EMBEDDING_HOT_ROWS
             if state_type is not None:
@@ -251,24 +274,13 @@ class ValueEngine:
                 old_probability = self._reuse_probability_ewma_by_type.get(
                     state_type, probability
                 )
+                alpha = self.config.reuse_probability_alpha
                 self._reuse_probability_ewma_by_type[state_type] = (
-                    0.9 * old_probability + 0.1 * probability
+                    (1 - alpha) * old_probability + alpha * probability
                 )
         self._last_access_epoch_by_key[key] = epoch
-        self._access_log[key].append(epoch)
-
-    def set_hot_key_count(self, emb_key: str, count: int):
-        self._hot_key_counts[emb_key] = count
 
     def decay_logs(self, current_epoch: int, max_age: int = 128):
-        for key in list(self._access_log.keys()):
-            self._access_log[key] = [
-                epoch
-                for epoch in self._access_log[key]
-                if current_epoch - epoch <= max_age
-            ]
-            if not self._access_log[key]:
-                del self._access_log[key]
         for key, last_epoch in list(self._embedding_last_access_epoch_by_item.items()):
             if current_epoch - last_epoch > max_age:
                 del self._embedding_last_access_epoch_by_item[key]
@@ -312,10 +324,11 @@ class ValueEngine:
                 ]
             else:
                 age = max(0, epoch - previous)
-                horizon = max(1.0, interval or 8.0)
+                horizon = max(1.0, interval or self.config.reuse_horizon_epochs)
                 recency_probability = math.exp(-float(age) / horizon)
             frequency_probability = 1.0 - math.exp(-float(counts[key]))
-            reuse = min(1.0, 0.6 * recency_probability + 0.4 * frequency_probability)
+            weight = self.config.embedding_recency_weight
+            reuse = min(1.0, weight * recency_probability + (1 - weight) * frequency_probability)
             miss_cost = self.cost_model.embedding_miss_ms(max(1, counts[key]))
             movement_cost = self.cost_model.estimate_transfer_ms(
                 state_class="embedding",
@@ -323,7 +336,9 @@ class ValueEngine:
                 bytes_moved=row_bytes,
             )
             opportunity_cost = self.cost_model.opportunity_cost_ms(row_bytes)
-            net_benefit = reuse * miss_cost - movement_cost - opportunity_cost
+            net_benefit = self.value_function(
+                ValueInputs(reuse * miss_cost, movement_cost, 0.0, opportunity_cost)
+            )
             density = net_benefit / row_bytes
             ranked.append(
                 (

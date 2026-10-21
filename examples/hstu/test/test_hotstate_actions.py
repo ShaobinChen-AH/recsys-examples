@@ -35,11 +35,14 @@ class _PlanningEmbedding:
             StateHandle(
                 state_type=StateType.EMBEDDING_HOT_ROWS,
                 logical_key="emb:item:hot_rows",
-                footprint_bytes=12,
+                footprint_bytes=8,
                 placement={Placement.HOST_DRAM},
                 reconstructability=Reconstructability.REFETCHABLE,
             )
         ]
+
+    def physical_hbm_bytes(self):
+        return 8
 
 
 class _PlanningKV:
@@ -74,6 +77,24 @@ class _PlanningKV:
                 reconstructability=Reconstructability.RECOMPUTABLE,
             ),
         ]
+
+    def get_physical_page_count(self):
+        return 8
+
+    def physical_hbm_bytes(self):
+        return 8
+
+    def actual_resident_kv_bytes(self):
+        return self.get_resident_page_count() * self._page_bytes()
+
+    def physical_kv_cache_bytes(self):
+        return self.get_physical_page_count() * self._page_bytes()
+
+    def user_id_from_key(self, key):
+        try:
+            return int(key.split(":")[2])
+        except (IndexError, ValueError):
+            return None
 
 
 def test_hotset_emits_concrete_embedding_and_kv_actions():

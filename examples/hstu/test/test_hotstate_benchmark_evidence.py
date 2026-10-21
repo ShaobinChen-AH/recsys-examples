@@ -35,6 +35,7 @@ def _hot_row(index, latency, embedding=20, kv=30):
         "model_rebuild_count": 0,
         "online_reallocation_observed": False,
         "benchmark_variant": "physical_envelope",
+        "physical_capacity_reallocation_applied": False,
     }
 
 
@@ -115,6 +116,31 @@ def test_paired_static_comparison_uses_common_fingerprints():
     assert comparison["paired"] is True
     assert comparison["best_static_split"] == "static_30_70"
     assert comparison["gain_vs_best_static_pct"] == pytest.approx(16.6666667)
+
+
+def test_control_and_forward_latency_are_separate_but_pair_on_forward():
+    hot = [_hot_row(0, 4.0)]
+    hot[0]["batch_fingerprint"] = "same-request"
+    hot[0]["hotstate_control_ms"] = 2.0
+    hot[0]["end_to_end_latency_ms"] = 6.0
+    static = [{
+        "record_type": "static",
+        "split": "static_50_50",
+        "batch_fingerprint": "same-request",
+        "batch_idx": 0,
+        "latency_ms": 5.0,
+        "latency_semantics": "inference_only",
+        "implementation_scope": "physical_static_shared_hbm_baseline",
+        "state_budget_bytes": 100,
+        "embedding_physical_hbm_bytes": 20,
+        "kv_physical_hbm_bytes": 30,
+        "managed_state_physical_hbm_bytes": 50,
+    }]
+
+    comparison = compare_static_baseline(hot, static)
+
+    assert comparison["paired"] is True
+    assert comparison["static_splits"][0]["common_samples"] == 1
 
 
 def test_evidence_summary_is_json_serializable():

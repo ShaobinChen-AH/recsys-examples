@@ -6,6 +6,7 @@ from modules.hotstate.demand_signal import DemandSignal
 from modules.hotstate.state_registry import StateRegistry
 from modules.hotstate.global_directory import GlobalDirectory
 from modules.hotstate.value_engine import ValueEngine
+from modules.hotstate.policy import InferenceBudget, InferencePolicy
 import math
 
 if TYPE_CHECKING:
@@ -28,6 +29,7 @@ class EpochResult:
     planned_embedding_keys: List[int] = field(default_factory=list)
     planned_embedding_eviction_keys: List[int] = field(default_factory=list)
     planned_kv_eviction_keys: List[str] = field(default_factory=list)
+    budget_snapshot: Dict[str, Any] = field(default_factory=dict)
 
 class HotSetManager:
     """Per-GPU hot-set manager.
@@ -44,7 +46,8 @@ class HotSetManager:
                  directory: GlobalDirectory,
                  emb_adapter: Any,
                  kv_adapter: Any,
-                 skip_kv_handles_for_admission_smoke: bool = False):
+                 skip_kv_handles_for_admission_smoke: bool = False,
+                 policy=None):
         self.total_hbm = total_hbm_bytes
         self.value_engine = value_engine
         self.registry = registry
@@ -52,11 +55,12 @@ class HotSetManager:
         self.emb = emb_adapter
         self.kv = kv_adapter
         self.skip_kv_handles_for_admission_smoke = skip_kv_handles_for_admission_smoke
+        self.policy = policy or InferencePolicy(value_engine.config)
 
     def run_epoch(self, epoch: int, demand: DemandSignal) -> EpochResult:
-        NUM_USERS = 8
-        MIN_KV_PAGES = 64
-        APPEND_MARGIN_PAGES = NUM_USERS * 2
+        config = self.value_engine.config
+        num_users = max(1, int(getattr(demand, "num_users", 1)))
+        append_margin_pages = num_users * config.kv_append_margin_pages_per_user
 
         # Start a versioned observation epoch; the previous snapshot is kept
         # in registry history so lifecycle changes remain auditable.
@@ -75,32 +79,23 @@ class HotSetManager:
 
         scored = self.value_engine.compute_scores(handles, demand)
 
-        selected = []
+        budget = InferenceBudget.observe(
+            self.total_hbm, self.emb, self.kv, config.reserve_bytes
+        )
+        if budget.physical_bytes > self.total_hbm and not self.skip_kv_handles_for_admission_smoke:
+            raise RuntimeError("managed physical HBM exceeds the configured inference envelope")
+        selected = self.policy.select(
+            scored, budget, protected_users=demand.user_ids or [demand.current_user_id]
+        )
         decision_by_key = {}
-        used_bytes = 0
-
-        for s in sorted(
-            scored,
-            key=lambda x: (
-                getattr(x, "value_density_ms_per_byte", x.score),
-                getattr(x, "net_benefit_ms", 0.0),
-            ),
-            reverse=True,
-        ):
-            h = s.handle
-            net_benefit = getattr(s, "net_benefit_ms", 0.0)
-            if h.footprint_bytes <= 0 or net_benefit <= 0.0:
-                continue
-            if used_bytes + h.footprint_bytes > self.total_hbm:
-                continue
-
-            selected.append(h)
-            used_bytes += h.footprint_bytes
+        selected_by_key = {h.logical_key: h for h in selected}
+        used_bytes = sum(max(0, h.footprint_bytes) for h in selected)
+        for h in selected:
             decision_by_key[h.logical_key] = (
                 "keep_planned" if Placement.HBM in h.placement else "admit_planned"
             )
 
-        selected_keys = {h.logical_key for h in selected}
+        selected_keys = set(selected_by_key)
 
         observe_allocation = getattr(self.value_engine, "observe_allocation", None)
         if callable(observe_allocation):
@@ -116,21 +111,12 @@ class HotSetManager:
 
         if self.skip_kv_handles_for_admission_smoke:
             planned_kv_bytes = 0
-            planned_embedding_bytes = sum(
-                h.footprint_bytes for h in selected
-                if h.state_type != StateType.SESSION_KV_USER
-            )
+            planned_embedding_bytes = sum(h.footprint_bytes for h in selected if not h.is_kv)
             target_pages = self.kv.get_current_page_limit()
         else:
             page_bytes = self.kv._page_bytes()
-            planned_kv_bytes = sum(
-                h.footprint_bytes for h in selected
-                if h.state_type == StateType.SESSION_KV_USER
-            )
-            planned_embedding_bytes = sum(
-                h.footprint_bytes for h in selected
-                if h.state_type != StateType.SESSION_KV_USER
-            )
+            planned_kv_bytes = sum(h.footprint_bytes for h in selected if h.is_kv)
+            planned_embedding_bytes = sum(h.footprint_bytes for h in selected if not h.is_kv)
 
             planned_kv_pages = math.ceil(planned_kv_bytes / page_bytes) if planned_kv_bytes else 0
             resident_pages = self.kv.get_resident_page_count()
@@ -140,16 +126,9 @@ class HotSetManager:
                 else self.kv._kvcache.num_primary_cache_pages
             )
 
-            target_pages = planned_kv_pages + APPEND_MARGIN_PAGES
-            target_pages = max(target_pages, resident_pages + APPEND_MARGIN_PAGES)
-
-            hist = demand.history_length
-            pages_per_user = math.ceil((hist * 2) / self.kv.page_size_tokens)
-            old_safe_pages = pages_per_user * NUM_USERS + APPEND_MARGIN_PAGES
-            old_safe_pages = min(max(MIN_KV_PAGES, old_safe_pages), max_pages)
-
-            target_pages = max(target_pages, old_safe_pages)
-            target_pages = min(max(MIN_KV_PAGES, target_pages), max_pages)
+            target_pages = planned_kv_pages + append_margin_pages
+            target_pages = max(target_pages, resident_pages + append_margin_pages)
+            target_pages = min(max(config.kv_min_primary_pages, target_pages), max_pages)
 
             # The fixed-envelope phase has no safe in-place KV resize API.
             # Keep this as a policy estimate only; changing the logical page
@@ -171,19 +150,22 @@ class HotSetManager:
                     if hbm_capacity > 0:
                         target_keys = min(target_keys, hbm_capacity)
                 if target_keys > 0:
-                    rank_fn = getattr(self.value_engine, "rank_embedding_item_indices", None)
-                    if callable(rank_fn):
-                        planned_embedding_keys = list(
-                            rank_fn(
-                                item_indices=item_indices,
-                                item_sequence=getattr(demand, "item_sequence", item_indices),
-                                demand=demand,
-                                row_size_bytes=row_size,
-                                return_trace=False,
-                            )[:target_keys]
-                        )
-                    else:
-                        planned_embedding_keys = item_indices[:target_keys]
+                    selected_item_keys = [
+                        int(h.logical_key.rsplit(":", 1)[-1])
+                        for h in selected
+                        if h.logical_key.startswith("emb:item:")
+                        and h.logical_key.rsplit(":", 1)[-1].isdigit()
+                    ]
+                    planned_embedding_keys = selected_item_keys[:target_keys]
+                    if self.skip_kv_handles_for_admission_smoke and not selected_item_keys:
+                        # Compatibility path for aggregate admission-smoke adapters.
+                        planned_embedding_keys = self.value_engine.rank_embedding_item_indices(
+                            item_indices=item_indices,
+                            item_sequence=getattr(demand, "item_sequence", item_indices),
+                            demand=demand,
+                            row_size_bytes=row_size,
+                            return_trace=False,
+                        )[:target_keys]
             except (RuntimeError, TypeError, ValueError):
                 # Host-only/admission-smoke configurations have no physical
                 # movement API; the adapter will report no applied action.
@@ -195,8 +177,9 @@ class HotSetManager:
         for scored_handle in scored:
             handle = scored_handle.handle
             if (
-                handle.state_type == StateType.SESSION_KV_USER
+                handle.is_kv
                 and Placement.HBM in handle.placement
+                and handle.metadata.get("policy_candidate", True)
                 and handle.logical_key not in selected_key_set
             ):
                 planned_kv_eviction_keys.append(handle.logical_key)
@@ -218,10 +201,14 @@ class HotSetManager:
 
         # The manager is a planner.  Keep applied-operation fields empty here;
         # HotStateController fills them only after adapter calls succeed.
+        budget_record = budget.snapshot()
+        budget_record["pinned_residency_excess_bytes"] = max(0, used_bytes - budget.residency_bytes)
         return EpochResult(
             evicted_keys=[],
             admitted_keys=[],
-            kv_page_budget=self.kv.get_current_page_limit(),
+            # This is the fixed physical pool capacity. Runtime planning does
+            # not alter it; planned_kv_page_budget is a residency estimate.
+            kv_page_budget=self.kv.get_physical_page_count(),
             epoch=epoch,
             scored_handles=scored,
             decision_by_key=decision_by_key,
@@ -235,4 +222,5 @@ class HotSetManager:
                 set(planned_embedding_eviction_keys)
             ),
             planned_kv_eviction_keys=planned_kv_eviction_keys,
+            budget_snapshot=budget_record,
         )

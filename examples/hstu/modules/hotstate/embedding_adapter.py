@@ -197,23 +197,6 @@ class EmbeddingAdapter:
                 "physical-HBM mode refuses to use a fabricated footprint"
             ) from detail
 
-    def logical_storage_bytes(self) -> int:
-        """Return value-buffer bytes across both HBM and host DynamicEmb tiers."""
-        try:
-            storage = self._storage()
-            states = []
-            if hasattr(storage, "_hbm"):
-                states.append(storage._hbm)
-            if hasattr(storage, "_host"):
-                states.append(storage._host)
-            if hasattr(storage, "_state"):
-                states.append(storage._state)
-            if not states:
-                raise RuntimeError(f"unsupported DynamicEmb storage {type(storage)!r}")
-            return int(sum(self._state_values_bytes(state) for state in states))
-        except Exception as exc:
-            raise RuntimeError("unable to introspect DynamicEmb logical storage") from exc
-
     def row_size_bytes(self) -> int:
         try:
             storage = self._storage()
@@ -271,6 +254,32 @@ class EmbeddingAdapter:
             except (AttributeError, IndexError, TypeError, RuntimeError):
                 continue
         return int(total)
+
+    def hbm_value_capacity_bytes(self) -> int:
+        """Allocated device value slots, excluding hash/index metadata."""
+        storage = self._storage()
+        state = getattr(storage, "_hbm", None)
+        if state is None:
+            # A host-only backend cannot accept physical HBM promotions.
+            return 0
+        return sum(self._tensor_bytes(table.tensor(), set())
+                   for table in state.tables)
+
+    def batch_item_sequence(self, batch) -> List[int]:
+        """Read table-zero feature IDs using the model's actual feature names.
+
+        The current physical adapter controls table zero. Other tables remain
+        accounted in the fixed pool but their keys must not alias table zero.
+        """
+        configs = getattr(self._module, "dynamic_embedding_configs", ())
+        names = configs[0].feature_names if configs else ("item_feat",)
+        features = batch.features.to_dict()
+        values = []
+        for name in names:
+            if name not in features:
+                continue
+            values.extend(int(key) for key in features[name].values().detach().cpu().reshape(-1).tolist())
+        return values
 
     def supports_physical_residency_control(self) -> bool:
         collection = getattr(self._module, "_dynamic_embedding_collection", None)
@@ -493,10 +502,6 @@ class EmbeddingAdapter:
                 reconstruction_cost_ms=self.cold_footprint_bytes() / 25_000_000.0,
             ),
         ]
-
-    def trigger_flush(self):
-        if self._module is not None and hasattr(self._module, "flush"):
-            self._module.flush()
 
     def update_admission_policy(
         self, item_indices, max_admitted_keys=None, enabled: bool = True

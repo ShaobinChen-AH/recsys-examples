@@ -187,7 +187,7 @@ class InferenceDenseModule(torch.nn.Module):
             self.setup_for_cudagraph(
                 hstu_config, kvcache_config, use_cudagraph, cudagraph_configs
             )
-        self._max_kv_pages = kvcache_config.blocks_in_primary_pool
+        self._max_kv_pages = kvcache_config.blocks_in_primary_pool if kvcache_config else 0
         self.hotstate = None
 
     def setup_for_kvcache(self, hstu_config, kvcache_config):
@@ -284,6 +284,9 @@ class InferenceDenseModule(torch.nn.Module):
         configured_state_budget_bytes=None,
         cuda_memory_before_construction=None,
         cuda_memory_after_construction=None,
+        policy_config=None,
+        value_function=None,
+        trace_path=None,
     ):
         """Enable the HotState unified HBM control plane.
 
@@ -302,6 +305,9 @@ class InferenceDenseModule(torch.nn.Module):
             configured_state_budget_bytes=configured_state_budget_bytes,
             cuda_memory_before_construction=cuda_memory_before_construction,
             cuda_memory_after_construction=cuda_memory_after_construction,
+            policy_config=policy_config,
+            value_function=value_function,
+            trace_path=trace_path,
         )
 
 
