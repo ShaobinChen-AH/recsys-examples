@@ -188,7 +188,16 @@ def test_scheduler_marks_unconfirmed_backend_actions_failed():
         row_size_bytes=128,
     )
     assert len(result.failed_ids) == 1
-    assert scheduler.snapshot()["counters"]["failed"] == 1
+    assert "embedding_admission" in result.backend_errors
+    assert "item 1" in result.backend_errors["embedding_admission"]
+    snapshot = scheduler.snapshot()
+    assert snapshot["counters"]["failed"] == 1
+    failed = next(
+        record
+        for record in snapshot["history_tail"]
+        if record["transfer_id"] == result.failed_ids[0]
+    )
+    assert failed["error"] in result.backend_errors["embedding_admission"]
 
 
 def test_failed_prerequisite_defers_dependent_admission():

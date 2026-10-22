@@ -450,7 +450,12 @@ class TransferScheduler:
                 result.completed_ids.append(request.transfer_id)
                 result.completed_bytes += request.bytes
             else:
-                self._fail(request, "DynamicEmb did not confirm HBM eviction", epoch)
+                error = (
+                    "DynamicEmb did not confirm HBM eviction for item "
+                    f"{request.metadata['item_id']}"
+                )
+                self._fail(request, error, epoch)
+                self._record_backend_error(result, "embedding_eviction", error)
                 result.failed_ids.append(request.transfer_id)
 
         for request in kv_releases:
@@ -461,7 +466,9 @@ class TransferScheduler:
                 result.released_kv_keys.append(request.logical_key)
                 result.completed_ids.append(request.transfer_id)
             else:
-                self._fail(request, "KV manager did not release the user", epoch)
+                error = f"KV manager did not release {request.logical_key}"
+                self._fail(request, error, epoch)
+                self._record_backend_error(result, "kv_release", error)
                 result.failed_ids.append(request.transfer_id)
 
         # Phase 2: submit only dependency-ready admissions.  A failed release
@@ -517,7 +524,12 @@ class TransferScheduler:
                 result.completed_ids.append(request.transfer_id)
                 result.completed_bytes += request.bytes
             else:
-                self._fail(request, "DynamicEmb did not confirm HBM admission", epoch)
+                error = (
+                    "DynamicEmb did not confirm HBM admission for item "
+                    f"{item_id}"
+                )
+                self._fail(request, error, epoch)
+                self._record_backend_error(result, "embedding_admission", error)
                 result.failed_ids.append(request.transfer_id)
 
         requested_evictions = {
@@ -855,6 +867,13 @@ class TransferScheduler:
         self._remember_terminal(request)
         self._counters["failed"] += 1
         self._append_history(request)
+
+    @staticmethod
+    def _record_backend_error(
+        result: TransferExecutionResult, stage: str, error: str
+    ) -> None:
+        previous = result.backend_errors.get(stage)
+        result.backend_errors[stage] = f"{previous}; {error}" if previous else error
 
     def _mark_noop(self, request: TransferRequest, reason: str) -> None:
         request.status = TransferStatus.NOOP

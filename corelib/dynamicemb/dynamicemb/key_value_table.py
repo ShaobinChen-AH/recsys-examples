@@ -1769,6 +1769,78 @@ class DynamicEmbStorage(Storage):
             preserve_existing,
         )
 
+    def admit_keys(
+        self,
+        unique_keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        initializer: Optional[Callable] = None,
+        *,
+        allow_initialize: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Materialize selected keys in a single-tier storage table.
+
+        This path is for HBM-only inference tables. Unlike HybridStorage,
+        there is no host tier to promote from or write evictions to, so new
+        rows are admitted only when the configured capacity can hold them.
+        """
+        state = self._state
+        empty = unique_keys[:0]
+        if unique_keys.numel() == 0:
+            return empty, empty
+
+        (
+            _num_missing,
+            missing_keys,
+            _missing_indices,
+            missing_table_ids,
+            missing_scores,
+            founds,
+            _scores,
+            _indices,
+        ) = _find_keys(state, unique_keys, table_ids)
+        if not allow_initialize or missing_keys.numel() == 0:
+            return unique_keys[founds], empty
+
+        for table_id in torch.unique(missing_table_ids).detach().cpu().tolist():
+            required = int((missing_table_ids == int(table_id)).sum().item())
+            capacity = int(state.key_index_map.capacity(int(table_id)))
+            resident = int(state.key_index_map.size(int(table_id)))
+            if resident + required > capacity:
+                raise RuntimeError(
+                    "single-tier DynamicEmb capacity cannot admit requested "
+                    f"rows for table {table_id}: resident={resident}, "
+                    f"requested={required}, capacity={capacity}"
+                )
+
+        values = torch.empty(
+            missing_keys.numel(),
+            state.value_dim,
+            dtype=state.emb_dtype,
+            device=state.device,
+        )
+        init_indices = torch.arange(
+            missing_keys.numel(), dtype=torch.int64, device=missing_keys.device
+        )
+        if initializer is None:
+            values[:, : state.emb_dim].zero_()
+        else:
+            initializer(values[:, : state.emb_dim], init_indices, missing_keys)
+        if state.value_dim > state.emb_dim:
+            values[:, state.emb_dim :] = state.initial_optim_state
+        self.insert(missing_keys, missing_table_ids, values, missing_scores)
+
+        (
+            _num_missing_after,
+            _missing_keys_after,
+            _missing_indices_after,
+            _missing_table_ids_after,
+            _missing_scores_after,
+            admitted_mask,
+            _scores_after,
+            _indices_after,
+        ) = _find_keys(state, unique_keys, table_ids)
+        return unique_keys[admitted_mask], empty
+
     def dump(
         self,
         table_id: int,

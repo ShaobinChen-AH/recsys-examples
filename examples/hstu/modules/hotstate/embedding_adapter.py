@@ -226,7 +226,9 @@ class EmbeddingAdapter:
         storage = self._storage()
         state = getattr(storage, "_hbm", None)
         if state is None:
-            return 0
+            state = getattr(storage, "_state", None)
+            if state is None or self.hbm_value_capacity_bytes() <= 0:
+                return 0
         capacity = 0
         for table in getattr(state, "tables", []):
             tensor_fn = getattr(table, "tensor", None)
@@ -260,10 +262,16 @@ class EmbeddingAdapter:
         storage = self._storage()
         state = getattr(storage, "_hbm", None)
         if state is None:
-            # A host-only backend cannot accept physical HBM promotions.
-            return 0
-        return sum(self._tensor_bytes(table.tensor(), set())
-                   for table in state.tables)
+            state = getattr(storage, "_state", None)
+            if state is None:
+                return 0
+            return sum(
+                self._walk_device_tensors(table, set(), set())
+                for table in getattr(state, "tables", [])
+            )
+        return sum(
+            self._tensor_bytes(table.tensor(), set()) for table in state.tables
+        )
 
     def batch_item_sequence(self, batch) -> List[int]:
         """Read table-zero feature IDs using the model's actual feature names.
@@ -289,13 +297,21 @@ class EmbeddingAdapter:
         ):
             return False
         storage = self._storage()
-        return callable(getattr(storage, "promote_keys", None)) and callable(
+        if callable(getattr(storage, "promote_keys", None)) and callable(
             getattr(storage, "evict_keys", None)
+        ):
+            return True
+        return (
+            getattr(storage, "_state", None) is not None
+            and callable(getattr(storage, "admit_keys", None))
+            and self.hbm_value_capacity_bytes() > 0
         )
 
     def _residency_tensors(self, item_indices) -> Tuple[torch.Tensor, torch.Tensor]:
         storage = self._storage()
         state = getattr(storage, "_hbm", None)
+        if state is None:
+            state = getattr(storage, "_state", None)
         device = getattr(state, "device", None)
         if device is None:
             device = torch.device("cuda")
@@ -329,8 +345,13 @@ class EmbeddingAdapter:
         its authoritative evaluation initializer; checkpoint-backed models
         may only promote existing host rows.
         """
-        if self._module is None or not self.supports_physical_residency_control():
-            return [], []
+        if self._module is None:
+            raise RuntimeError("no InferenceEmbedding module is connected")
+        if not self.supports_physical_residency_control():
+            raise RuntimeError(
+                "DynamicEmb storage does not support physical HBM residency "
+                f"control: {type(self._storage()).__name__}"
+            )
 
         storage = self._storage()
         admitted_keys: List[int] = []
@@ -338,7 +359,13 @@ class EmbeddingAdapter:
 
         if evicted_item_indices is not None and len(evicted_item_indices) > 0:
             keys, table_ids = self._residency_tensors(evicted_item_indices)
-            moved = storage.evict_keys(keys, table_ids)
+            evict_fn = getattr(storage, "evict_keys", None)
+            if not callable(evict_fn):
+                raise RuntimeError(
+                    "single-tier DynamicEmb storage cannot evict rows without "
+                    "a backing host tier"
+                )
+            moved = evict_fn(keys, table_ids)
             evicted_keys.extend(int(key) for key in moved.detach().cpu().tolist())
 
         if admitted_item_indices is not None and len(admitted_item_indices) > 0:
@@ -380,10 +407,21 @@ class EmbeddingAdapter:
             return []
         storage = self._storage()
         residency_fn = getattr(storage, "residency", None)
-        if not callable(residency_fn):
-            return None
         key_tensor, table_ids = self._residency_tensors(keys)
-        locations = residency_fn(key_tensor, table_ids)
+        if callable(residency_fn):
+            locations = residency_fn(key_tensor, table_ids)
+        else:
+            state = getattr(storage, "_state", None)
+            if state is None:
+                return None
+            from dynamicemb.key_value_table import _find_keys
+
+            founds = _find_keys(
+                state, key_tensor, table_ids, const_lookup=True
+            )[5]
+            tier = 1 if self.hbm_value_capacity_bytes() > 0 else 2
+            locations = torch.zeros_like(key_tensor, dtype=torch.int8)
+            locations[founds] = tier
         return [int(value) for value in locations.detach().cpu().tolist()]
 
     def validate_item_keys(self, item_indices) -> None:
