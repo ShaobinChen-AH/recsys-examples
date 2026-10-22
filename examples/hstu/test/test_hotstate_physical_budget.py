@@ -605,6 +605,16 @@ def test_cuda_physical_hbm_envelope_smoke():
                         eager_rows = eager_attention.index_select(
                             0, odd_candidate_rows
                         )
+                        native_row33 = native_attention[33].float().cpu().tolist()
+                        eager_row33 = eager_attention[33].float().cpu().tolist()
+                        eager_row33_nonzero = torch.count_nonzero(
+                            eager_attention[33]
+                        ).item()
+                        print(
+                            f"batch=1 {model_name} row33 "
+                            f"native={native_row33} eager={eager_row33} "
+                            f"eager_nonzero={eager_row33_nonzero}"
+                        )
                         assert torch.allclose(
                             native_rows, eager_rows, rtol=2e-2, atol=2e-2
                         ), (
