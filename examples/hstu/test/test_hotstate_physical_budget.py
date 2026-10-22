@@ -523,6 +523,39 @@ def test_cuda_physical_hbm_envelope_smoke():
                     "batch=0 uncached model outputs differ: "
                     f"max_diff={uncached_difference}"
                 )
+            if index == 1:
+                with torch.inference_mode():
+                    hbm_sparse = hbm_model.sparse_module(batch.features)
+                    host_sparse = host_model.sparse_module(batch.features)
+                    hbm_uncached_output = hbm_model.dense_module.forward_nokvcache(
+                        batch, hbm_sparse
+                    )
+                    host_uncached_output = host_model.dense_module.forward_nokvcache(
+                        batch, host_sparse
+                    )
+                assert hbm_sparse_outputs.keys() == host_sparse_outputs.keys()
+                for feature_name in hbm_sparse_outputs:
+                    hbm_values, hbm_lengths = hbm_sparse_outputs[feature_name]
+                    host_values, host_lengths = host_sparse_outputs[feature_name]
+                    assert torch.equal(hbm_lengths, host_lengths), (
+                        f"batch=1 sparse lengths differ for {feature_name}"
+                    )
+                    assert torch.equal(hbm_values, host_values), (
+                        f"batch=1 sparse outputs differ for {feature_name}: "
+                        f"max_diff={max_diff(hbm_values, host_values)}"
+                    )
+                uncached_difference = max_diff(
+                    hbm_uncached_output, host_uncached_output
+                )
+                assert torch.allclose(
+                    hbm_uncached_output,
+                    host_uncached_output,
+                    rtol=2e-2,
+                    atol=2e-2,
+                ), (
+                    "batch=1 uncached model outputs differ: "
+                    f"max_diff={uncached_difference}"
+                )
             with torch.inference_mode():
                 hbm_output = hbm_model.forward_with_kvcache(
                     batch, user_ids, history_lengths
@@ -554,6 +587,52 @@ def test_cuda_physical_hbm_envelope_smoke():
             difference = max_diff(hbm_output, host_output)
             assert torch.count_nonzero(hbm_output).item() > 0
             assert torch.count_nonzero(host_output).item() > 0
+            if index == 1:
+                hbm_cache = hbm_model.dense_module.async_kvcache
+                host_cache = host_model.dense_module.async_kvcache
+                assert hbm_cache.last_origin_cached_lengths == host_cache.last_origin_cached_lengths, (
+                    "batch=1 cached prefix lengths differ: "
+                    f"hbm={hbm_cache.last_origin_cached_lengths}, "
+                    f"host={host_cache.last_origin_cached_lengths}"
+                )
+                assert hbm_cache.last_origin_cached_lengths == [0], (
+                    "batch=1 was expected to start with a cold cache: "
+                    f"{hbm_cache.last_origin_cached_lengths}"
+                )
+                assert hbm_cache.last_new_tokens == host_cache.last_new_tokens, (
+                    "batch=1 cache prefill token counts differ: "
+                    f"hbm={hbm_cache.last_new_tokens}, "
+                    f"host={host_cache.last_new_tokens}"
+                )
+                assert hbm_cache.last_new_tokens == int(history_lengths[0].item()), (
+                    "batch=1 prefill did not cover the complete uncached history: "
+                    f"new_tokens={hbm_cache.last_new_tokens}, "
+                    f"history_length={int(history_lengths[0].item())}"
+                )
+                uid = int(user_ids[0].item())
+                hbm_interval = hbm_cache.gpu_kvcache_mgr.get_user_cache_interval(uid)
+                host_interval = host_cache.gpu_kvcache_mgr.get_user_cache_interval(uid)
+                assert hbm_interval[0:2] == host_interval[0:2], (
+                    "batch=1 logical cache intervals differ: "
+                    f"hbm={hbm_interval}, host={host_interval}"
+                )
+                assert hbm_interval[0:2] == [0, int(history_lengths[0].item())], (
+                    "batch=1 cache interval is not the requested history: "
+                    f"interval={hbm_interval}, history={int(history_lengths[0].item())}"
+                )
+                assert hbm_interval[2] == host_interval[2] == 1, (
+                    "batch=1 should allocate one page per model: "
+                    f"hbm={hbm_interval}, host={host_interval}"
+                )
+                torch.cuda.synchronize()
+                hbm_page = int(hbm_cache.static_page_ids_gpu_buffer[0].item())
+                host_page = int(host_cache.static_page_ids_gpu_buffer[0].item())
+                hbm_kv = hbm_cache.cache_table[:, hbm_page, :, : int(history_lengths[0].item())]
+                host_kv = host_cache.cache_table[:, host_page, :, : int(history_lengths[0].item())]
+                assert torch.equal(hbm_kv, host_kv), (
+                    "batch=1 K/V values written to the cold-cache page differ: "
+                    f"max_diff={max_diff(hbm_kv, host_kv)}"
+                )
             if index == 0:
                 assert hbm_sparse_outputs.keys() == host_sparse_outputs.keys()
                 for feature_name in hbm_sparse_outputs:
