@@ -294,6 +294,69 @@ def _capture_sparse_outputs(captured):
     return capture
 
 
+def _smoke_attention_candidate_rows(model, batch, embeddings):
+    from hstu import hstu_attn_varlen_func
+
+    dense = model.dense_module
+    block = dense._hstu_block
+    jd = block._preprocessor(embeddings=embeddings, batch=batch)
+    jd.scaling_seqlen = dense._scaling_seqlen
+    layer = block._attention_layers[0]
+    normed_input = torch.nn.functional.layer_norm(
+        jd.values,
+        normalized_shape=[layer._embedding_dim],
+        weight=layer._input_layernorm_weight,
+        bias=layer._input_layernorm_bias,
+        eps=layer._eps,
+    )
+    mixed = layer.uvqk_addmm_impl(normed_input, jd.values.size(0))
+    _, value, query, key = torch.split(mixed, layer._split_arg_list, dim=-1)
+    query = query.view(-1, layer._num_heads, layer._attention_dim_per_head)
+    key = key.view(-1, layer._num_heads, layer._attention_dim_per_head)
+    value = value.view(-1, layer._num_heads, layer._linear_dim_per_head)
+    native = hstu_attn_varlen_func(
+        query,
+        key,
+        value,
+        jd.seqlen_offsets[: batch.batch_size + 1],
+        jd.seqlen_offsets[: batch.batch_size + 1],
+        None,
+        None,
+        jd.max_seqlen,
+        jd.max_seqlen,
+        jd.scaling_seqlen,
+        None,
+        jd.num_candidates[: batch.batch_size],
+        target_group_size=1,
+        window_size=(-1, 0),
+        alpha=layer._alpha,
+    )
+
+    seq_len = int(jd.seqlen[0].item())
+    num_targets = int(jd.num_candidates[0].item())
+    history_len = seq_len - num_targets
+    positions = torch.arange(seq_len, device=query.device)
+    visible = positions.unsqueeze(0) <= positions.unsqueeze(1)
+    target_rows = positions.unsqueeze(1) >= history_len
+    target_columns = positions.unsqueeze(0) >= history_len
+    same_target = positions.unsqueeze(1) == positions.unsqueeze(0)
+    visible &= ~(target_rows & target_columns & ~same_target)
+
+    scores = torch.matmul(
+        query.float().transpose(0, 1),
+        key.float().transpose(0, 1).transpose(-1, -2),
+    ) * layer._alpha
+    probabilities = torch.nn.functional.silu(scores).to(query.dtype).float()
+    probabilities = probabilities * visible.unsqueeze(0)
+    reference = torch.matmul(probabilities, value.float().transpose(0, 1))
+    reference = (reference / float(jd.scaling_seqlen)).transpose(0, 1).to(query.dtype)
+
+    odd_candidate_rows = history_len + torch.arange(
+        1, num_targets, 2, device=query.device
+    )
+    return native, reference, odd_candidate_rows, history_len
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cuda_physical_hbm_envelope_smoke():
     """Exercise real DynamicEmb HBM and KV allocations for 20 inference batches."""
@@ -527,6 +590,30 @@ def test_cuda_physical_hbm_envelope_smoke():
                 with torch.inference_mode():
                     hbm_sparse = hbm_model.sparse_module(batch.features)
                     host_sparse = host_model.sparse_module(batch.features)
+                    for model, sparse, model_name in (
+                        (hbm_model, hbm_sparse, "HBM"),
+                        (host_model, host_sparse, "host"),
+                    ):
+                        native_attention, eager_attention, odd_candidate_rows, history_len = (
+                            _smoke_attention_candidate_rows(model, batch, sparse)
+                        )
+                        assert history_len == 32
+                        assert odd_candidate_rows.tolist() == [33, 35, 37, 39]
+                        native_rows = native_attention.index_select(
+                            0, odd_candidate_rows
+                        )
+                        eager_rows = eager_attention.index_select(
+                            0, odd_candidate_rows
+                        )
+                        assert torch.allclose(
+                            native_rows, eager_rows, rtol=2e-2, atol=2e-2
+                        ), (
+                            f"batch=1 {model_name} attention differs from eager "
+                            "causal-target reference at visible odd candidates: "
+                            f"history_len={history_len}, "
+                            f"rows={odd_candidate_rows.tolist()}, "
+                            f"max_diff={max_diff(native_rows, eager_rows)}"
+                        )
                     hbm_dense_state = hbm_model.dense_module.state_dict()
                     host_dense_state = host_model.dense_module.state_dict()
                     assert hbm_dense_state.keys() == host_dense_state.keys()
