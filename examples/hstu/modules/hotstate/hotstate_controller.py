@@ -766,16 +766,16 @@ class HotStateController:
             )
             automatic_queue_depth = self.scheduler.pending_count()
             batch_cost_inputs = {
-                latency_ms=float(latency_ms),
-                history_tokens=int(context["history_tokens"]),
-                num_candidates=int(context["num_candidates"]),
-                embedding_requests=int(context["embedding_requests"]),
-                embedding_misses=int(embedding_misses),
-                kv_miss_tokens=max(0, int(new_tokens)),
-                concurrent_transfer_bytes=int(automatic_transfer_bytes),
-                transfer_queue_depth=automatic_queue_depth,
-                hbm_pressure=float(context["hbm_pressure"]),
-                host_memory_pressure=self._host_memory_pressure(),
+                "latency_ms": float(latency_ms),
+                "history_tokens": int(context["history_tokens"]),
+                "num_candidates": int(context["num_candidates"]),
+                "embedding_requests": int(context["embedding_requests"]),
+                "embedding_misses": int(embedding_misses),
+                "kv_miss_tokens": max(0, int(new_tokens)),
+                "concurrent_transfer_bytes": int(automatic_transfer_bytes),
+                "transfer_queue_depth": automatic_queue_depth,
+                "hbm_pressure": float(context["hbm_pressure"]),
+                "host_memory_pressure": self._host_memory_pressure(),
             }
             self.value_engine.observe_batch_cost(**batch_cost_inputs)
             observed_cost_inputs = {
