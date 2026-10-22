@@ -3,4 +3,4 @@
 	url = https://github.com/NVIDIA/cutlass.git
 [submodule "third_party/FBGEMM"]
 	path = third_party/FBGEMM
-	url = https://github.com/jiayus-nvidia/FBGEMM.git
+	url = https://github.com/ShaobinChen-AH/FBGEMM.git
