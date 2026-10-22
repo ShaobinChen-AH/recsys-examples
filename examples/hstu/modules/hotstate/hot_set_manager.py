@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Dict, List
 
 from modules.hotstate.state_handle import StateType, ScoredHandle, Placement
@@ -62,10 +62,10 @@ class HotSetManager:
         num_users = max(1, int(getattr(demand, "num_users", 1)))
         append_margin_pages = num_users * config.kv_append_margin_pages_per_user
         page_bytes = 1
-        kv_append_reserve_bytes = 0
+        requested_kv_append_reserve_bytes = 0
         if not self.skip_kv_handles_for_admission_smoke:
             page_bytes = max(1, int(self.kv._page_bytes()))
-            kv_append_reserve_bytes = append_margin_pages * page_bytes
+            requested_kv_append_reserve_bytes = append_margin_pages * page_bytes
 
         # Start a versioned observation epoch; the previous snapshot is kept
         # in registry history so lifecycle changes remain auditable.
@@ -84,17 +84,49 @@ class HotSetManager:
 
         scored = self.value_engine.compute_scores(handles, demand)
 
-        budget = InferenceBudget.observe(
+        base_budget = InferenceBudget.observe(
             self.total_hbm,
             self.emb,
             self.kv,
-            config.reserve_bytes + kv_append_reserve_bytes,
+            config.reserve_bytes,
         )
-        if budget.physical_bytes > self.total_hbm and not self.skip_kv_handles_for_admission_smoke:
+        if base_budget.physical_bytes > self.total_hbm and not self.skip_kv_handles_for_admission_smoke:
             raise RuntimeError("managed physical HBM exceeds the configured inference envelope")
-        selected = self.policy.select(
-            scored, budget, protected_users=demand.user_ids or [demand.current_user_id]
+        protected_users = demand.user_ids or [demand.current_user_id]
+        base_selected = self.policy.select(
+            scored, base_budget, protected_users=protected_users
         )
+        base_embedding_bytes = sum(
+            max(0, handle.footprint_bytes)
+            for handle in base_selected
+            if not handle.is_kv
+        )
+        reserve_slack_bytes = max(
+            0, base_budget.residency_bytes - base_embedding_bytes
+        )
+        kv_append_reserve_bytes = min(
+            requested_kv_append_reserve_bytes, reserve_slack_bytes
+        )
+        budget = replace(
+            base_budget,
+            reserve_bytes=base_budget.reserve_bytes + kv_append_reserve_bytes,
+        )
+        selected = self.policy.select(
+            scored, budget, protected_users=protected_users
+        )
+        empty_plan_reason = None
+        selected_embedding = any(not handle.is_kv for handle in selected)
+        if not selected or (base_embedding_bytes > 0 and not selected_embedding):
+            # Append headroom is opportunistic. If the reduced envelope
+            # removes every plan or all baseline embedding residency, retry
+            # without that reserve before reporting an empty plan.
+            kv_append_reserve_bytes = 0
+            budget = base_budget
+            selected = base_selected
+        if not selected:
+            empty_plan_reason = (
+                "no feasible positive-value state under the configured budget"
+            )
         decision_by_key = {}
         selected_by_key = {h.logical_key: h for h in selected}
         used_bytes = sum(max(0, h.footprint_bytes) for h in selected)
@@ -211,7 +243,15 @@ class HotSetManager:
         # The manager is a planner.  Keep applied-operation fields empty here;
         # HotStateController fills them only after adapter calls succeed.
         budget_record = budget.snapshot()
+        budget_record["requested_kv_append_reserve_bytes"] = (
+            requested_kv_append_reserve_bytes
+        )
         budget_record["kv_append_reserve_bytes"] = kv_append_reserve_bytes
+        budget_record["kv_append_reserve_clamped"] = (
+            kv_append_reserve_bytes < requested_kv_append_reserve_bytes
+        )
+        if empty_plan_reason is not None:
+            budget_record["empty_plan_reason"] = empty_plan_reason
         budget_record["pinned_residency_excess_bytes"] = max(0, used_bytes - budget.residency_bytes)
         return EpochResult(
             evicted_keys=[],

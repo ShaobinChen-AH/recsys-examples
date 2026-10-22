@@ -236,6 +236,16 @@ def _shutdown_cuda_smoke_model(model):
         torch.cuda.empty_cache()
 
 
+def _use_smoke_eval_initializer(model):
+    """Give independently constructed DynamicEmb tables identical nonzero misses."""
+    tables = model.sparse_module._dynamic_embedding_collection._embedding_tables
+
+    def initialize(values, indices, keys):
+        values.fill_(0.25)
+
+    tables._eval_initializers[0] = initialize
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cuda_physical_hbm_envelope_smoke():
     """Exercise real DynamicEmb HBM and KV allocations for 20 inference batches."""
@@ -318,6 +328,8 @@ def test_cuda_physical_hbm_envelope_smoke():
         torch.cuda.manual_seed_all(23)
         torch.manual_seed(23)
         host_model = _build_cuda_smoke_model(0, plan.blocks_in_primary_pool)
+        _use_smoke_eval_initializer(hbm_model)
+        _use_smoke_eval_initializer(host_model)
 
         host_model.dense_module.load_state_dict(
             hbm_model.dense_module.state_dict(),
@@ -359,9 +371,28 @@ def test_cuda_physical_hbm_envelope_smoke():
 
         for index in range(20):
             batch, user_ids, history_lengths = requests[index % len(requests)]
-            hbm_model.dense_module.hotstate.before_batch(
+            before = hbm_model.dense_module.hotstate.before_batch(
                 batch, user_ids, history_lengths, batch_idx=index
             )
+            if index == 0:
+                requested_keys = set(
+                    embedding_adapter.batch_item_sequence(batch)
+                )
+                admitted_keys = {
+                    int(key.rsplit(":", 1)[-1])
+                    for key in before["physical_admitted_keys"]
+                    if str(key).startswith("emb:item:")
+                }
+                assert admitted_keys, (
+                    "first batch produced no physical DynamicEmb admission: "
+                    f"{before['transfer_execution']}"
+                )
+                assert admitted_keys <= requested_keys
+                residency = embedding_adapter._observed_residency(
+                    sorted(admitted_keys)
+                )
+                assert residency is not None
+                assert all(location == 1 for location in residency)
             with torch.inference_mode():
                 hbm_output = hbm_model.forward_with_kvcache(
                     batch, user_ids, history_lengths
@@ -371,6 +402,8 @@ def test_cuda_physical_hbm_envelope_smoke():
                 )
             hbm_model.dense_module.hotstate.after_batch(batch, latency_ms=0.0)
             difference = max_diff(hbm_output, host_output)
+            assert torch.count_nonzero(hbm_output).item() > 0
+            assert torch.count_nonzero(host_output).item() > 0
             assert torch.allclose(
                 hbm_output, host_output, rtol=2e-2, atol=2e-2
             ), f"batch={index}, max_diff={difference}"

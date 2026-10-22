@@ -18,8 +18,8 @@ from modules.hotstate.state_handle import (  # noqa: E402
     StateHandle,
     StateType,
 )
-from modules.hotstate.state_registry import StateRegistry  # noqa: E402
 from modules.hotstate.global_directory import GlobalDirectory  # noqa: E402
+from modules.hotstate.state_registry import StateRegistry  # noqa: E402
 from modules.hotstate.value_engine import ValueEngine  # noqa: E402
 
 
@@ -122,6 +122,13 @@ def test_hotset_emits_concrete_embedding_and_kv_actions():
     assert result.admitted_keys == []
     assert len(result.planned_embedding_keys) == 2
     assert "kv:uid:2" in result.planned_kv_eviction_keys
+    assert result.budget_snapshot["requested_kv_append_reserve_bytes"] > 0
+    assert 0 < result.budget_snapshot["kv_append_reserve_bytes"]
+    assert (
+        result.budget_snapshot["kv_append_reserve_bytes"]
+        < result.budget_snapshot["requested_kv_append_reserve_bytes"]
+    )
+    assert result.budget_snapshot["kv_append_reserve_clamped"] is True
 
 
 class _FakeGpuManager:
