@@ -18,6 +18,7 @@ from modules.hotstate.policy import (
     PolicyConfig,
     ValueInputs,
     WeightedValue,
+    make_value_function,
 )
 from modules.hotstate.state_handle import (
     Placement,
@@ -25,6 +26,7 @@ from modules.hotstate.state_handle import (
     StateHandle,
     StateType,
 )
+from modules.hotstate.value_engine import ValueEngine
 
 
 def _scored(key, state_type, footprint, score, *, user_id=None, parent=None):
@@ -58,6 +60,18 @@ def test_policy_configuration_is_validated_and_reproducible():
         PolicyConfig(construction_embedding_hbm_ratio=1.5)
     with pytest.raises(ValueError, match="construction_embedding_hbm_ratio"):
         PolicyConfig(construction_embedding_hbm_ratio=float("nan"))
+
+
+def test_named_value_models_support_controlled_ablations():
+    inputs = ValueInputs(2.0, 0.5, 1.0, 1.0)
+    assert make_value_function(PolicyConfig(value_model="benefit_only"))(inputs) == 2.0
+    assert make_value_function(
+        PolicyConfig(value_model="transfer_aware", benefit_weight=2.0, movement_weight=3.0)
+    )(inputs) == pytest.approx(2.5)
+    with pytest.raises(ValueError, match="value model"):
+        PolicyConfig(value_model="unvalidated")
+    engine = ValueEngine(1024, config=PolicyConfig(value_model="benefit_only"))
+    assert engine.value_function(inputs) == 2.0
 
 
 def test_construction_pool_split_is_a_real_configurable_parameter():

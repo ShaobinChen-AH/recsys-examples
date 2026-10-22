@@ -133,6 +133,9 @@ def run_inference_request(model, batch, user_ids, history_lengths, *, controller
         "model_rebuild_count": 0,
         "policy": controller.policy_config.snapshot() if controller is not None else None,
         "policy_budget": control.get("policy_budget"),
+        "request_metrics": control.get("request_metrics", {}),
+        "control_profile_ms": control.get("profile_ms", {}),
+        "online_cost_model_before": control.get("online_cost_model", {}),
         "physical_admitted_keys": control.get("physical_admitted_keys", []),
         "physical_evicted_keys": control.get("physical_evicted_keys", []),
         "state_trace": control.get("state_trace", []),
@@ -142,6 +145,8 @@ def run_inference_request(model, batch, user_ids, history_lengths, *, controller
         )),
         "transfer_execution": control.get("transfer_execution", {}),
         "post_control": post,
+        "observed_cost_inputs": post.get("observed_cost_inputs"),
+        "online_cost_model_after": post.get("online_cost_model", {}),
         "waits": dict(getattr(model.dense_module.async_kvcache, "last_wait_timings", {})),
     }
     if budget is not None and physical["managed_state_physical_hbm_bytes"] > budget:

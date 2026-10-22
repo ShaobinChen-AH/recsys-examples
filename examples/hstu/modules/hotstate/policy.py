@@ -44,10 +44,13 @@ class PolicyConfig:
     batch_forgetting: float = 0.99
     transfer_forgetting: float = 0.98
     confidence_samples: int = 16
+    value_model: str = "weighted"
 
     def __post_init__(self):
         if self.selection not in ("value_density", "static_partition"):
             raise ValueError("unknown HotState selection policy")
+        if self.value_model not in ("weighted", "benefit_only", "transfer_aware"):
+            raise ValueError("unknown HotState value model")
         if self.kv_granularity not in ("segment", "user"):
             raise ValueError("kv_granularity must be segment or user")
         for name in ("construction_embedding_hbm_ratio", "static_embedding_ratio",
@@ -130,6 +133,35 @@ class WeightedValue:
                 - c.movement_weight * inputs.movement_ms
                 - c.risk_weight * inputs.risk_ms
                 - c.opportunity_weight * inputs.opportunity_ms)
+
+
+class BenefitOnlyValue:
+    """Ablation model that ranks by avoided miss/reconstruction cost only."""
+
+    def __call__(self, inputs):
+        return inputs.gross_benefit_ms
+
+
+class TransferAwareValue:
+    """Ablation model that prices movement but omits risk and HBM scarcity."""
+
+    def __init__(self, config):
+        self.config = config
+
+    def __call__(self, inputs):
+        return (
+            self.config.benefit_weight * inputs.gross_benefit_ms
+            - self.config.movement_weight * inputs.movement_ms
+        )
+
+
+def make_value_function(config):
+    """Build a named ablation or the configurable production candidate."""
+    if config.value_model == "benefit_only":
+        return BenefitOnlyValue()
+    if config.value_model == "transfer_aware":
+        return TransferAwareValue(config)
+    return WeightedValue(config)
 
 
 @dataclass(frozen=True)

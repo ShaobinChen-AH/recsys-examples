@@ -17,12 +17,15 @@ from .online_cost_model import (
 )
 from .value_engine import ValueEngine
 from .policy import (
+    BenefitOnlyValue,
     InferenceBudget,
     InferencePolicy,
     PolicyConfig,
+    TransferAwareValue,
     ValueInputs,
     WeightedValue,
     load_policy_config,
+    make_value_function,
 )
 from .kv_adapter import KVAdapter
 from .transfer_scheduler import (

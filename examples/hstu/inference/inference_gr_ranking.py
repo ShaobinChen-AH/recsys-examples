@@ -543,7 +543,11 @@ def run_ranking_gr_simulate(
     disable_contextual_features: bool = False,
     disable_kvcache: bool = False,
     max_bs: int = 1,
+    max_batches: int = 0,
+    warmup_batches: int = 0,
 ):
+    if max_batches < 0 or warmup_batches < 0:
+        raise ValueError("max_batches and warmup_batches must be non-negative")
     dataset_args, emb_configs = get_inference_dataset_and_embedding_configs(
         disable_contextual_features
     )
@@ -622,6 +626,8 @@ def run_ranking_gr_simulate(
         dataloader_iter = iter(dataloader)
 
         num_batches_ctr = 0
+        warmup_batches_ctr = 0
+        measured_batches_ctr = 0
         start_time = time.time()
         cur_date = None
 
@@ -668,26 +674,60 @@ def run_ranking_gr_simulate(
                         except Exception as e:
                             print(f"[AccessTracer] Failed to record batch {num_batches_ctr}: {e}")
 
-                    if not disable_kvcache and (hotstate_controller is not None or os.getenv("HOTSTATE_TRACE_PATH")):
-                        logits, _record = run_inference_request(
-                            model, batch, uids, total_history_lengths,
-                            controller=hotstate_controller,
-                            batch_idx=num_batches_ctr,
-                            state_budget_bytes=total_hbm_bytes or None,
-                            static_split=os.getenv("HOTSTATE_STATIC_SPLIT", "static_default"),
-                        )
-                    elif not disable_kvcache:
-                        logits = model.forward_with_kvcache(batch, uids, total_history_lengths)
-                    else:
-                        logits = model.forward_nokvcache(batch)
+                    is_warmup = warmup_batches_ctr < warmup_batches
+                    trace_path_env = None
+                    controller_trace_path = None
+                    if is_warmup:
+                        trace_path_env = os.environ.pop("HOTSTATE_TRACE_PATH", None)
+                        if hotstate_controller is not None:
+                            controller_trace_path = hotstate_controller.trace_path
+                            hotstate_controller.trace_path = None
+                    try:
+                        if not disable_kvcache and (
+                            hotstate_controller is not None
+                            or os.getenv("HOTSTATE_TRACE_PATH")
+                        ):
+                            logits, _record = run_inference_request(
+                                model,
+                                batch,
+                                uids,
+                                total_history_lengths,
+                                controller=hotstate_controller,
+                                batch_idx=measured_batches_ctr,
+                                state_budget_bytes=total_hbm_bytes or None,
+                                static_split=os.getenv(
+                                    "HOTSTATE_STATIC_SPLIT", "static_default"
+                                ),
+                            )
+                        elif not disable_kvcache:
+                            logits = model.forward_with_kvcache(
+                                batch, uids, total_history_lengths
+                            )
+                        else:
+                            logits = model.forward_nokvcache(batch)
+                    finally:
+                        if is_warmup:
+                            if trace_path_env is not None:
+                                os.environ["HOTSTATE_TRACE_PATH"] = trace_path_env
+                            if hotstate_controller is not None:
+                                hotstate_controller.trace_path = controller_trace_path
 
                 num_batches_ctr += 1
+                if batch is None:
+                    continue
+                if is_warmup:
+                    warmup_batches_ctr += 1
+                    continue
+                measured_batches_ctr += 1
+                if max_batches and measured_batches_ctr >= max_batches:
+                    break
                 # if num_batches_ctr == 1000:
                 #     break
             except StopIteration:
                 break
         end_time = time.time()
-        print("Total #batch:", num_batches_ctr)
+        print("Total #batch:", measured_batches_ctr)
+        print("Total #warmup batch:", warmup_batches_ctr)
         print("Total time(s):", end_time - start_time)
 
         # ============================================================
@@ -868,6 +908,18 @@ if __name__ == "__main__":
     parser.add_argument("--disable_context", action="store_true")
     parser.add_argument("--disable_kvcache", action="store_true")
     parser.add_argument("--max_bs", type=int, default=1)
+    parser.add_argument(
+        "--max_batches",
+        type=int,
+        default=0,
+        help="Stop simulate mode after this many batches; 0 processes the full date window.",
+    )
+    parser.add_argument(
+        "--warmup_batches",
+        type=int,
+        default=0,
+        help="Run this many untraced requests before measurement in simulate mode.",
+    )
 
     args = parser.parse_args()
     gin.parse_config_file(args.gin_config_file)
@@ -889,5 +941,7 @@ if __name__ == "__main__":
             disable_contextual_features=args.disable_context,
             disable_kvcache=args.disable_kvcache,
             max_bs=args.max_bs,
+            max_batches=args.max_batches,
+            warmup_batches=args.warmup_batches,
         )
     print("Finished.")

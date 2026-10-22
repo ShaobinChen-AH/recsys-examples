@@ -1,0 +1,305 @@
+{
+  "variants": [
+    {
+      "name": "static_30_70",
+      "hotstate_enabled": false,
+      "stage": "baseline",
+      "static_split": "static_30_70",
+      "policy": {"static_embedding_ratio": 0.3},
+      "parameters_under_test": {"construction_embedding_hbm_ratio": 0.3}
+    },
+    {
+      "name": "static_50_50",
+      "hotstate_enabled": false,
+      "stage": "baseline",
+      "static_split": "static_50_50",
+      "policy": {"static_embedding_ratio": 0.5},
+      "parameters_under_test": {"construction_embedding_hbm_ratio": 0.5}
+    },
+    {
+      "name": "static_70_30",
+      "hotstate_enabled": false,
+      "stage": "baseline",
+      "static_split": "static_70_30",
+      "policy": {"static_embedding_ratio": 0.7},
+      "parameters_under_test": {"construction_embedding_hbm_ratio": 0.7}
+    },
+    {
+      "name": "pool_30_70",
+      "stage": "pool_split",
+      "policy": {"construction_embedding_hbm_ratio": 0.3},
+      "parameters_under_test": {"construction_embedding_hbm_ratio": 0.3}
+    },
+    {
+      "name": "pool_70_30",
+      "stage": "pool_split",
+      "policy": {"construction_embedding_hbm_ratio": 0.7},
+      "parameters_under_test": {"construction_embedding_hbm_ratio": 0.7}
+    },
+    {
+      "name": "selection_static_partition",
+      "stage": "value_model",
+      "policy": {"selection": "static_partition", "static_embedding_ratio": 0.5},
+      "parameters_under_test": {"selection": "static_partition"}
+    },
+    {
+      "name": "value_weighted_base",
+      "policy": {},
+      "stage": "value_model",
+      "reference": true,
+      "parameters_under_test": {"value_model": "weighted"}
+    },
+    {
+      "name": "value_benefit_only",
+      "stage": "value_model",
+      "policy": {"value_model": "benefit_only"},
+      "parameters_under_test": {"value_model": "benefit_only"}
+    },
+    {
+      "name": "value_transfer_aware",
+      "stage": "value_model",
+      "policy": {"value_model": "transfer_aware"},
+      "parameters_under_test": {"value_model": "transfer_aware"}
+    },
+    {
+      "name": "benefit_weight_low",
+      "stage": "weights",
+      "policy": {"benefit_weight": 0.5},
+      "parameters_under_test": {"benefit_weight": 0.5}
+    },
+    {
+      "name": "benefit_weight_high",
+      "stage": "weights",
+      "policy": {"benefit_weight": 2.0},
+      "parameters_under_test": {"benefit_weight": 2.0}
+    },
+    {
+      "name": "movement_weight_low",
+      "stage": "weights",
+      "policy": {"movement_weight": 0.5},
+      "parameters_under_test": {"movement_weight": 0.5}
+    },
+    {
+      "name": "movement_weight_high",
+      "stage": "weights",
+      "policy": {"movement_weight": 2.0},
+      "parameters_under_test": {"movement_weight": 2.0}
+    },
+    {
+      "name": "risk_weight_low",
+      "stage": "weights",
+      "policy": {"risk_weight": 0.5},
+      "parameters_under_test": {"risk_weight": 0.5}
+    },
+    {
+      "name": "risk_weight_high",
+      "stage": "weights",
+      "policy": {"risk_weight": 2.0},
+      "parameters_under_test": {"risk_weight": 2.0}
+    },
+    {
+      "name": "opportunity_weight_low",
+      "stage": "weights",
+      "policy": {"opportunity_weight": 0.5},
+      "parameters_under_test": {"opportunity_weight": 0.5}
+    },
+    {
+      "name": "opportunity_weight_high",
+      "stage": "weights",
+      "policy": {"opportunity_weight": 2.0},
+      "parameters_under_test": {"opportunity_weight": 2.0}
+    },
+    {
+      "name": "recency_weight_low",
+      "stage": "reuse",
+      "policy": {"embedding_recency_weight": 0.3},
+      "parameters_under_test": {"embedding_recency_weight": 0.3}
+    },
+    {
+      "name": "recency_weight_high",
+      "stage": "reuse",
+      "policy": {"embedding_recency_weight": 0.9},
+      "parameters_under_test": {"embedding_recency_weight": 0.9}
+    },
+    {
+      "name": "time_exponent_025",
+      "stage": "reuse",
+      "policy": {"density_time_exponent": 0.25},
+      "parameters_under_test": {"density_time_exponent": 0.25}
+    },
+    {
+      "name": "time_exponent_050",
+      "stage": "reuse",
+      "policy": {"density_time_exponent": 0.5},
+      "parameters_under_test": {"density_time_exponent": 0.5}
+    },
+    {
+      "name": "reuse_horizon_4",
+      "stage": "reuse",
+      "policy": {"reuse_horizon_epochs": 4.0},
+      "parameters_under_test": {"reuse_horizon_epochs": 4.0}
+    },
+    {
+      "name": "reuse_horizon_16",
+      "stage": "reuse",
+      "policy": {"reuse_horizon_epochs": 16.0},
+      "parameters_under_test": {"reuse_horizon_epochs": 16.0}
+    },
+    {
+      "name": "bandwidth_fraction_050",
+      "stage": "scheduler",
+      "policy": {"bandwidth_fraction": 0.5},
+      "parameters_under_test": {"bandwidth_fraction": 0.5}
+    },
+    {
+      "name": "bandwidth_fraction_095",
+      "stage": "scheduler",
+      "policy": {"bandwidth_fraction": 0.95},
+      "parameters_under_test": {"bandwidth_fraction": 0.95}
+    },
+    {
+      "name": "kv_user_granularity",
+      "stage": "scheduler",
+      "policy": {"kv_granularity": "user"},
+      "parameters_under_test": {"kv_granularity": "user"}
+    },
+    {
+      "name": "reuse_interval_alpha_010",
+      "stage": "reuse",
+      "policy": {"reuse_interval_alpha": 0.1},
+      "parameters_under_test": {"reuse_interval_alpha": 0.1}
+    },
+    {
+      "name": "reuse_interval_alpha_040",
+      "stage": "reuse",
+      "policy": {"reuse_interval_alpha": 0.4},
+      "parameters_under_test": {"reuse_interval_alpha": 0.4}
+    },
+    {
+      "name": "reuse_probability_alpha_005",
+      "stage": "reuse",
+      "policy": {"reuse_probability_alpha": 0.05},
+      "parameters_under_test": {"reuse_probability_alpha": 0.05}
+    },
+    {
+      "name": "reuse_probability_alpha_025",
+      "stage": "reuse",
+      "policy": {"reuse_probability_alpha": 0.25},
+      "parameters_under_test": {"reuse_probability_alpha": 0.25}
+    },
+    {
+      "name": "admission_threshold_001",
+      "stage": "admission",
+      "policy": {"minimum_net_benefit_ms": 0.01},
+      "parameters_under_test": {"minimum_net_benefit_ms": 0.01}
+    },
+    {
+      "name": "admission_threshold_010",
+      "stage": "admission",
+      "policy": {"minimum_net_benefit_ms": 0.1},
+      "parameters_under_test": {"minimum_net_benefit_ms": 0.1}
+    },
+    {
+      "name": "reserve_bytes_64mib",
+      "stage": "admission",
+      "policy": {"reserve_bytes": 67108864},
+      "parameters_under_test": {"reserve_bytes": 67108864}
+    },
+    {
+      "name": "kv_min_pages_32",
+      "stage": "admission",
+      "policy": {"kv_min_primary_pages": 32},
+      "parameters_under_test": {"kv_min_primary_pages": 32}
+    },
+    {
+      "name": "kv_min_pages_128",
+      "stage": "admission",
+      "policy": {"kv_min_primary_pages": 128},
+      "parameters_under_test": {"kv_min_primary_pages": 128}
+    },
+    {
+      "name": "kv_append_margin_1",
+      "stage": "admission",
+      "policy": {"kv_append_margin_pages_per_user": 1},
+      "parameters_under_test": {"kv_append_margin_pages_per_user": 1}
+    },
+    {
+      "name": "kv_append_margin_4",
+      "stage": "admission",
+      "policy": {"kv_append_margin_pages_per_user": 4},
+      "parameters_under_test": {"kv_append_margin_pages_per_user": 4}
+    },
+    {
+      "name": "confidence_samples_8",
+      "stage": "online_model",
+      "policy": {"confidence_samples": 8},
+      "parameters_under_test": {"confidence_samples": 8}
+    },
+    {
+      "name": "confidence_samples_32",
+      "stage": "online_model",
+      "policy": {"confidence_samples": 32},
+      "parameters_under_test": {"confidence_samples": 32}
+    },
+    {
+      "name": "batch_forgetting_095",
+      "stage": "online_model",
+      "policy": {"batch_forgetting": 0.95},
+      "parameters_under_test": {"batch_forgetting": 0.95}
+    },
+    {
+      "name": "batch_forgetting_0995",
+      "stage": "online_model",
+      "policy": {"batch_forgetting": 0.995},
+      "parameters_under_test": {"batch_forgetting": 0.995}
+    },
+    {
+      "name": "transfer_forgetting_095",
+      "stage": "online_model",
+      "policy": {"transfer_forgetting": 0.95},
+      "parameters_under_test": {"transfer_forgetting": 0.95}
+    },
+    {
+      "name": "transfer_forgetting_0995",
+      "stage": "online_model",
+      "policy": {"transfer_forgetting": 0.995},
+      "parameters_under_test": {"transfer_forgetting": 0.995}
+    },
+    {
+      "name": "batch_embedding_prior_low",
+      "stage": "online_model",
+      "policy": {"batch_priors": [1.0, 0.5, 0.1, 0.02, 50.0, 3.5, 0.04, 0.05, 0.1, 0.1]},
+      "parameters_under_test": {"embedding_miss_prior": 50.0}
+    },
+    {
+      "name": "batch_embedding_prior_high",
+      "stage": "online_model",
+      "policy": {"batch_priors": [1.0, 0.5, 0.1, 0.02, 300.0, 3.5, 0.04, 0.05, 0.1, 0.1]},
+      "parameters_under_test": {"embedding_miss_prior": 300.0}
+    },
+    {
+      "name": "batch_kv_prior_low",
+      "stage": "online_model",
+      "policy": {"batch_priors": [1.0, 0.5, 0.1, 0.02, 150.0, 1.0, 0.04, 0.05, 0.1, 0.1]},
+      "parameters_under_test": {"kv_uncached_prior": 1.0}
+    },
+    {
+      "name": "batch_kv_prior_high",
+      "stage": "online_model",
+      "policy": {"batch_priors": [1.0, 0.5, 0.1, 0.02, 150.0, 8.0, 0.04, 0.05, 0.1, 0.1]},
+      "parameters_under_test": {"kv_uncached_prior": 8.0}
+    },
+    {
+      "name": "transfer_prior_low",
+      "stage": "online_model",
+      "policy": {"transfer_priors": [0.0, 0.01, 0.0]},
+      "parameters_under_test": {"transfer_ms_per_mib_prior": 0.01}
+    },
+    {
+      "name": "transfer_prior_high",
+      "stage": "online_model",
+      "policy": {"transfer_priors": [0.0, 0.1, 0.0]},
+      "parameters_under_test": {"transfer_ms_per_mib_prior": 0.1}
+    }
+  ]
+}

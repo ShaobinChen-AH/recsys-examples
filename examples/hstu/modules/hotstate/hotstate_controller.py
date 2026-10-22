@@ -589,7 +589,9 @@ class HotStateController:
             },
             "policy_inputs": (
                 self._state_trace_records(result)
-                if self.trace_path is not None or self.trace_detail == "full"
+                if self.trace_detail == "full"
+                else self._policy_calibration_records(result)
+                if self.trace_path is not None
                 else []
             ),
         }
@@ -679,6 +681,20 @@ class HotStateController:
             "physical_hbm": physical_hbm,
             "consistency": self.consistency_snapshot(),
             "online_cost_model": self.value_engine.cost_model_snapshot(),
+            "request_metrics": {
+                "history_tokens": int(sum(request_history_lengths)),
+                "history_length": int(hist_len),
+                "num_candidates": int(batch.max_num_candidates or 100),
+                "embedding_requests": int(len(item_sequence)),
+                "unique_embedding_requests": int(requested_unique_keys),
+                "user_id": int(uid),
+                "user_was_offloaded": bool(
+                    self._pending_batch_cost_context.get("user_was_offloaded", False)
+                ),
+                "hbm_pressure": float(
+                    self._pending_batch_cost_context.get("hbm_pressure", 0.0)
+                ),
+            },
             "policy_inputs": self._pending_batch_cost_context.get("policy_inputs", []),
             "physical_kv_pool_bytes": self.kv_adapter.physical_kv_cache_bytes(),
             "logical_kv_page_limit_pages": self.kv_adapter.get_current_page_limit(),
@@ -707,6 +723,7 @@ class HotStateController:
 
         context = self._pending_batch_cost_context
         scheduler_post = {}
+        observed_cost_inputs = None
         if context is not None:
             staged_generation = context.get("staged_kv_generation")
             completed_onloads = []
@@ -748,7 +765,7 @@ class HotStateController:
                 context.get("staged_kv_onload_bytes", 0) or 0
             )
             automatic_queue_depth = self.scheduler.pending_count()
-            self.value_engine.observe_batch_cost(
+            batch_cost_inputs = {
                 latency_ms=float(latency_ms),
                 history_tokens=int(context["history_tokens"]),
                 num_candidates=int(context["num_candidates"]),
@@ -759,7 +776,21 @@ class HotStateController:
                 transfer_queue_depth=automatic_queue_depth,
                 hbm_pressure=float(context["hbm_pressure"]),
                 host_memory_pressure=self._host_memory_pressure(),
-            )
+            }
+            self.value_engine.observe_batch_cost(**batch_cost_inputs)
+            observed_cost_inputs = {
+                **batch_cost_inputs,
+                "synchronous_control_transfer_bytes": int(
+                    context.get("synchronous_control_transfer_bytes", 0)
+                ),
+                "synchronous_kv_released_bytes": int(
+                    context.get("synchronous_kv_released_bytes", 0)
+                ),
+                "user_was_offloaded": bool(context.get("user_was_offloaded", False)),
+                "offload_pages": offload_pages,
+                "origin_cached_tokens": origin,
+                "new_tokens": int(new_tokens),
+            }
             self._pending_batch_cost_context = None
 
         # The forward may have caused native KV onload/offload activity and
@@ -775,6 +806,7 @@ class HotStateController:
                 "consistency": self.consistency_snapshot(),
                 "online_cost_model": self.value_engine.cost_model_snapshot(),
                 "transfer_scheduler": scheduler_post,
+                "observed_cost_inputs": observed_cost_inputs,
             }
             return result
 
@@ -806,6 +838,7 @@ class HotStateController:
             "consistency": self.consistency_snapshot(),
             "online_cost_model": self.value_engine.cost_model_snapshot(),
             "transfer_scheduler": scheduler_post,
+            "observed_cost_inputs": observed_cost_inputs,
         }
         return result
 
@@ -838,6 +871,34 @@ class HotStateController:
             result.scored_handles,
             result.decision_by_key,
         )
+
+    @staticmethod
+    def _policy_calibration_records(result):
+        """Keep the scalar trace to the value inputs needed for offline tuning."""
+        records = []
+        for scored in result.scored_handles:
+            handle = scored.handle
+            records.append(
+                {
+                    "state_type": handle.state_type.name,
+                    "footprint_bytes": int(handle.footprint_bytes),
+                    "gross_benefit_ms": float(scored.gross_benefit_ms),
+                    "movement_penalty_ms": float(scored.movement_cost_ms),
+                    "semantic_risk_ms": float(scored.risk_cost_ms),
+                    "opportunity_cost_ms": float(scored.opportunity_cost_ms),
+                    "net_benefit_ms": float(scored.net_benefit_ms),
+                    "value_density_ms_per_byte": float(
+                        scored.value_density_ms_per_byte
+                    ),
+                    "reuse_probability": float(scored.reuse_probability),
+                    "decision": result.decision_by_key.get(
+                        handle.logical_key, "unknown"
+                    ),
+                    "policy_name": scored.policy_name,
+                    "policy_config_id": scored.policy_config_id,
+                }
+            )
+        return records
     
     def _state_trace_records_from_scored(self, scored_handles, decision_by_key):
         records = []

@@ -3,7 +3,7 @@ from collections import defaultdict
 from typing import Dict, List, Optional
 
 from modules.hotstate.demand_signal import DemandSignal
-from modules.hotstate.policy import PolicyConfig, ValueInputs, WeightedValue
+from modules.hotstate.policy import PolicyConfig, ValueInputs, make_value_function
 from modules.hotstate.online_cost_model import (
     BatchCostObservation,
     OnlineSystemCostModel,
@@ -27,7 +27,7 @@ class ValueEngine:
     def __init__(self, total_hbm_bytes: int, cost_model=None, config=None, value_function=None):
         self.total_hbm = int(total_hbm_bytes)
         self.config = config or PolicyConfig()
-        self.value_function = value_function or WeightedValue(self.config)
+        self.value_function = value_function or make_value_function(self.config)
         self.cost_model = cost_model or OnlineSystemCostModel(self.config)
         self._embedding_last_access_epoch_by_item: Dict[int, int] = {}
         self._last_access_epoch_by_key: Dict[str, int] = {}
