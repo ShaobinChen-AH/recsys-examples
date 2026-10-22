@@ -278,6 +278,22 @@ def _read_dynamic_embedding_rows(model, item_ids):
     return result[-1]
 
 
+def _capture_sparse_outputs(captured):
+    def capture(_module, _inputs, outputs):
+        captured.clear()
+        captured.update(
+            {
+                name: (
+                    embedding.values().detach().clone(),
+                    embedding.lengths().detach().clone(),
+                )
+                for name, embedding in outputs.items()
+            }
+        )
+
+    return capture
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cuda_physical_hbm_envelope_smoke():
     """Exercise real DynamicEmb HBM and KV allocations for 20 inference batches."""
@@ -336,6 +352,8 @@ def test_cuda_physical_hbm_envelope_smoke():
 
     hbm_model = None
     host_model = None
+    hbm_sparse_hook = None
+    host_sparse_hook = None
     try:
         torch.cuda.manual_seed_all(23)
         torch.manual_seed(23)
@@ -364,6 +382,14 @@ def test_cuda_physical_hbm_envelope_smoke():
         host_initialized_rows = {}
         _use_smoke_eval_initializer(hbm_model, hbm_initialized_rows)
         _use_smoke_eval_initializer(host_model, host_initialized_rows)
+        hbm_sparse_outputs = {}
+        host_sparse_outputs = {}
+        hbm_sparse_hook = hbm_model.sparse_module.register_forward_hook(
+            _capture_sparse_outputs(hbm_sparse_outputs)
+        )
+        host_sparse_hook = host_model.sparse_module.register_forward_hook(
+            _capture_sparse_outputs(host_sparse_outputs)
+        )
 
         host_model.dense_module.load_state_dict(
             hbm_model.dense_module.state_dict(),
@@ -427,6 +453,38 @@ def test_cuda_physical_hbm_envelope_smoke():
                 )
                 assert residency is not None
                 assert all(location == 1 for location in residency)
+                with torch.inference_mode():
+                    hbm_sparse = hbm_model.sparse_module(batch.features)
+                    host_sparse = host_model.sparse_module(batch.features)
+                    hbm_uncached_output = hbm_model.dense_module.forward_nokvcache(
+                        batch, hbm_sparse
+                    )
+                    host_uncached_output = host_model.dense_module.forward_nokvcache(
+                        batch, host_sparse
+                    )
+                assert hbm_sparse_outputs.keys() == host_sparse_outputs.keys()
+                for feature_name in hbm_sparse_outputs:
+                    hbm_values, hbm_lengths = hbm_sparse_outputs[feature_name]
+                    host_values, host_lengths = host_sparse_outputs[feature_name]
+                    assert torch.equal(hbm_lengths, host_lengths), (
+                        f"batch=0 sparse lengths differ for {feature_name}"
+                    )
+                    assert torch.equal(hbm_values, host_values), (
+                        f"batch=0 sparse outputs differ for {feature_name}: "
+                        f"max_diff={max_diff(hbm_values, host_values)}"
+                    )
+                uncached_difference = max_diff(
+                    hbm_uncached_output, host_uncached_output
+                )
+                assert torch.allclose(
+                    hbm_uncached_output,
+                    host_uncached_output,
+                    rtol=2e-2,
+                    atol=2e-2,
+                ), (
+                    "batch=0 uncached model outputs differ: "
+                    f"max_diff={uncached_difference}"
+                )
             with torch.inference_mode():
                 hbm_output = hbm_model.forward_with_kvcache(
                     batch, user_ids, history_lengths
@@ -458,6 +516,33 @@ def test_cuda_physical_hbm_envelope_smoke():
             difference = max_diff(hbm_output, host_output)
             assert torch.count_nonzero(hbm_output).item() > 0
             assert torch.count_nonzero(host_output).item() > 0
+            if index == 0:
+                assert hbm_sparse_outputs.keys() == host_sparse_outputs.keys()
+                for feature_name in hbm_sparse_outputs:
+                    hbm_values, hbm_lengths = hbm_sparse_outputs[feature_name]
+                    host_values, host_lengths = host_sparse_outputs[feature_name]
+                    assert torch.equal(hbm_lengths, host_lengths), (
+                        f"batch=0 sparse lengths differ for {feature_name}"
+                    )
+                    assert torch.equal(hbm_values, host_values), (
+                        f"batch=0 sparse outputs differ for {feature_name}: "
+                        f"max_diff={max_diff(hbm_values, host_values)}"
+                    )
+                hbm_cache = hbm_model.dense_module.async_kvcache
+                host_cache = host_model.dense_module.async_kvcache
+                assert (
+                    hbm_cache.last_origin_cached_lengths
+                    == host_cache.last_origin_cached_lengths
+                ), (
+                    "batch=0 cached prefix lengths differ: "
+                    f"hbm={hbm_cache.last_origin_cached_lengths}, "
+                    f"host={host_cache.last_origin_cached_lengths}"
+                )
+                assert hbm_cache.last_new_tokens == host_cache.last_new_tokens, (
+                    "batch=0 cache prefill token counts differ: "
+                    f"hbm={hbm_cache.last_new_tokens}, "
+                    f"host={host_cache.last_new_tokens}"
+                )
             assert torch.allclose(
                 hbm_output, host_output, rtol=2e-2, atol=2e-2
             ), f"batch={index}, max_diff={difference}"
@@ -466,5 +551,9 @@ def test_cuda_physical_hbm_envelope_smoke():
             measured_kv = kv_adapter.physical_hbm_bytes()
             assert measured_embedding + measured_kv <= state_budget
     finally:
+        if hbm_sparse_hook is not None:
+            hbm_sparse_hook.remove()
+        if host_sparse_hook is not None:
+            host_sparse_hook.remove()
         _shutdown_cuda_smoke_model(host_model)
         _shutdown_cuda_smoke_model(hbm_model)

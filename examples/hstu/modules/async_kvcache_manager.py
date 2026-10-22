@@ -199,16 +199,23 @@ class AsyncHSTUKVCacheManager:
         static_onload_handle,
     ):
         self.last_wait_timings = {}
+        user_ids = [int(uid) for uid in user_ids]
+        total_history_lengths = [int(length) for length in total_history_lengths]
+        if len(user_ids) != int(batch_size) or len(total_history_lengths) != int(
+            batch_size
+        ):
+            raise ValueError(
+                "batch_size, user_ids, and total_history_lengths must align"
+            )
+
         origin_cached_lengths = self.gpu_kvcache_mgr.get_total_cache_length(user_ids)
         new_tokens = sum(
-            [
-                total_history_lengths[idx] - origin_cached_lengths[idx]
-                for idx in range(batch_size)
-            ]
+            total_history_lengths[idx] - int(origin_cached_lengths[idx])
+            for idx in range(batch_size)
         )
 
         self.last_origin_cached_lengths = list(origin_cached_lengths)
-        self.last_new_tokens = int(new_tokens)
+        self.last_new_tokens = new_tokens
 
         offload_uids_buffer = torch.empty(
             [
