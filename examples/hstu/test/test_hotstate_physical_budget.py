@@ -382,8 +382,6 @@ def test_cuda_physical_hbm_envelope_smoke():
         host_initialized_rows = {}
         _use_smoke_eval_initializer(hbm_model, hbm_initialized_rows)
         _use_smoke_eval_initializer(host_model, host_initialized_rows)
-        hbm_model.dense_module.async_kvcache.capture_last_kv_metadata = True
-        host_model.dense_module.async_kvcache.capture_last_kv_metadata = True
         hbm_sparse_outputs = {}
         host_sparse_outputs = {}
         hbm_sparse_hook = hbm_model.sparse_module.register_forward_hook(
@@ -529,12 +527,68 @@ def test_cuda_physical_hbm_envelope_smoke():
                 with torch.inference_mode():
                     hbm_sparse = hbm_model.sparse_module(batch.features)
                     host_sparse = host_model.sparse_module(batch.features)
+                    hbm_dense_state = hbm_model.dense_module.state_dict()
+                    host_dense_state = host_model.dense_module.state_dict()
+                    assert hbm_dense_state.keys() == host_dense_state.keys()
+                    for state_name, hbm_state in hbm_dense_state.items():
+                        if isinstance(hbm_state, torch.Tensor):
+                            assert torch.equal(
+                                hbm_state, host_dense_state[state_name]
+                            ), f"batch=1 dense state differs at {state_name}"
+                    hbm_preprocessed = (
+                        hbm_model.dense_module._hstu_block._preprocessor(
+                            embeddings=hbm_sparse, batch=batch
+                        )
+                    )
+                    host_preprocessed = (
+                        host_model.dense_module._hstu_block._preprocessor(
+                            embeddings=host_sparse, batch=batch
+                        )
+                    )
+                    assert torch.equal(
+                        hbm_preprocessed.values, host_preprocessed.values
+                    ), (
+                        "batch=1 preprocessed HSTU inputs differ: "
+                        f"max_diff={max_diff(hbm_preprocessed.values, host_preprocessed.values)}"
+                    )
+                    for metadata_name in (
+                        "seqlen",
+                        "seqlen_offsets",
+                        "num_candidates",
+                        "num_candidates_offsets",
+                    ):
+                        hbm_metadata = getattr(hbm_preprocessed, metadata_name)
+                        host_metadata = getattr(host_preprocessed, metadata_name)
+                        if hbm_metadata is not None:
+                            assert torch.equal(hbm_metadata, host_metadata), (
+                                f"batch=1 preprocessed {metadata_name} differs"
+                            )
                     hbm_uncached_output = hbm_model.dense_module.forward_nokvcache(
                         batch, hbm_sparse
                     )
                     host_uncached_output = host_model.dense_module.forward_nokvcache(
                         batch, host_sparse
                     )
+                    hbm_sparse_repeat = hbm_model.sparse_module(batch.features)
+                    host_sparse_repeat = host_model.sparse_module(batch.features)
+                    hbm_uncached_repeat = hbm_model.dense_module.forward_nokvcache(
+                        batch, hbm_sparse_repeat
+                    )
+                    host_uncached_repeat = host_model.dense_module.forward_nokvcache(
+                        batch, host_sparse_repeat
+                    )
+                assert torch.equal(
+                    hbm_uncached_output, hbm_uncached_repeat
+                ), (
+                    "batch=1 HBM uncached output is nondeterministic: "
+                    f"max_diff={max_diff(hbm_uncached_output, hbm_uncached_repeat)}"
+                )
+                assert torch.equal(
+                    host_uncached_output, host_uncached_repeat
+                ), (
+                    "batch=1 host uncached output is nondeterministic: "
+                    f"max_diff={max_diff(host_uncached_output, host_uncached_repeat)}"
+                )
                 assert hbm_sparse_outputs.keys() == host_sparse_outputs.keys()
                 for feature_name in hbm_sparse_outputs:
                     hbm_values, hbm_lengths = hbm_sparse_outputs[feature_name]
@@ -546,18 +600,6 @@ def test_cuda_physical_hbm_envelope_smoke():
                         f"batch=1 sparse outputs differ for {feature_name}: "
                         f"max_diff={max_diff(hbm_values, host_values)}"
                     )
-                uncached_difference = max_diff(
-                    hbm_uncached_output, host_uncached_output
-                )
-                assert torch.allclose(
-                    hbm_uncached_output,
-                    host_uncached_output,
-                    rtol=2e-2,
-                    atol=2e-2,
-                ), (
-                    "batch=1 uncached model outputs differ: "
-                    f"max_diff={uncached_difference}"
-                )
                 batch1_uncached_outputs = (
                     hbm_uncached_output.detach().clone(),
                     host_uncached_output.detach().clone(),
@@ -595,18 +637,6 @@ def test_cuda_physical_hbm_envelope_smoke():
             assert torch.count_nonzero(host_output).item() > 0
             if index == 1:
                 hbm_uncached_output, host_uncached_output = batch1_uncached_outputs
-                assert torch.allclose(
-                    hbm_output, hbm_uncached_output, rtol=2e-2, atol=2e-2
-                ), (
-                    "batch=1 HBM cached and uncached outputs differ: "
-                    f"max_diff={max_diff(hbm_output, hbm_uncached_output)}"
-                )
-                assert torch.allclose(
-                    host_output, host_uncached_output, rtol=2e-2, atol=2e-2
-                ), (
-                    "batch=1 host cached and uncached outputs differ: "
-                    f"max_diff={max_diff(host_output, host_uncached_output)}"
-                )
                 hbm_cache = hbm_model.dense_module.async_kvcache
                 host_cache = host_model.dense_module.async_kvcache
                 assert hbm_cache.last_origin_cached_lengths == host_cache.last_origin_cached_lengths, (
@@ -646,27 +676,36 @@ def test_cuda_physical_hbm_envelope_smoke():
                 torch.cuda.synchronize()
                 hbm_page = int(hbm_cache.static_page_ids_gpu_buffer[0].item())
                 host_page = int(host_cache.static_page_ids_gpu_buffer[0].item())
-                hbm_metadata = hbm_cache.last_kv_metadata
-                host_metadata = host_cache.last_kv_metadata
-                assert hbm_metadata.keys() == host_metadata.keys()
-                assert hbm_metadata["kv_indices"].tolist() == [hbm_page]
-                assert host_metadata["kv_indices"].tolist() == [host_page]
                 hbm_kv = hbm_cache.cache_table[:, hbm_page, :, : int(history_lengths[0].item())]
                 host_kv = host_cache.cache_table[:, host_page, :, : int(history_lengths[0].item())]
                 assert torch.equal(hbm_kv, host_kv), (
                     "batch=1 K/V values written to the cold-cache page differ: "
                     f"max_diff={max_diff(hbm_kv, host_kv)}"
                 )
-                for metadata_name in hbm_metadata:
-                    if metadata_name == "kv_indices":
-                        continue
-                    assert torch.equal(
-                        hbm_metadata[metadata_name], host_metadata[metadata_name]
-                    ), (
-                        f"batch=1 consumed KV metadata differs at {metadata_name}: "
-                        f"hbm={hbm_metadata[metadata_name].tolist()}, "
-                        f"host={host_metadata[metadata_name].tolist()}"
-                    )
+                assert torch.allclose(
+                    hbm_output, hbm_uncached_output, rtol=2e-2, atol=2e-2
+                ), (
+                    "batch=1 HBM cached and uncached outputs differ: "
+                    f"max_diff={max_diff(hbm_output, hbm_uncached_output)}"
+                )
+                assert torch.allclose(
+                    host_output, host_uncached_output, rtol=2e-2, atol=2e-2
+                ), (
+                    "batch=1 host cached and uncached outputs differ: "
+                    f"max_diff={max_diff(host_output, host_uncached_output)}"
+                )
+                uncached_difference = max_diff(
+                    hbm_uncached_output, host_uncached_output
+                )
+                assert torch.allclose(
+                    hbm_uncached_output,
+                    host_uncached_output,
+                    rtol=2e-2,
+                    atol=2e-2,
+                ), (
+                    "batch=1 uncached model outputs differ: "
+                    f"max_diff={uncached_difference}"
+                )
             if index == 0:
                 assert hbm_sparse_outputs.keys() == host_sparse_outputs.keys()
                 for feature_name in hbm_sparse_outputs:

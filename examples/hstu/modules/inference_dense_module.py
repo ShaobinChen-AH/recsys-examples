@@ -430,16 +430,6 @@ class InferenceDenseModule(torch.nn.Module):
             kvcache_metadata.total_history_offsets += jagged_data.num_candidates_offsets
             kvcache_metadata.total_history_lengths += jagged_data.num_candidates
             kvcache_metadata.max_seqlen += jagged_data.max_num_candidates
-            if getattr(self.async_kvcache, "capture_last_kv_metadata", False):
-                self.async_kvcache.last_kv_metadata = {
-                    "kv_indices": kvcache_metadata.kv_indices.detach().clone(),
-                    "kv_indptr": kvcache_metadata.kv_indptr.detach().clone(),
-                    "kv_last_page_len": kvcache_metadata.kv_last_page_len.detach().clone(),
-                    "total_history_lengths": kvcache_metadata.total_history_lengths.detach().clone(),
-                    "total_history_offsets": kvcache_metadata.total_history_offsets.detach().clone(),
-                    "batch_indices": kvcache_metadata.batch_indices.detach().clone(),
-                    "position": kvcache_metadata.position.detach().clone(),
-                }
 
             num_tokens = batch.features.values().shape[0]
             if self.use_cudagraph:

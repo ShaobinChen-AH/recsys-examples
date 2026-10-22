@@ -137,7 +137,6 @@ class AsyncHSTUKVCacheManager:
         self._last_offload_completion_target = 0
         self._active_prepare = None
         self.last_wait_timings = {}
-        self.last_kv_metadata = None
 
     def physical_hbm_breakdown(self) -> dict:
         """Return bytes allocated by the KV state manager on the GPU.
