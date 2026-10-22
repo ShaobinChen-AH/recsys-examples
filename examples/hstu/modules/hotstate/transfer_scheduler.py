@@ -370,11 +370,19 @@ class TransferScheduler:
                 self._mark_noop(request, "row already resident in HBM")
                 result.noop_ids.append(request.transfer_id)
                 continue
+            materialize_absent = bool(
+                entry is not None
+                and entry.metadata.get("tier") == "absent"
+            )
             request = self._enqueue(
                 logical_key=key,
                 state_class="embedding",
                 direction="admission",
-                source=entry.location if entry is not None else Placement.HOST_DRAM,
+                source=(
+                    None
+                    if materialize_absent
+                    else entry.location if entry is not None else Placement.HOST_DRAM
+                ),
                 target=Placement.HBM,
                 bytes_moved=row_bytes,
                 priority=self._priority(scoring_map, key, "admission", row_bytes),
@@ -382,7 +390,10 @@ class TransferScheduler:
                 epoch=epoch,
                 resource=TransferResource.PCIE_H2D,
                 dependencies=eviction_ids,
-                metadata={"item_id": item_id},
+                metadata={
+                    "item_id": item_id,
+                    "materialized_from_absent": materialize_absent,
+                },
             )
             admissions.append(request)
 
@@ -785,6 +796,14 @@ class TransferScheduler:
             authoritative=request.state_class == "embedding",
             transfer_id=request.transfer_id,
         )
+        if request.metadata.get("materialized_from_absent"):
+            # register_handle uses HOST_DRAM as a compatibility location for
+            # empty placement sets. It was not a real source replica.
+            self.dir.evict_replica(
+                request.logical_key,
+                Placement.HOST_DRAM,
+                epoch=epoch,
+            )
         request.status = TransferStatus.COMPLETE
         request.completed_at = time.perf_counter()
         self._in_flight.pop(request.transfer_id, None)

@@ -200,6 +200,49 @@ def test_scheduler_marks_unconfirmed_backend_actions_failed():
     assert failed["error"] in result.backend_errors["embedding_admission"]
 
 
+def test_scheduler_materializes_absent_embedding_without_host_source():
+    directory = GlobalDirectory()
+    registry = StateRegistry()
+    embedding = _EmbeddingBackend()
+    kv = _KVBackend()
+    handle = StateHandle(
+        state_type=StateType.EMBEDDING_COLD_ROWS,
+        logical_key="emb:item:42",
+        footprint_bytes=128,
+        placement=set(),
+        metadata={"tier": "absent"},
+    )
+    registry.register(handle)
+    directory.observe_handle(handle, epoch=1)
+    scheduler = TransferScheduler(
+        kv,
+        directory,
+        ValueEngine(4096),
+        embedding_adapter=embedding,
+        registry=registry,
+    )
+
+    result = scheduler.execute_residency_plan(
+        admitted_embedding_keys=[42],
+        evicted_embedding_keys=[],
+        evicted_kv_keys=[],
+        scoring_map={"emb:item:42": _scored(handle, density=0.01, net=1.0)},
+        protected_uids=[],
+        epoch=1,
+        row_size_bytes=128,
+    )
+
+    assert result.admitted_embedding_keys == [42]
+    assert directory.get("emb:item:42").placements == {Placement.HBM}
+    assert registry.get("emb:item:42").placement == {Placement.HBM}
+    admission = next(
+        record
+        for record in scheduler.snapshot()["history_tail"]
+        if record["logical_key"] == "emb:item:42"
+    )
+    assert admission["source"] is None
+
+
 def test_failed_prerequisite_defers_dependent_admission():
     scheduler, embedding, _kv, _directory, _registry, handles = _scheduler()
     embedding.apply_residency_plan = lambda admitted, evicted: ([], [])
