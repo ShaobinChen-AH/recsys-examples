@@ -236,14 +236,46 @@ def _shutdown_cuda_smoke_model(model):
         torch.cuda.empty_cache()
 
 
-def _use_smoke_eval_initializer(model):
+def _use_smoke_eval_initializer(model, initialized_rows):
     """Give independently constructed DynamicEmb tables identical nonzero misses."""
     tables = model.sparse_module._dynamic_embedding_collection._embedding_tables
 
     def initialize(values, indices, keys):
-        values.fill_(0.25)
+        missing_indices = indices.to(dtype=torch.long)
+        missing_keys = keys.index_select(0, missing_indices).to(dtype=torch.int64)
+        row_values = (
+            missing_keys.remainder(251).to(dtype=values.dtype) / 251.0 + 0.125
+        )
+        initialized_values = row_values.unsqueeze(1).expand(-1, values.size(1))
+        values.index_copy_(0, missing_indices, initialized_values)
+        for key, row in zip(
+            missing_keys.detach().cpu().tolist(), initialized_values.detach().cpu()
+        ):
+            key = int(key)
+            row = row.clone()
+            previous = initialized_rows.get(key)
+            if previous is not None:
+                assert torch.equal(previous, row), (
+                    f"key {key} was initialized with different values"
+                )
+            initialized_rows[key] = row
 
     tables._eval_initializers[0] = initialize
+
+
+def _read_dynamic_embedding_rows(model, item_ids):
+    from dynamicemb.types import CopyMode
+
+    tables = model.sparse_module._dynamic_embedding_collection._embedding_tables
+    storage = tables._storage
+    state = getattr(storage, "_hbm", None)
+    if state is None:
+        state = storage._state
+    keys = torch.as_tensor(item_ids, dtype=torch.int64, device=state.device)
+    table_ids = torch.zeros_like(keys)
+    result = storage.find(keys, table_ids, copy_mode=CopyMode.EMBEDDING)
+    assert bool(result[5].all()), "requested DynamicEmb rows are missing after lookup"
+    return result[-1]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -324,12 +356,14 @@ def test_cuda_physical_hbm_envelope_smoke():
         assert physical_snapshot["managed_state_physical_hbm_bytes"] <= state_budget
 
         # Reset the seed so the host-only control model has the same learned
-        # parameters and DynamicEmb initializer sequence.
+        # parameters.
         torch.cuda.manual_seed_all(23)
         torch.manual_seed(23)
         host_model = _build_cuda_smoke_model(0, plan.blocks_in_primary_pool)
-        _use_smoke_eval_initializer(hbm_model)
-        _use_smoke_eval_initializer(host_model)
+        hbm_initialized_rows = {}
+        host_initialized_rows = {}
+        _use_smoke_eval_initializer(hbm_model, hbm_initialized_rows)
+        _use_smoke_eval_initializer(host_model, host_initialized_rows)
 
         host_model.dense_module.load_state_dict(
             hbm_model.dense_module.state_dict(),
@@ -400,13 +434,34 @@ def test_cuda_physical_hbm_envelope_smoke():
                 host_output = host_model.forward_with_kvcache(
                     batch, user_ids, history_lengths
                 )
-            hbm_model.dense_module.hotstate.after_batch(batch, latency_ms=0.0)
+            item_ids = sorted(
+                set(embedding_adapter.batch_item_sequence(batch))
+            )
+            for key in item_ids:
+                assert key in hbm_initialized_rows, (
+                    f"batch={index} HBM path did not initialize key {key}"
+                )
+                assert key in host_initialized_rows, (
+                    f"batch={index} host path did not initialize key {key}"
+                )
+                assert torch.equal(
+                    hbm_initialized_rows[key], host_initialized_rows[key]
+                ), f"batch={index} initializer values differ for key {key}"
+            if index == 0:
+                admitted_rows = _read_dynamic_embedding_rows(
+                    hbm_model, sorted(admitted_keys)
+                )
+                for key, row in zip(sorted(admitted_keys), admitted_rows):
+                    assert torch.equal(row.cpu(), hbm_initialized_rows[key]), (
+                        f"physical admission stored a different value for key {key}"
+                    )
             difference = max_diff(hbm_output, host_output)
             assert torch.count_nonzero(hbm_output).item() > 0
             assert torch.count_nonzero(host_output).item() > 0
             assert torch.allclose(
                 hbm_output, host_output, rtol=2e-2, atol=2e-2
             ), f"batch={index}, max_diff={difference}"
+            hbm_model.dense_module.hotstate.after_batch(batch, latency_ms=0.0)
             measured_embedding = embedding_adapter.physical_hbm_bytes()
             measured_kv = kv_adapter.physical_hbm_bytes()
             assert measured_embedding + measured_kv <= state_budget
