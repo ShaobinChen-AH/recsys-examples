@@ -456,6 +456,44 @@ def test_cuda_physical_hbm_envelope_smoke():
                 with torch.inference_mode():
                     hbm_sparse = hbm_model.sparse_module(batch.features)
                     host_sparse = host_model.sparse_module(batch.features)
+                    hbm_dense_state = hbm_model.dense_module.state_dict()
+                    host_dense_state = host_model.dense_module.state_dict()
+                    assert hbm_dense_state.keys() == host_dense_state.keys()
+                    for state_name, hbm_state in hbm_dense_state.items():
+                        host_state = host_dense_state[state_name]
+                        if isinstance(hbm_state, torch.Tensor):
+                            assert torch.equal(hbm_state, host_state), (
+                                f"batch=0 dense state differs at {state_name}"
+                            )
+
+                    hbm_preprocessed = (
+                        hbm_model.dense_module._hstu_block._preprocessor(
+                            embeddings=hbm_sparse, batch=batch
+                        )
+                    )
+                    host_preprocessed = (
+                        host_model.dense_module._hstu_block._preprocessor(
+                            embeddings=host_sparse, batch=batch
+                        )
+                    )
+                    assert torch.equal(
+                        hbm_preprocessed.values, host_preprocessed.values
+                    ), (
+                        "batch=0 preprocessed HSTU inputs differ: "
+                        f"max_diff={max_diff(hbm_preprocessed.values, host_preprocessed.values)}"
+                    )
+                    for metadata_name in (
+                        "seqlen",
+                        "seqlen_offsets",
+                        "num_candidates",
+                        "num_candidates_offsets",
+                    ):
+                        hbm_metadata = getattr(hbm_preprocessed, metadata_name)
+                        host_metadata = getattr(host_preprocessed, metadata_name)
+                        if hbm_metadata is not None:
+                            assert torch.equal(hbm_metadata, host_metadata), (
+                                f"batch=0 preprocessed {metadata_name} differs"
+                            )
                     hbm_uncached_output = hbm_model.dense_module.forward_nokvcache(
                         batch, hbm_sparse
                     )
