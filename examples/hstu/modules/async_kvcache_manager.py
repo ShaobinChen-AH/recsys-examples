@@ -137,6 +137,7 @@ class AsyncHSTUKVCacheManager:
         self._last_offload_completion_target = 0
         self._active_prepare = None
         self.last_wait_timings = {}
+        self.last_kv_metadata = None
 
     def physical_hbm_breakdown(self) -> dict:
         """Return bytes allocated by the KV state manager on the GPU.
@@ -463,25 +464,27 @@ class AsyncHSTUKVCacheManager:
         return KVCacheMetadata(
             kv_indices=static_page_ids_gpu_buffer[
                 : metadata_host_buffer[batch_size * 7 + 4]
-            ],
-            kv_indptr=metadata_gpu_buffer[: batch_size + 1],
-            kv_last_page_len=metadata_gpu_buffer[batch_size + 1 : batch_size * 2 + 1],
+            ].clone(),
+            kv_indptr=metadata_gpu_buffer[: batch_size + 1].clone(),
+            kv_last_page_len=metadata_gpu_buffer[
+                batch_size + 1 : batch_size * 2 + 1
+            ].clone(),
             total_history_lengths=metadata_gpu_buffer[
                 batch_size * 2 + 1 : batch_size * 3 + 1
-            ],
+            ].clone(),
             total_history_offsets=metadata_gpu_buffer[
                 batch_size * 3 + 1 : batch_size * 4 + 2
-            ],
+            ].clone(),
             batch_indices=metadata_gpu_buffer[
                 batch_size * 5 + 4 : batch_size * 5 + 4 + new_tokens
-            ],
+            ].clone(),
             position=metadata_gpu_buffer[
                 batch_size * 5 + 4 + new_tokens : batch_size * 5 + 4 + new_tokens * 2
-            ],
+            ].clone(),
             new_history_nnz=new_tokens,
             new_history_nnz_cuda=metadata_gpu_buffer[
                 batch_size * 4 + 2 : batch_size * 4 + 3
-            ],
+            ].clone(),
             kv_cache_table=self.cache_table_list,
             kv_onload_handle=static_onload_handle,
             kv_offload_handle=offload_handle,
