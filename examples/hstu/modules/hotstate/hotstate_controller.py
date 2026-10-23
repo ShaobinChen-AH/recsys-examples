@@ -13,13 +13,13 @@ from modules.hotstate.policy import (
     PolicyConfig,
     load_policy_config,
 )
-import json
 import time
 import os
 from pathlib import Path
 from typing import Optional
 
 import torch
+from modules.hotstate.trace_writer import write_jsonl_record
 
 
 class HotStateController:
@@ -45,6 +45,7 @@ class HotStateController:
         if self.trace_path is not None:
             self.trace_path.parent.mkdir(parents=True, exist_ok=True)
         self.last_trace_record = None
+        self._trace_enabled = self.trace_path is not None
         self.configured_state_budget_bytes = int(
             total_hbm_bytes
             if configured_state_budget_bytes is None
@@ -281,7 +282,11 @@ class HotStateController:
         }
 
     def set_trace_detail(self, trace_detail: str):
+        trace_detail = str(trace_detail).strip().lower()
+        if trace_detail not in {"scalar", "full"}:
+            raise ValueError("HOTSTATE_TRACE_DETAIL must be 'scalar' or 'full'")
         self.trace_detail = trace_detail
+        self._trace_enabled = self.trace_path is not None
     
     # Public API
     def set_embedding_module(self, embedding_module):
@@ -370,7 +375,11 @@ class HotStateController:
         admit_all_control = bool(getattr(self, "admission_admit_all_control", False))
         batch_order_control = bool(getattr(self, "admission_batch_order_control", False))
         smoke_cap = getattr(self, "admission_smoke_max_admitted_keys", None)
-        trace_detail = getattr(self, "trace_detail", "scalar")
+        trace_detail = (
+            getattr(self, "trace_detail", "scalar")
+            if self._trace_enabled
+            else "scalar"
+        )
         admission_trace = []
 
         admission_start = time.perf_counter()
@@ -591,17 +600,13 @@ class HotStateController:
             },
             "policy_inputs": (
                 self._state_trace_records(result)
-                if self.trace_detail == "full"
-                else self._policy_calibration_records(result)
-                if self.trace_path is not None
+                if self._trace_enabled and trace_detail == "full"
                 else []
             ),
         }
 
         self.epoch += 1
 
-        trace_detail = getattr(self, "trace_detail", "scalar")
-        physical_hbm = self.physical_hbm_snapshot()
         if self._pending_batch_cost_context is not None:
             logical_resident_bytes = int(self.kv_adapter.actual_resident_kv_bytes())
             try:
@@ -618,6 +623,97 @@ class HotStateController:
                     / float(max(1, self.configured_state_budget_bytes)),
                 ),
             )
+
+        trace_detail = self.trace_detail
+        physical_hbm = self.physical_hbm_snapshot()
+        if trace_detail != "full":
+            return {
+                "kv_page_budget": result.kv_page_budget,
+                "active_kv_page_limit_pages": self.kv_adapter.get_current_page_limit(),
+                "planned_kv_page_budget": result.planned_kv_page_budget,
+                "hbm_bytes_used": physical_hbm[
+                    "managed_state_physical_hbm_bytes"
+                ],
+                "policy_planned_hbm_bytes": planned_hbm_bytes,
+                "policy_planned_kv_bytes": planned_kv_bytes,
+                "policy_planned_embedding_bytes": planned_embedding_bytes,
+                "policy_budget": result.budget_snapshot,
+                "online_cost_model": self.value_engine.cost_model_snapshot(),
+                "physical_pool_resize_supported": False,
+                "evicted": len(result.evicted_keys),
+                "admitted": len(result.admitted_keys),
+                "epoch": self.epoch - 1,
+                "completed_transfers": len(completed),
+                "profile_ms": {
+                    "extract": 1000 * (t1 - t),
+                    "record_keys": 1000 * (t2 - t1),
+                    "run_epoch": 1000 * (t3 - t2),
+                    "scheduler": 1000 * (t4 - t3),
+                    "total": 1000 * (t4 - t),
+                },
+                "planned_hbm_bytes": planned_hbm_bytes,
+                "planned_kv_bytes": planned_kv_bytes,
+                "planned_embedding_bytes": planned_embedding_bytes,
+                "embedding_requested_unique_keys": requested_unique_keys,
+                "embedding_planned_budget_bytes": planned_embedding_bytes,
+                "embedding_kv_reserved_bytes": kv_reserved_bytes,
+                "embedding_residual_budget_bytes": residual_embedding_budget_bytes,
+                "embedding_admission_budget_bytes": embedding_budget_bytes,
+                "embedding_admission_budget_keys": hotstate_admission_budget_keys,
+                "embedding_admission_policy_size": len(policy_keys),
+                "embedding_admission_smoke_max_keys": smoke_cap,
+                "embedding_admission_max_keys": admission_max_keys,
+                "embedding_admission_cap_source": admission_cap_source,
+                "embedding_admission_order": admission_order,
+                "physical_admission_count": len(result.admitted_keys),
+                "physical_eviction_count": len(result.evicted_keys),
+                "physical_admitted_keys": result.admitted_keys,
+                "physical_evicted_keys": result.evicted_keys,
+                "transfer_execution": transfer_execution.scalar_snapshot(),
+                "staged_kv_request": {
+                    "prepare_generation": kv_stage.get("prepare_generation"),
+                    "staged": bool(kv_stage.get("staged", False)),
+                    "onload_bytes": int(kv_stage.get("onload_bytes", 0)),
+                    "onload_count": len(kv_stage.get("onload_transfer_ids", [])),
+                },
+                "transfer_scheduler": self.scheduler.snapshot(
+                    history_tail=0, include_details=False
+                ),
+                "physical_hbm": physical_hbm,
+                "request_metrics": {
+                    "history_tokens": int(sum(request_history_lengths)),
+                    "history_length": int(hist_len),
+                    "num_candidates": int(batch.max_num_candidates or 100),
+                    "embedding_requests": int(len(item_sequence)),
+                    "unique_embedding_requests": int(requested_unique_keys),
+                    "user_id": int(uid),
+                    "user_was_offloaded": bool(
+                        self._pending_batch_cost_context.get(
+                            "user_was_offloaded", False
+                        )
+                    ),
+                    "hbm_pressure": float(
+                        self._pending_batch_cost_context.get("hbm_pressure", 0.0)
+                    ),
+                    "controlled_embedding_table": (
+                        embedding_key_spaces[0] if embedding_key_spaces else None
+                    ),
+                    "controlled_embedding_key_min": min(item_indices)
+                    if item_indices
+                    else None,
+                    "controlled_embedding_key_max": max(item_indices)
+                    if item_indices
+                    else None,
+                },
+                "physical_kv_pool_bytes": self.kv_adapter.physical_kv_cache_bytes(),
+                "logical_kv_page_limit_pages": self.kv_adapter.get_current_page_limit(),
+                "active_kv_page_limit_bytes": self.kv_adapter.logical_kv_budget_bytes(),
+                "directory_pending_transfers": self.directory.pending_count(),
+                "embedding_prefetch_keys": policy_keys,
+                "kv_staged_handles": kv_stage,
+                "admitted_keys": result.admitted_keys,
+                "evicted_keys": result.evicted_keys,
+            }
 
         return {
             "kv_page_budget": result.kv_page_budget,
@@ -729,6 +825,7 @@ class HotStateController:
 
     def after_batch(self, batch, latency_ms: float):
         """Called after inference. Updates access statistics and snapshots post-forward state."""
+        trace_detail = self.trace_detail if self._trace_enabled else "scalar"
         for feature_name in batch.features.keys():
             self.value_engine.record_access(f"emb:{feature_name}", self.epoch)
 
@@ -745,14 +842,24 @@ class HotStateController:
             if self.enable_transfer_scheduler:
                 native_offload = self.scheduler.observe_native_kv_activity(self.epoch)
                 completed_native = self.scheduler.poll_completions(self.epoch)
-                scheduler_post = {
-                    "completed_onloads": completed_onloads,
-                    "native_offload": native_offload,
-                    "completed_native": completed_native,
-                    "snapshot": self.scheduler.snapshot(
-                        history_tail=32 if self.trace_detail == "full" else 0
-                    ),
-                }
+                if self._trace_enabled and trace_detail == "full":
+                    scheduler_post = {
+                        "completed_onloads": completed_onloads,
+                        "native_offload": native_offload,
+                        "completed_native": completed_native,
+                        "snapshot": self.scheduler.snapshot(history_tail=32),
+                    }
+                elif self._trace_enabled:
+                    scheduler_post = {
+                        "completed_onloads_count": len(completed_onloads),
+                        "native_offload_submitted_count": len(
+                            native_offload.get("submitted_ids", [])
+                        ),
+                        "completed_native_count": len(completed_native),
+                        "snapshot": self.scheduler.snapshot(
+                            history_tail=0, include_details=False
+                        ),
+                    }
             embedding_misses = sum(
                 1
                 for item_id in context["embedding_request_sequence"]
@@ -809,12 +916,12 @@ class HotStateController:
         # adapters after the kernels complete, even for scalar traces.
         self._sync_directory(epoch=self.epoch)
 
-        if self.trace_detail != "full":
+        if not self._trace_enabled:
+            return {}
+
+        if trace_detail != "full":
             result = {
-                "post_num_state_handles": 0,
-                "post_state_trace": [],
                 "post_directory_pending_transfers": self.directory.pending_count(),
-                "consistency": self.consistency_snapshot(),
                 "online_cost_model": self.value_engine.cost_model_snapshot(),
                 "transfer_scheduler": scheduler_post,
                 "observed_cost_inputs": observed_cost_inputs,
@@ -857,8 +964,7 @@ class HotStateController:
         """Send a completed measured request to the configured JSONL sink."""
         self.last_trace_record = record
         if self.trace_path is not None:
-            with self.trace_path.open("a", encoding="utf-8") as output:
-                output.write(json.dumps(record, sort_keys=True, default=str) + "\n")
+            write_jsonl_record(self.trace_path, record)
 
     def abort_batch(self, error: str) -> None:
         """Drain native owners and release HotState request ownership on failure."""
@@ -883,34 +989,6 @@ class HotStateController:
             result.decision_by_key,
         )
 
-    @staticmethod
-    def _policy_calibration_records(result):
-        """Keep the scalar trace to the value inputs needed for offline tuning."""
-        records = []
-        for scored in result.scored_handles:
-            handle = scored.handle
-            records.append(
-                {
-                    "state_type": handle.state_type.name,
-                    "footprint_bytes": int(handle.footprint_bytes),
-                    "gross_benefit_ms": float(scored.gross_benefit_ms),
-                    "movement_penalty_ms": float(scored.movement_cost_ms),
-                    "semantic_risk_ms": float(scored.risk_cost_ms),
-                    "opportunity_cost_ms": float(scored.opportunity_cost_ms),
-                    "net_benefit_ms": float(scored.net_benefit_ms),
-                    "value_density_ms_per_byte": float(
-                        scored.value_density_ms_per_byte
-                    ),
-                    "reuse_probability": float(scored.reuse_probability),
-                    "decision": result.decision_by_key.get(
-                        handle.logical_key, "unknown"
-                    ),
-                    "policy_name": scored.policy_name,
-                    "policy_config_id": scored.policy_config_id,
-                }
-            )
-        return records
-    
     def _state_trace_records_from_scored(self, scored_handles, decision_by_key):
         records = []
         for scored in scored_handles:

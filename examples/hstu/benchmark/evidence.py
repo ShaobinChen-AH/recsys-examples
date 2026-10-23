@@ -272,7 +272,22 @@ def validate_hotstate_trace(records: Iterable[dict], *, require_physical: bool =
                 )
             physical_rows += 1
             remaining_values.append(budget - measured)
-            if row.get("physical_admitted_keys") or row.get("physical_evicted_keys"):
+            admission_count = (
+                _number(row, "physical_admission_count")
+                if "physical_admission_count" in row
+                else 0
+            )
+            eviction_count = (
+                _number(row, "physical_eviction_count")
+                if "physical_eviction_count" in row
+                else 0
+            )
+            if (
+                row.get("physical_admitted_keys")
+                or row.get("physical_evicted_keys")
+                or admission_count > 0
+                or eviction_count > 0
+            ):
                 action_rows += 1
         if row.get("online_pool_resize_observed"):
             events = row.get("physical_pool_resize_events", ())

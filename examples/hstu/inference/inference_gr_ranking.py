@@ -653,7 +653,11 @@ def run_ranking_gr_simulate(
         # INSTRUMENTATION: Trace actual embedding access patterns
         # ============================================================
         access_tracer = EmbeddingAccessTracer()
-        enable_access_tracing = True  # Set to True to collect trace data
+        enable_access_tracing = os.getenv("HOTSTATE_ACCESS_TRACE", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
         while True:
             try:
                 uids, dates, seq_endptrs = next(dataloader_iter)
@@ -693,7 +697,11 @@ def run_ranking_gr_simulate(
                     # INSTRUMENTATION: Record embedding access for this batch
                     # Extract IDs from batch.features (KeyedJaggedTensor)
                     # ============================================================
-                    if enable_access_tracing and hasattr(batch, 'features'):
+                    if (
+                        enable_access_tracing
+                        and not is_warmup
+                        and hasattr(batch, "features")
+                    ):
                         try:
                             access_tracer.record_batch_access(batch.features, emb_configs)
                         except Exception as e:
@@ -721,6 +729,16 @@ def run_ranking_gr_simulate(
                                 state_budget_bytes=total_hbm_bytes or None,
                                 static_split=os.getenv(
                                     "HOTSTATE_STATIC_SPLIT", "static_default"
+                                ),
+                                trace_enabled=bool(
+                                    not is_warmup
+                                    and (
+                                        os.getenv("HOTSTATE_TRACE_PATH")
+                                        or (
+                                            hotstate_controller is not None
+                                            and hotstate_controller.trace_path is not None
+                                        )
+                                    )
                                 ),
                             )
                         elif not disable_kvcache:

@@ -195,7 +195,9 @@ def run_sweep(args):
                         variant["construction_embedding_hbm_ratio"]
                     ),
                     "HOTSTATE_TRACE_PATH": str(trace_path),
-                    "HOTSTATE_TRACE_DETAIL": "scalar",
+                    "HOTSTATE_TRACE_DETAIL": os.getenv(
+                        "HOTSTATE_TRACE_DETAIL", "scalar"
+                    ),
                     "HOTSTATE_SWEEP_SEED": str(args.seed),
                     "HOTSTATE_SWEEP_REPEAT": str(repeat),
                     "HOTSTATE_STATIC_SPLIT": (
@@ -312,6 +314,11 @@ def _metrics(records):
     def values(field):
         return [float(row[field]) for row in records if row.get(field) is not None]
 
+    def action_count(row, count_field, key_field):
+        if count_field in row:
+            return int(row.get(count_field, 0) or 0)
+        return len(row.get(key_field, []) or [])
+
     physical_values = values("managed_state_physical_hbm_bytes")
     result = {
         "requests": len(records),
@@ -327,10 +334,12 @@ def _metrics(records):
             "max": max(physical_values, default=None),
         },
         "physical_admissions": sum(
-            len(row.get("physical_admitted_keys", [])) for row in records
+            action_count(row, "physical_admission_count", "physical_admitted_keys")
+            for row in records
         ),
         "physical_evictions": sum(
-            len(row.get("physical_evicted_keys", [])) for row in records
+            action_count(row, "physical_eviction_count", "physical_evicted_keys")
+            for row in records
         ),
     }
     request_fields = (
@@ -480,13 +489,26 @@ def _metrics(records):
             ):
                 value = state.get(field)
                 if isinstance(value, (int, float)):
-                    summary["components"].setdefault(field, []).append(float(value))
+                    component = summary["components"].setdefault(
+                        field,
+                        {
+                            "n": 0,
+                            "sum": 0.0,
+                            "min": float(value),
+                            "max": float(value),
+                        },
+                    )
+                    component["n"] += 1
+                    component["sum"] += float(value)
+                    component["min"] = min(component["min"], float(value))
+                    component["max"] = max(component["max"], float(value))
     for summary in state_components.values():
         summary["components"] = {
             field: {
-                "mean": sum(values) / len(values),
-                "min": min(values),
-                "max": max(values),
+                "n": values["n"],
+                "mean": values["sum"] / values["n"],
+                "min": values["min"],
+                "max": values["max"],
             }
             for field, values in summary["components"].items()
         }

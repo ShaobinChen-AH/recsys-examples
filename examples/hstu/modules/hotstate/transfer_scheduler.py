@@ -79,6 +79,23 @@ class TransferExecutionResult:
     def snapshot(self) -> dict:
         return asdict(self)
 
+    def scalar_snapshot(self) -> dict:
+        """Return transfer counters without request or key identifier lists."""
+        return {
+            "admitted_embedding_count": len(self.admitted_embedding_keys),
+            "evicted_embedding_count": len(self.evicted_embedding_keys),
+            "released_kv_count": len(self.released_kv_keys),
+            "submitted_count": len(self.submitted_ids),
+            "completed_count": len(self.completed_ids),
+            "failed_count": len(self.failed_ids),
+            "deferred_count": len(self.deferred_ids),
+            "noop_count": len(self.noop_ids),
+            "backend_error_count": len(self.backend_errors),
+            "submitted_bytes": int(self.submitted_bytes),
+            "completed_bytes": int(self.completed_bytes),
+            "elapsed_ms": float(self.elapsed_ms),
+        }
+
 
 class TransferScheduler:
     """One value-ordered lifecycle for DynamicEmb and native KV movement."""
@@ -1057,8 +1074,8 @@ class TransferScheduler:
             }
         return result
 
-    def snapshot(self, history_tail: int = 32) -> dict:
-        return {
+    def snapshot(self, history_tail: int = 32, *, include_details: bool = True) -> dict:
+        snapshot = {
             "scheduler": "dependency_aware_real_backends",
             "bandwidth_fraction": self.bandwidth_fraction,
             "epoch_bandwidth_budget_bytes": self._max_bytes_for_epoch(),
@@ -1067,7 +1084,13 @@ class TransferScheduler:
             "pending_bytes": self.pending_bytes(),
             "resources": self._resource_snapshot(),
             "counters": dict(self._counters),
-            "queued": [request.record() for request in self._queued.values()],
-            "in_flight": [request.record() for request in self._in_flight.values()],
-            "history_tail": self._history[-max(0, int(history_tail)) :],
         }
+        if include_details:
+            snapshot.update(
+                {
+                    "queued": [request.record() for request in self._queued.values()],
+                    "in_flight": [request.record() for request in self._in_flight.values()],
+                    "history_tail": self._history[-max(0, int(history_tail)) :],
+                }
+            )
+        return snapshot
