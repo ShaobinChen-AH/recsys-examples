@@ -179,6 +179,11 @@ class InferenceDynamicEmbeddingCollection(torch.nn.Module):
         self._embedding_tables.train(True)
         for option in self._embedding_tables._dynamicemb_options:
             option.training = True
+        # Admission controls placement; missing-row values must retain eval
+        # lookup semantics even when policy admits the row into storage.
+        self._embedding_tables._initializers = list(
+            self._embedding_tables._eval_initializers
+        )
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -323,11 +328,6 @@ class InferenceEmbedding(torch.nn.Module):
         dynamic_embedding_hbm_bytes: int = 0,
     ):
         super(InferenceEmbedding, self).__init__()
-        # A freshly constructed inference model has an explicit DynamicEmb
-        # initializer as its authoritative source.  Loading a checkpoint
-        # flips this marker off so a missing checkpoint row is a hard error.
-        self._hotstate_initializer_authoritative = True
-
         self.dynamic_embedding_configs = []
         self.static_embedding_configs = []
         for config in embedding_configs:
@@ -397,8 +397,6 @@ class InferenceEmbedding(torch.nn.Module):
     def load_checkpoint(self, checkpoint_dir, model_state_dict=None):
         if checkpoint_dir is None:
             return
-
-        self._hotstate_initializer_authoritative = False
 
         self._dynamic_embedding_collection.load_checkpoint(checkpoint_dir)
 

@@ -46,6 +46,65 @@ class EmbeddingAdapter:
             raise RuntimeError("DynamicEmb table collection has no _storage")
         return storage
 
+    def key_space_metadata(self) -> List[dict]:
+        """Describe configured dynamic table capacities and feature names."""
+        configs = getattr(self._module, "dynamic_embedding_configs", ())
+        return [
+            {
+                "table_name": str(config.table_name),
+                "feature_names": list(config.feature_names),
+                "vocab_size": int(config.vocab_size),
+            }
+            for config in configs
+        ]
+
+    def batch_feature_key_ranges(self, batch) -> dict:
+        """Return observed ID ranges for dynamic features in one request."""
+        ranges = {}
+        configs = getattr(self._module, "dynamic_embedding_configs", ())
+        for config in configs:
+            for feature_name in config.feature_names:
+                try:
+                    values = batch.features[feature_name].values()
+                except (KeyError, TypeError, AttributeError):
+                    continue
+                values = torch.as_tensor(values).detach().reshape(-1)
+                if values.numel() == 0:
+                    continue
+                values = values.to(device="cpu", dtype=torch.int64)
+                ranges[feature_name] = {
+                    "table_name": str(config.table_name),
+                    "vocab_size": int(config.vocab_size),
+                    "count": int(values.numel()),
+                    "min_id": int(values.min().item()),
+                    "max_id": int(values.max().item()),
+                    "out_of_configured_range_count": int(
+                        ((values < 0) | (values >= int(config.vocab_size)))
+                        .sum()
+                        .item()
+                    ),
+                }
+        return ranges
+
+    def validate_key_range(self, item_indices) -> None:
+        """Reject keys outside table zero's configured logical vocabulary."""
+        configs = getattr(self._module, "dynamic_embedding_configs", ())
+        if not configs:
+            return
+        config = configs[0]
+        capacity = int(config.vocab_size)
+        invalid = [
+            int(key) for key in item_indices
+            if int(key) < 0 or int(key) >= capacity
+        ]
+        if invalid:
+            features = ",".join(config.feature_names)
+            raise ConsistencyError(
+                f"inference keys outside configured dynamic table range: "
+                f"table={config.table_name} features={features} "
+                f"vocab_size={capacity} invalid={invalid[:8]}"
+            )
+
     @staticmethod
     def _tensor_bytes(tensor: torch.Tensor, seen_ptrs: set) -> int:
         if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cuda":
@@ -322,17 +381,11 @@ class EmbeddingAdapter:
         table_ids = torch.zeros_like(keys)
         return keys, table_ids
 
-    def _authoritative_eval_initializer(self):
-        """Return DynamicEmb's eval initializer only for an uncheckpointed model."""
-        if not bool(
-            getattr(self._module, "_hotstate_initializer_authoritative", False)
-        ):
-            return None
+    def _eval_initializer(self):
+        """Return the configured eval fallback used by ordinary inference lookup."""
         initializers = getattr(self._embedding_tables(), "_eval_initializers", None)
         if not initializers or not callable(initializers[0]):
-            raise RuntimeError(
-                "DynamicEmb does not expose its authoritative eval initializer"
-            )
+            return None
         return initializers[0]
 
     def apply_residency_plan(
@@ -375,7 +428,7 @@ class EmbeddingAdapter:
                 raise RuntimeError(
                     "DynamicEmb storage cannot perform physical row admission"
                 )
-            initializer = self._authoritative_eval_initializer()
+            initializer = self._eval_initializer()
             promoted, displaced = admit_fn(
                 keys,
                 table_ids,
@@ -425,15 +478,19 @@ class EmbeddingAdapter:
         return [int(value) for value in locations.detach().cpu().tolist()]
 
     def validate_item_keys(self, item_indices) -> None:
-        """Ensure every inference lookup has an authoritative row.
+        """Validate residency without rejecting DynamicEmb's eval fallback.
 
-        Checkpoint-backed inference requires an authoritative value in either
-        tier. A fresh model may instead use its explicitly authoritative eval
-        initializer, which is also the only source HotState may use to
-        materialize a row before lookup.
+        DynamicEmb eval lookup intentionally returns the configured evaluation
+        initializer (zero by default) for sparse keys absent from a checkpoint.
+        HotState must preserve that inference behavior: a missing checkpoint row
+        is not a failed authoritative read. Physical admission still promotes
+        existing host rows, while the normal forward path handles absent rows.
         """
         keys = [int(value) for value in item_indices]
-        if not keys or self._module is None or not self.supports_physical_residency_control():
+        if not keys or self._module is None:
+            return
+        self.validate_key_range(keys)
+        if not self.supports_physical_residency_control():
             return
         observed = self._observed_residency(keys)
         if observed is None:
@@ -442,16 +499,14 @@ class EmbeddingAdapter:
             )
         missing = [key for key, location in zip(keys, observed) if int(location) == 0]
         if missing:
-            if bool(
-                getattr(self._module, "_hotstate_initializer_authoritative", False)
-            ):
-                # The no-checkpoint inference smoke path has an explicit,
-                # authoritative DynamicEmb initializer. Physical admission
-                # materializes these rows before the lookup consumes them.
+            if self._eval_initializer() is not None:
+                # Match the static inference path. The eval lookup supplies the
+                # fallback value without pretending that the row is checkpoint
+                # state or forcing it into the physical HBM pool.
                 return
             raise ConsistencyError(
-                "inference requested embedding rows absent from both authoritative "
-                f"tiers: {missing[:8]}"
+                "inference requested embedding rows absent and no eval fallback "
+                f"is configured: {missing[:8]}"
             )
 
     def set_module(self, embedding_module):

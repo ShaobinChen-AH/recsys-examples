@@ -348,6 +348,45 @@ def _metrics(records):
         )
         for field in request_fields
     }
+    feature_ranges = {}
+    for row in records:
+        for feature_name, observed in row.get(
+            "dynamic_feature_id_ranges", {}
+        ).items():
+            summary = feature_ranges.setdefault(
+                feature_name,
+                {
+                    "table_name": observed.get("table_name"),
+                    "vocab_size": observed.get("vocab_size"),
+                    "count": 0,
+                    "min_id": None,
+                    "max_id": None,
+                    "out_of_configured_range_count": 0,
+                },
+            )
+            summary["count"] += int(observed.get("count", 0))
+            summary["out_of_configured_range_count"] += int(
+                observed.get("out_of_configured_range_count", 0)
+            )
+            min_id = observed.get("min_id")
+            max_id = observed.get("max_id")
+            if min_id is not None:
+                summary["min_id"] = (
+                    int(min_id)
+                    if summary["min_id"] is None
+                    else min(summary["min_id"], int(min_id))
+                )
+            if max_id is not None:
+                summary["max_id"] = (
+                    int(max_id)
+                    if summary["max_id"] is None
+                    else max(summary["max_id"], int(max_id))
+                )
+    result["dynamic_feature_id_ranges"] = feature_ranges
+    if records:
+        result["dynamic_embedding_key_spaces"] = records[0].get(
+            "dynamic_embedding_key_spaces", []
+        )
     cost_snapshots = [
         row.get("online_cost_model_after", {}) for row in records
         if isinstance(row.get("online_cost_model_after"), dict)

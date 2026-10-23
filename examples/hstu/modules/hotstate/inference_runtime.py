@@ -104,10 +104,16 @@ def run_inference_request(model, batch, user_ids, history_lengths, *, controller
     )
 
     if controller is not None:
+        embedding_adapter = getattr(controller, "emb_adapter", None)
+        if embedding_adapter is None:
+            embedding_adapter = EmbeddingAdapter(
+                getattr(model, "sparse_module", None)
+            )
         physical = controller.physical_hbm_snapshot()
         budget = controller.configured_state_budget_bytes
     else:
         embedding = EmbeddingAdapter(model.sparse_module)
+        embedding_adapter = embedding
         kv = KVAdapter(model.dense_module.async_kvcache)
         emb_bytes, kv_bytes = embedding.physical_hbm_bytes(), kv.physical_hbm_bytes()
         physical = {"embedding_physical_hbm_bytes": emb_bytes,
@@ -128,6 +134,8 @@ def run_inference_request(model, batch, user_ids, history_lengths, *, controller
         "user_id": int(torch.as_tensor(user_ids).reshape(-1)[0].item()),
         "seq_history_len": int(torch.as_tensor(history_lengths).reshape(-1)[0].item() // 2),
         "batch_fingerprint": fingerprint,
+        "dynamic_embedding_key_spaces": embedding_adapter.key_space_metadata(),
+        "dynamic_feature_id_ranges": embedding_adapter.batch_feature_key_ranges(batch),
         "physical_pool_resize_applied": False,
         "online_pool_resize_observed": False,
         "model_rebuild_count": 0,

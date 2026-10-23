@@ -49,6 +49,8 @@ from utils import DatasetArgs, NetworkArgs, RankingArgs
 sys.path.append("./model/")
 from inference_ranking_gr import get_inference_ranking_gr
 
+VIDEO_ID_VOCAB_SIZE = 1_000_000
+
 
 class RunningMode(enum.Enum):
     EVAL = "eval"
@@ -63,7 +65,6 @@ def get_inference_dataset_and_embedding_configs(
 ):
     dataset_args = DatasetArgs()
     embedding_dim = NetworkArgs().hidden_size
-    HASH_SIZE = 1000_000
     if dataset_args.dataset_name == "kuairand-1k":
         embedding_configs = [
             InferenceEmbeddingConfig(
@@ -111,7 +112,7 @@ def get_inference_dataset_and_embedding_configs(
             InferenceEmbeddingConfig(
                 feature_names=["video_id"],
                 table_name="video_id",
-                vocab_size=HASH_SIZE,
+                vocab_size=VIDEO_ID_VOCAB_SIZE,
                 dim=embedding_dim,
                 use_dynamicemb=True,
             ),
@@ -615,7 +616,7 @@ def run_ranking_gr_simulate(
             else [],
             action_feature_name=dataproc._action_feature_name,
             max_num_candidates=dataset_args.max_num_candidates,
-            item_vocab_size=10_000_000,
+            item_vocab_size=VIDEO_ID_VOCAB_SIZE,
             userid_name="user_id",
             date_name="date",
             sequence_endptr_name="interval_indptr",

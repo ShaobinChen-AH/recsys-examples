@@ -313,6 +313,8 @@ class HotStateController:
 
         item_sequence = self.emb_adapter.batch_item_sequence(batch)
         item_indices = list(dict.fromkeys(item_sequence))
+        embedding_key_spaces = self.emb_adapter.key_space_metadata()
+        self.emb_adapter.validate_key_range(item_indices)
 
         requested_unique_keys = len(item_indices)
 
@@ -694,6 +696,15 @@ class HotStateController:
                 "hbm_pressure": float(
                     self._pending_batch_cost_context.get("hbm_pressure", 0.0)
                 ),
+                "controlled_embedding_table": (
+                    embedding_key_spaces[0] if embedding_key_spaces else None
+                ),
+                "controlled_embedding_key_min": min(item_indices)
+                if item_indices
+                else None,
+                "controlled_embedding_key_max": max(item_indices)
+                if item_indices
+                else None,
             },
             "policy_inputs": self._pending_batch_cost_context.get("policy_inputs", []),
             "physical_kv_pool_bytes": self.kv_adapter.physical_kv_cache_bytes(),
