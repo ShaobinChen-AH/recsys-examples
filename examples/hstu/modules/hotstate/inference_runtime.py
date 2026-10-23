@@ -122,9 +122,124 @@ _OMIT = object()
 def _scalar_cost_snapshot(value):
     if not isinstance(value, dict):
         return _scalar_tree(value)
-    return _scalar_tree(
-        {key: item for key, item in value.items() if key != "policy"}
+    allowed = (
+        "model",
+        "batch_samples",
+        "confidence",
+        "calibration_state",
+        "batch_error_ewma_ms",
+        "observed_latency_ewma_ms",
+        "observed_tail_ewma_ms",
+        "last_prediction_ms",
+        "last_observation_ms",
+        "last_absolute_error_ms",
+        "shadow_price_ms_per_byte",
+        "last_hbm_pressure",
+        "last_transfer_queue_depth",
+        "configured_kv_prior_ms_per_1k_tokens",
+        "configured_embedding_prior_ms_per_key",
+        "tracked_access_keys",
+        "learned_reuse_intervals",
     )
+    compact = {key: value[key] for key in allowed if key in value}
+    transfer_models = value.get("transfer_models")
+    if isinstance(transfer_models, dict):
+        compact["transfer_models"] = {
+            str(name): _scalar_tree(model)
+            for name, model in transfer_models.items()
+            if isinstance(model, dict)
+        }
+    return _scalar_tree(compact)
+
+
+def _compact_feature_ranges(ranges):
+    """Collapse repeated per-feature range objects to one row per table."""
+    if not isinstance(ranges, dict):
+        return {}
+    tables = {}
+    for observed in ranges.values():
+        if not isinstance(observed, dict):
+            continue
+        table_name = str(observed.get("table_name", "unknown"))
+        summary = tables.setdefault(
+            table_name,
+            {
+                "table_name": table_name,
+                "vocab_size": int(observed.get("vocab_size", 0) or 0),
+                "feature_count": 0,
+                "count": 0,
+                "min_id": None,
+                "max_id": None,
+                "negative_id_count": 0,
+            },
+        )
+        summary["feature_count"] += 1
+        summary["vocab_size"] = max(
+            summary["vocab_size"], int(observed.get("vocab_size", 0) or 0)
+        )
+        summary["count"] += int(observed.get("count", 0) or 0)
+        summary["negative_id_count"] += int(
+            observed.get("negative_id_count", 0) or 0
+        )
+        for field in ("min_id", "max_id"):
+            value = observed.get(field)
+            if value is None:
+                continue
+            value = int(value)
+            if summary[field] is None:
+                summary[field] = value
+            elif field == "min_id":
+                summary[field] = min(summary[field], value)
+            else:
+                summary[field] = max(summary[field], value)
+    return tables
+
+
+def _scalar_request_metrics(request):
+    if not isinstance(request, dict):
+        return {}
+    fields = (
+        "history_tokens",
+        "history_length",
+        "num_candidates",
+        "embedding_requests",
+        "unique_embedding_requests",
+        "user_id",
+        "user_was_offloaded",
+        "hbm_pressure",
+    )
+    return {field: request[field] for field in fields if field in request}
+
+
+def _scalar_profile(profile):
+    if not isinstance(profile, dict):
+        return {}
+    fields = ("extract", "record_keys", "run_epoch", "scheduler", "total")
+    return {field: profile[field] for field in fields if field in profile}
+
+
+def _scalar_observed_costs(observed):
+    if not isinstance(observed, dict):
+        return {}
+    fields = (
+        "latency_ms",
+        "history_tokens",
+        "num_candidates",
+        "embedding_requests",
+        "embedding_misses",
+        "kv_miss_tokens",
+        "concurrent_transfer_bytes",
+        "transfer_queue_depth",
+        "hbm_pressure",
+        "host_memory_pressure",
+        "synchronous_control_transfer_bytes",
+        "synchronous_kv_released_bytes",
+        "user_was_offloaded",
+        "offload_pages",
+        "origin_cached_tokens",
+        "new_tokens",
+    )
+    return {field: observed[field] for field in fields if field in observed}
 
 
 def _transfer_execution_summary(execution):
@@ -212,7 +327,9 @@ def run_inference_request(
             ),
             "batch_fingerprint": fingerprint,
             "dynamic_embedding_key_spaces": embedding_adapter.key_space_metadata(),
-            "dynamic_feature_id_ranges": embedding_adapter.batch_feature_key_ranges(batch),
+            "dynamic_feature_id_ranges": embedding_adapter.batch_feature_key_ranges(
+                batch
+            ),
             "physical_pool_resize_applied": False,
             "online_pool_resize_observed": False,
             "model_rebuild_count": 0,
@@ -239,14 +356,6 @@ def run_inference_request(
             "trace_detail": "full",
         }
     else:
-        key_spaces = [
-            {
-                key: value
-                for key, value in table.items()
-                if key != "feature_names"
-            }
-            for table in embedding_adapter.key_space_metadata()
-        ]
         admitted_count = int(
             control.get(
                 "physical_admission_count",
@@ -286,8 +395,6 @@ def run_inference_request(
                 torch.as_tensor(history_lengths).reshape(-1)[0].item() // 2
             ),
             "batch_fingerprint": fingerprint,
-            "dynamic_embedding_key_spaces": key_spaces,
-            "dynamic_feature_id_ranges": embedding_adapter.batch_feature_key_ranges(batch),
             "physical_pool_resize_applied": False,
             "online_pool_resize_observed": False,
             "model_rebuild_count": 0,
@@ -297,9 +404,15 @@ def run_inference_request(
                 if controller is not None
                 else None
             ),
-            "policy_budget": _scalar_tree(control.get("policy_budget")),
-            "request_metrics": _scalar_tree(control.get("request_metrics", {})),
-            "control_profile_ms": _scalar_tree(control.get("profile_ms", {})),
+            "policy_budget_bytes": (
+                control.get("policy_budget", {}).get("residency_budget_bytes")
+                if isinstance(control.get("policy_budget"), dict)
+                else None
+            ),
+            "request_metrics": _scalar_request_metrics(
+                control.get("request_metrics", {})
+            ),
+            "control_profile_ms": _scalar_profile(control.get("profile_ms", {})),
             "online_cost_model_before": _scalar_cost_snapshot(
                 control.get("online_cost_model", {})
             ),
@@ -315,14 +428,21 @@ def run_inference_request(
             "directory_pending_transfers_after": post.get(
                 "post_directory_pending_transfers"
             ),
-            "observed_cost_inputs": _scalar_tree(
+            "observed_cost_inputs": _scalar_observed_costs(
                 post.get("observed_cost_inputs")
             ),
             "online_cost_model_after": _scalar_cost_snapshot(
                 post.get("online_cost_model", {})
             ),
-            "waits": _scalar_tree(
-                dict(getattr(model.dense_module.async_kvcache, "last_wait_timings", {}))
+            "metadata_future_wait_ms": float(
+                (
+                    getattr(
+                        model.dense_module.async_kvcache,
+                        "last_wait_timings",
+                        {},
+                    )
+                    or {}
+                ).get("metadata_future_wait_ms", 0.0)
             ),
         }
         for field in (
@@ -333,8 +453,19 @@ def run_inference_request(
         ):
             if field in control:
                 record[field] = control[field]
-        if int(batch_idx) != 0:
-            record.pop("dynamic_embedding_key_spaces", None)
+        if int(batch_idx) == 0:
+            key_spaces = [
+                {
+                    key: value
+                    for key, value in table.items()
+                    if key != "feature_names"
+                }
+                for table in embedding_adapter.key_space_metadata()
+            ]
+            record["dynamic_embedding_key_spaces"] = key_spaces
+            record["dynamic_feature_id_ranges"] = _compact_feature_ranges(
+                embedding_adapter.batch_feature_key_ranges(batch)
+            )
     if budget is not None and physical["managed_state_physical_hbm_bytes"] > budget:
         raise RuntimeError("measured inference state exceeds the configured physical envelope")
     if controller is not None:

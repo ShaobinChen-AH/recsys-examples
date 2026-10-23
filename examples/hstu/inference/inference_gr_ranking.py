@@ -14,8 +14,10 @@
 # limitations under the License.
 import argparse
 import enum
+import faulthandler
 import math
 import os
+import signal
 import sys
 import time
 
@@ -693,6 +695,12 @@ def run_ranking_gr_simulate(
                 total_history_lengths = seq_endptrs * 2 + num_contextual_features
 
                 if batch is not None:
+                    if num_batches_ctr % 128 == 0:
+                        print(
+                            "[progress] batch-start "
+                            f"batch={num_batches_ctr} measured={measured_batches_ctr}",
+                            flush=True,
+                        )
                     # ============================================================
                     # INSTRUMENTATION: Record embedding access for this batch
                     # Extract IDs from batch.features (KeyedJaggedTensor)
@@ -761,6 +769,13 @@ def run_ranking_gr_simulate(
                     warmup_batches_ctr += 1
                     continue
                 measured_batches_ctr += 1
+                if num_batches_ctr % 128 == 0:
+                    print(
+                        "[progress] batch-complete batches="
+                        f"{num_batches_ctr} warmup={warmup_batches_ctr} "
+                        f"measured={measured_batches_ctr}",
+                        flush=True,
+                    )
                 if max_batches and measured_batches_ctr >= max_batches:
                     break
                 # if num_batches_ctr == 1000:
@@ -940,6 +955,12 @@ def run_ranking_gr_evaluate(
 
 
 if __name__ == "__main__":
+    if hasattr(signal, "SIGUSR1"):
+        try:
+            faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+            print("[fault-handler] SIGUSR1 thread dumps enabled", flush=True)
+        except (RuntimeError, ValueError, OSError) as exc:
+            print(f"[fault-handler] SIGUSR1 unavailable: {exc}", flush=True)
     parser = argparse.ArgumentParser(description="Inference End-to-end Example")
     parser.add_argument("--gin_config_file", type=str, required=True)
     parser.add_argument("--checkpoint_dir", type=str, required=True)

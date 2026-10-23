@@ -314,6 +314,7 @@ def test_inference_trace_keeps_scalar_measurements_without_per_key_dumps(
     assert controller.record["online_cost_model_after"]["confidence"] == 0.5
     assert controller.record["physical_admission_count"] == 1
     assert controller.record["transfer_execution"]["submitted_count"] == 1
+    assert controller.record["metadata_future_wait_ms"] == pytest.approx(0.1)
     for field in (
         "physical_admitted_keys",
         "physical_evicted_keys",
@@ -326,6 +327,7 @@ def test_inference_trace_keeps_scalar_measurements_without_per_key_dumps(
     assert "queued" not in controller.record["transfer_scheduler_after"]
     assert "post_control" not in controller.record
     assert "scored_state_summary" not in controller.record
+    assert "dynamic_feature_id_ranges" not in controller.record
 
 
 def test_full_inference_trace_is_explicitly_opt_in(monkeypatch):
