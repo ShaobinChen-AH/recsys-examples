@@ -1,11 +1,13 @@
 """CPU checks for paired HotState calibration analysis."""
 
 import json
+import random
 import sys
 from argparse import Namespace
 from pathlib import Path
 
 import pytest
+import numpy as np
 import torch
 
 HSTU_ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +20,10 @@ from benchmark.hotstate_policy_sweep import (  # noqa: E402
 )
 from modules.hotstate.inference_runtime import run_inference_request  # noqa: E402
 from modules.hotstate.policy import PolicyConfig  # noqa: E402
+from modules.hotstate.sweep_rng import (  # noqa: E402
+    derive_sweep_batch_seed,
+    seed_sweep_rngs,
+)
 
 
 def _row(index, latency, *, hotstate, config_id=None):
@@ -77,6 +83,31 @@ def test_default_policy_sweep_manifest_has_valid_staged_variants():
             "admission", "online_model"}.issubset(stages)
     assert sum(not variant["hotstate_enabled"] for variant in variants) == 3
     assert sum(variant["reference"] for variant in variants) == 1
+
+
+def test_sweep_rngs_repeat_for_identical_seed_repeat_and_batch():
+    first_seed = seed_sweep_rngs(2026, 2, 7)
+    first_draws = (
+        first_seed,
+        random.randint(0, 10_000_000),
+        int(np.random.randint(0, 10_000_000)),
+        torch.randint(10_000_000, (4,)).tolist(),
+    )
+    second_seed = seed_sweep_rngs(2026, 2, 7)
+    second_draws = (
+        second_seed,
+        random.randint(0, 10_000_000),
+        int(np.random.randint(0, 10_000_000)),
+        torch.randint(10_000_000, (4,)).tolist(),
+    )
+
+    assert first_draws == second_draws
+    assert derive_sweep_batch_seed(2026, 2, 7) != derive_sweep_batch_seed(
+        2026, 2, 8
+    )
+    assert derive_sweep_batch_seed(2026, 2, 7) != derive_sweep_batch_seed(
+        2026, 3, 7
+    )
 
 
 def test_analysis_ranks_on_discovery_and_reports_paired_holdout(tmp_path):

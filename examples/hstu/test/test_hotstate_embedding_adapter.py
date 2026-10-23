@@ -47,11 +47,11 @@ def test_missing_in_range_user_uses_eval_fallback_after_checkpoint_load():
     adapter.validate_item_keys([867])
 
 
-def test_out_of_range_user_key_reports_table_and_configured_capacity():
+def test_negative_key_is_rejected_without_treating_capacity_as_id_bound():
     adapter = EmbeddingAdapter(_EmbeddingModule())
 
-    with pytest.raises(ConsistencyError, match="table=user_id.*vocab_size=1000"):
-        adapter.validate_key_range([1000])
+    with pytest.raises(ConsistencyError, match="non-negative"):
+        adapter.validate_key_range([-1])
 
 
 def test_checkpoint_missing_row_can_be_admitted_with_eval_initializer():
@@ -93,7 +93,7 @@ def test_key_space_and_observed_ranges_keep_feature_namespaces_separate():
         def __getitem__(self, name):
             return {
                 "user_id": Jagged([867]),
-                "video_id": Jagged([12, 999_999]),
+                "video_id": Jagged([12, 4_142_676]),
             }[name]
 
     ranges = adapter.batch_feature_key_ranges(SimpleNamespace(features=Features()))
@@ -101,4 +101,4 @@ def test_key_space_and_observed_ranges_keep_feature_namespaces_separate():
 
     assert [item["table_name"] for item in key_spaces] == ["user_id", "video_id"]
     assert ranges["user_id"]["max_id"] == 867
-    assert ranges["video_id"]["max_id"] == 999_999
+    assert ranges["video_id"]["max_id"] == 4_142_676

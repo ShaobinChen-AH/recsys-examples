@@ -196,6 +196,8 @@ def run_sweep(args):
                     ),
                     "HOTSTATE_TRACE_PATH": str(trace_path),
                     "HOTSTATE_TRACE_DETAIL": "scalar",
+                    "HOTSTATE_SWEEP_SEED": str(args.seed),
+                    "HOTSTATE_SWEEP_REPEAT": str(repeat),
                     "HOTSTATE_STATIC_SPLIT": (
                         variant.get("static_split") or "static_disabled"
                     ),
@@ -361,12 +363,12 @@ def _metrics(records):
                     "count": 0,
                     "min_id": None,
                     "max_id": None,
-                    "out_of_configured_range_count": 0,
+                    "negative_id_count": 0,
                 },
             )
             summary["count"] += int(observed.get("count", 0))
-            summary["out_of_configured_range_count"] += int(
-                observed.get("out_of_configured_range_count", 0)
+            summary["negative_id_count"] += int(
+                observed.get("negative_id_count", 0)
             )
             min_id = observed.get("min_id")
             max_id = observed.get("max_id")

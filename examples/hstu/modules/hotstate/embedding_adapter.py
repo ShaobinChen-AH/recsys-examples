@@ -54,6 +54,7 @@ class EmbeddingAdapter:
                 "table_name": str(config.table_name),
                 "feature_names": list(config.feature_names),
                 "vocab_size": int(config.vocab_size),
+                "capacity_semantics": "maximum_row_count_not_id_upper_bound",
             }
             for config in configs
         ]
@@ -78,31 +79,22 @@ class EmbeddingAdapter:
                     "count": int(values.numel()),
                     "min_id": int(values.min().item()),
                     "max_id": int(values.max().item()),
-                    "out_of_configured_range_count": int(
-                        ((values < 0) | (values >= int(config.vocab_size)))
-                        .sum()
-                        .item()
-                    ),
+                    "negative_id_count": int((values < 0).sum().item()),
                 }
         return ranges
 
     def validate_key_range(self, item_indices) -> None:
-        """Reject keys outside table zero's configured logical vocabulary."""
+        """Reject invalid negative keys; capacity is a row count, not an ID bound."""
         configs = getattr(self._module, "dynamic_embedding_configs", ())
         if not configs:
             return
         config = configs[0]
-        capacity = int(config.vocab_size)
-        invalid = [
-            int(key) for key in item_indices
-            if int(key) < 0 or int(key) >= capacity
-        ]
+        invalid = [int(key) for key in item_indices if int(key) < 0]
         if invalid:
             features = ",".join(config.feature_names)
             raise ConsistencyError(
-                f"inference keys outside configured dynamic table range: "
-                f"table={config.table_name} features={features} "
-                f"vocab_size={capacity} invalid={invalid[:8]}"
+                f"inference keys must be non-negative: table={config.table_name} "
+                f"features={features} invalid={invalid[:8]}"
             )
 
     @staticmethod

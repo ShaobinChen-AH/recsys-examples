@@ -43,13 +43,23 @@ from modules.hotstate.physical_budget import (
 )
 from modules.hotstate.policy import load_policy_config
 from modules.hotstate.inference_runtime import run_inference_request
+from modules.hotstate.sweep_rng import seed_sweep_rngs
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from utils import DatasetArgs, NetworkArgs, RankingArgs
 
 sys.path.append("./model/")
 from inference_ranking_gr import get_inference_ranking_gr
 
-VIDEO_ID_VOCAB_SIZE = 1_000_000
+VIDEO_ID_TABLE_CAPACITY = 1_000_000
+VIDEO_ID_INPUT_KEY_SPACE = 10_000_000
+
+
+def _sweep_seed() -> tuple[int, int]:
+    """Read the deterministic seed contract supplied by the sweep runner."""
+    return (
+        int(os.getenv("HOTSTATE_SWEEP_SEED", "0")),
+        int(os.getenv("HOTSTATE_SWEEP_REPEAT", "0")),
+    )
 
 
 class RunningMode(enum.Enum):
@@ -112,7 +122,7 @@ def get_inference_dataset_and_embedding_configs(
             InferenceEmbeddingConfig(
                 feature_names=["video_id"],
                 table_name="video_id",
-                vocab_size=VIDEO_ID_VOCAB_SIZE,
+                vocab_size=VIDEO_ID_TABLE_CAPACITY,
                 dim=embedding_dim,
                 use_dynamicemb=True,
             ),
@@ -549,6 +559,11 @@ def run_ranking_gr_simulate(
 ):
     if max_batches < 0 or warmup_batches < 0:
         raise ValueError("max_batches and warmup_batches must be non-negative")
+    sweep_seed, sweep_repeat = _sweep_seed()
+    # Seed before model construction or dataset generation. Each request is
+    # reseeded below so model-construction RNG consumption cannot affect the
+    # candidate stream used for pairing.
+    seed_sweep_rngs(sweep_seed, sweep_repeat, -1)
     dataset_args, emb_configs = get_inference_dataset_and_embedding_configs(
         disable_contextual_features
     )
@@ -616,7 +631,9 @@ def run_ranking_gr_simulate(
             else [],
             action_feature_name=dataproc._action_feature_name,
             max_num_candidates=dataset_args.max_num_candidates,
-            item_vocab_size=VIDEO_ID_VOCAB_SIZE,
+            # Raw video IDs are opaque DynamicEmb keys. Keep the original
+            # candidate key space used by the static baseline.
+            item_vocab_size=VIDEO_ID_INPUT_KEY_SPACE,
             userid_name="user_id",
             date_name="date",
             sequence_endptr_name="interval_indptr",
@@ -640,6 +657,13 @@ def run_ranking_gr_simulate(
         while True:
             try:
                 uids, dates, seq_endptrs = next(dataloader_iter)
+                is_warmup = warmup_batches_ctr < warmup_batches
+                rng_batch_idx = (
+                    -(warmup_batches_ctr + 1)
+                    if is_warmup
+                    else measured_batches_ctr
+                )
+                seed_sweep_rngs(sweep_seed, sweep_repeat, rng_batch_idx)
                 if dates[0] != cur_date:
                     # if cur_date is not None:
                     # eval_metric_dict = eval_module.compute()
@@ -675,7 +699,6 @@ def run_ranking_gr_simulate(
                         except Exception as e:
                             print(f"[AccessTracer] Failed to record batch {num_batches_ctr}: {e}")
 
-                    is_warmup = warmup_batches_ctr < warmup_batches
                     trace_path_env = None
                     controller_trace_path = None
                     if is_warmup:
